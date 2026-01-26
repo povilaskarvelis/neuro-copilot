@@ -1,6 +1,6 @@
 # AI Co-Scientist
 
-An AI-powered research assistant for preclinical drug target discovery. Built with Google's Agent Development Kit (ADK) and the Model Context Protocol (MCP).
+An AI-powered research assistant for preclinical drug target discovery.
 
 ## What It Does
 
