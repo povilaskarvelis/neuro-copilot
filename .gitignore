@@ -10,6 +10,7 @@ __pycache__/
 venv/
 *.egg-info/
 .pytest_cache/
+adk-agent/acceptance/results/
 
 # Node.js
 node_modules/

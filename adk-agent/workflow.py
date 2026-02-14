@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
 import re
 import uuid
 
@@ -25,6 +26,8 @@ class WorkflowStep:
     evidence_refs: list[str] = field(default_factory=list)
     recommended_tools: list[str] = field(default_factory=list)
     fallback_tools: list[str] = field(default_factory=list)
+    allowed_tools: list[str] = field(default_factory=list)
+    tool_trace: list[dict] = field(default_factory=list)
     rationale: str = ""
     expected_output_fields: list[str] = field(default_factory=list)
 
@@ -38,6 +41,8 @@ class WorkflowStep:
             "evidence_refs": self.evidence_refs,
             "recommended_tools": self.recommended_tools,
             "fallback_tools": self.fallback_tools,
+            "allowed_tools": self.allowed_tools,
+            "tool_trace": self.tool_trace,
             "rationale": self.rationale,
             "expected_output_fields": self.expected_output_fields,
         }
@@ -53,6 +58,8 @@ class WorkflowStep:
             evidence_refs=list(payload.get("evidence_refs", [])),
             recommended_tools=list(payload.get("recommended_tools", [])),
             fallback_tools=list(payload.get("fallback_tools", [])),
+            allowed_tools=list(payload.get("allowed_tools", [])),
+            tool_trace=list(payload.get("tool_trace", [])),
             rationale=payload.get("rationale", ""),
             expected_output_fields=list(payload.get("expected_output_fields", [])),
         )
@@ -452,6 +459,108 @@ def render_status(task: WorkflowTask) -> str:
     return "\n".join(lines)
 
 
+def _summarize_step_output(output: str, max_chars: int = 280) -> str:
+    normalized = re.sub(r"\s+", " ", output or "").strip()
+    if not normalized:
+        return "No output captured."
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[: max_chars - 3].rstrip()}..."
+
+
+def _compact_json(value, max_chars: int = 180) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=True, sort_keys=True)
+    except TypeError:
+        text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3].rstrip()}..."
+
+
+def _detect_pivots(trace_entries: list[dict]) -> list[str]:
+    pivots: list[str] = []
+    for idx in range(len(trace_entries) - 1):
+        current = trace_entries[idx]
+        nxt = trace_entries[idx + 1]
+        current_outcome = str(current.get("outcome", "unknown"))
+        if current_outcome in {"error", "not_found_or_empty", "no_response"}:
+            current_tool = str(current.get("tool_name", "unknown_tool"))
+            next_tool = str(nxt.get("tool_name", "unknown_tool"))
+            if current_tool != next_tool:
+                detail = str(current.get("detail", "")).strip()
+                if detail:
+                    pivots.append(
+                        f"After {current_tool} returned {current_outcome} ({detail}), switched to {next_tool}."
+                    )
+                else:
+                    pivots.append(
+                        f"After {current_tool} returned {current_outcome}, switched to {next_tool}."
+                    )
+    return pivots
+
+
+def _render_tool_trace(trace_entries: list[dict]) -> list[str]:
+    if not trace_entries:
+        return ["- Executed tool trace: no tool calls recorded for this step."]
+
+    lines = ["- Executed tool trace:"]
+    for idx, entry in enumerate(trace_entries, start=1):
+        tool_name = str(entry.get("tool_name", "unknown_tool"))
+        outcome = str(entry.get("outcome", "unknown"))
+        call_id = str(entry.get("call_id", "n/a"))
+        phase = str(entry.get("phase", "main"))
+        args_text = _compact_json(entry.get("args", {}))
+        line = f"  {idx}. [{phase}] {tool_name}(call_id={call_id}, args={args_text}) -> {outcome}"
+        detail = str(entry.get("detail", "")).strip()
+        if detail:
+            line += f" | detail: {detail}"
+        lines.append(line)
+
+    pivot_notes = _detect_pivots(trace_entries)
+    if pivot_notes:
+        lines.append("- Pivot behavior:")
+        for note in pivot_notes:
+            lines.append(f"  - {note}")
+    else:
+        lines.append("- Pivot behavior: none detected.")
+    return lines
+
+
+def _render_methodology(task: WorkflowTask) -> list[str]:
+    lines = ["## Methodology"]
+    if not task.steps:
+        lines.append("- No workflow steps were created.")
+        return lines
+
+    for idx, step in enumerate(task.steps, start=1):
+        planned_tools = sorted(set(step.recommended_tools + step.fallback_tools))
+        lines.extend(
+            [
+                f"### Step {idx}: {step.title}",
+                f"- Status: {step.status}",
+                f"- Goal: {step.instruction}",
+                f"- Why this order: {step.rationale or 'Not specified.'}",
+                f"- Planned tools: {', '.join(planned_tools) if planned_tools else 'none'}",
+                (
+                    f"- Enforced step tools: {', '.join(step.allowed_tools)}"
+                    if step.allowed_tools
+                    else "- Enforced step tools: none (reasoning-only step)"
+                ),
+                f"- Information gained: {_summarize_step_output(step.output)}",
+                (
+                    f"- Evidence IDs from step: {', '.join(step.evidence_refs)}"
+                    if step.evidence_refs
+                    else "- Evidence IDs from step: none detected"
+                ),
+            ]
+        )
+        lines.extend(_render_tool_trace(step.tool_trace))
+        lines.append("")
+    return lines
+
+
 def render_final_report(task: WorkflowTask, quality_report: dict | None = None) -> str:
     all_refs: list[str] = []
     for step in task.steps:
@@ -459,7 +568,9 @@ def render_final_report(task: WorkflowTask, quality_report: dict | None = None) 
     unique_refs = sorted(set(all_refs))
 
     answer_text = task.steps[-1].output if task.steps else "No answer generated."
-    lines = ["## Answer", answer_text, "", "## Evidence"]
+    lines = ["## Answer", answer_text, ""]
+    lines.extend(_render_methodology(task))
+    lines.extend(["", "## Evidence"])
     if unique_refs:
         for ref in unique_refs:
             lines.append(f"- {ref}")
@@ -478,6 +589,7 @@ def render_final_report(task: WorkflowTask, quality_report: dict | None = None) 
     if quality_report:
         lines.append(f"- Quality gate passed: {'yes' if quality_report.get('passed') else 'no'}")
         lines.append(f"- Evidence refs detected: {quality_report.get('evidence_count', 0)}")
+        lines.append(f"- Tool calls captured: {quality_report.get('tool_call_count', 0)}")
         gaps = quality_report.get("unresolved_gaps", [])
         if gaps:
             lines.append("- Unresolved gaps:")
@@ -496,10 +608,14 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
         "Preferred tools: "
         f"{', '.join(step.recommended_tools) if step.recommended_tools else 'N/A'}\n"
         "Fallback tools: "
-        f"{', '.join(step.fallback_tools) if step.fallback_tools else 'N/A'}\n\n"
+        f"{', '.join(step.fallback_tools) if step.fallback_tools else 'N/A'}\n"
+        "Allowed tools for this step: "
+        f"{', '.join(step.allowed_tools) if step.allowed_tools else 'none'}\n\n"
         "Return concise output for this step only.\n"
         "Do not restate workflow contracts, constraints, or meta-guidelines.\n"
         "Prioritize directly answering the user query.\n"
+        "Do not call tools outside the allowed-tools list for this step.\n"
+        "When preferred tools are available, execute at least one relevant tool before finalizing the step.\n"
         "If tools are insufficient, state a fallback strategy instead of blocking.\n"
         "Use source citations whenever possible (PMID, NCT IDs).\n"
     )

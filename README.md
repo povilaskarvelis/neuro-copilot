@@ -89,6 +89,8 @@ General response contract used for broad request coverage:
 Terminal commands:
 - `status`: show current or latest workflow status
 - `resume [task_id]`: resume a saved task
+- `history [task_id]`: show recent saved revisions for rollback
+- `rollback <offset|revision_id> [task_id]`: restore a task to an earlier revision
 - `help`: show command help
 
 ## Project Structure
@@ -174,6 +176,29 @@ pytest test_agent_eval.py::test_sprint5_custom_weights -v
 # Run Sprint 6 evaluation (auto mode selection + minimal clarification)
 pytest test_agent_eval.py::test_sprint6_auto_mode_clarification -v
 ```
+
+One-command acceptance demo (fixed challenge scenarios + deterministic scoreboard):
+
+```bash
+python adk-agent/run_acceptance_demo.py
+```
+
+Artifacts are written to:
+- `adk-agent/acceptance/results/<run_id>/scoreboard.json`
+- `adk-agent/acceptance/results/<run_id>/summary.md`
+- `adk-agent/acceptance/results/<run_id>/reports/*.md`
+
+Useful options:
+- `--limit 1`: run only the first scenario for a quick smoke
+- `--only-scenario <scenario_id>`: run specific scenario(s)
+- `--non-strict`: always exit 0 even when checks fail
+
+CI automation:
+- Workflow file: `.github/workflows/acceptance-demo.yml`
+- Trigger: pushes to `main`/`master` and all pull requests
+- Behavior: runs strict acceptance harness (no `--non-strict`) and fails build on any scenario/checkpoint failure
+- Artifacts uploaded on every run (pass or fail): `scoreboard.json`, `summary.md`, scenario reports, HITL probe log
+- Required repository secret: `GOOGLE_API_KEY`
 
 Weighted rubric for general strategy quality:
 - `adk-agent/evals/co_investigator_rubric.md`

@@ -1,0 +1,93 @@
+name: Acceptance Demo
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+concurrency:
+  group: acceptance-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  acceptance-demo:
+    name: Strict Acceptance Harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate required secret
+        run: |
+          if [ -z "${GOOGLE_API_KEY}" ]; then
+            echo "::error::Missing GOOGLE_API_KEY secret. Add it in Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: research-mcp/package-lock.json
+
+      - name: Install MCP dependencies
+        working-directory: research-mcp
+        run: npm ci
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: adk-agent/requirements.txt
+
+      - name: Install agent dependencies
+        working-directory: adk-agent
+        run: pip install -r requirements.txt
+
+      - name: Run strict acceptance harness
+        working-directory: adk-agent
+        run: |
+          python run_acceptance_demo.py --scenario-timeout-sec 300 --hitl-timeout-sec 240
+
+      - name: Resolve latest acceptance artifact path
+        if: always()
+        id: latest-run
+        run: |
+          latest_dir="$(ls -1dt adk-agent/acceptance/results/*/ 2>/dev/null | head -n 1 || true)"
+          if [ -z "${latest_dir}" ]; then
+            echo "found=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          latest_dir="${latest_dir%/}"
+          echo "found=true" >> "${GITHUB_OUTPUT}"
+          echo "path=${latest_dir}" >> "${GITHUB_OUTPUT}"
+          echo "basename=$(basename "${latest_dir}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish acceptance summary
+        if: always() && steps.latest-run.outputs.found == 'true'
+        run: |
+          cat "${{ steps.latest-run.outputs.path }}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload acceptance artifacts
+        if: always() && steps.latest-run.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-results-${{ steps.latest-run.outputs.basename }}
+          path: |
+            ${{ steps.latest-run.outputs.path }}/scoreboard.json
+            ${{ steps.latest-run.outputs.path }}/summary.md
+            ${{ steps.latest-run.outputs.path }}/reports
+            ${{ steps.latest-run.outputs.path }}/hitl_probe_stdout.log
+          if-no-files-found: warn
+          retention-days: 30

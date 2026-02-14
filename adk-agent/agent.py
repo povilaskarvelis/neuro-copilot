@@ -41,6 +41,7 @@ from workflow import (
     render_plan,
     render_status,
     step_prompt,
+    tool_bundle_for_intent,
 )
 
 # Path to the MCP server
@@ -387,7 +388,7 @@ def create_clarifier_agent():
     )
 
 
-def create_agent():
+def create_agent(tool_filter: list[str] | None = None):
     """Create the ADK agent with MCP tools."""
     # Configure MCP server connection
     server_params = StdioServerParameters(
@@ -400,37 +401,299 @@ def create_agent():
         server_params=server_params,
         timeout=90.0,
     )
-    
-    # Connect to the MCP server
-    mcp_tools = McpToolset(connection_params=connection_params)
-    
+
+    mcp_tools = None
+    agent_tools = []
+    if tool_filter is None or len(tool_filter) > 0:
+        # Connect to the MCP server. If tool_filter is provided, enforce it for this runner.
+        mcp_tools = McpToolset(
+            connection_params=connection_params,
+            tool_filter=tool_filter,
+        )
+        agent_tools = [mcp_tools]
+
     # Create the agent
     agent = Agent(
         name="co_scientist",
         model="gemini-2.5-flash",
         instruction=AGENT_INSTRUCTION,
-        tools=[mcp_tools],
+        tools=agent_tools,
     )
-    
+
     return agent, mcp_tools
 
 
+STEP_SCOPE_TOOLS = {
+    "search_diseases",
+    "search_targets",
+    "expand_disease_context",
+}
+
+STEP_EVIDENCE_BACKSTOP_TOOLS = {
+    "search_pubmed_advanced",
+    "search_openalex_works",
+    "search_openalex_authors",
+    "search_clinical_trials",
+    "search_disease_targets",
+    "search_diseases",
+    "search_targets",
+    "expand_disease_context",
+    "get_target_info",
+    "get_gene_info",
+    "list_local_datasets",
+    "read_local_dataset",
+}
+
+
+def _is_reasoning_only_step(task: WorkflowTask, step_idx: int) -> bool:
+    return step_idx == 0 or step_idx == len(task.steps) - 1
+
+
+def _build_step_allowed_tools(task: WorkflowTask, step_idx: int) -> list[str]:
+    step = task.steps[step_idx]
+
+    # Keep request framing and final synthesis deterministic.
+    if _is_reasoning_only_step(task, step_idx):
+        return sorted(STEP_SCOPE_TOOLS) if step_idx == 0 else []
+
+    preferred, fallback = tool_bundle_for_intent(task.intent_tags)
+    allowed = set(step.recommended_tools + step.fallback_tools + preferred + fallback)
+    allowed.update(STEP_EVIDENCE_BACKSTOP_TOOLS)
+    return sorted(allowed)
+
+
+def _should_escalate_allowlist(step, trace_entries: list[dict], output: str) -> bool:
+    if not step.recommended_tools:
+        return False
+    if not trace_entries:
+        return True
+    outcomes = {str(entry.get("outcome", "unknown")) for entry in trace_entries}
+    if outcomes and outcomes.issubset({"error", "not_found_or_empty", "no_response"}):
+        return True
+    lower = (output or "").lower()
+    if any(token in lower for token in ["cannot be completed", "insufficient data", "unable to identify"]):
+        return True
+    return False
+
+
+def _build_escalated_allowed_tools(task: WorkflowTask, step_idx: int) -> list[str]:
+    base = set(_build_step_allowed_tools(task, step_idx))
+    # Escalation broadens coverage while keeping synthesis steps tool-free.
+    if _is_reasoning_only_step(task, step_idx):
+        return sorted(base)
+    base.update(
+        {
+            "search_pubmed",
+            "get_pubmed_abstract",
+            "get_pubmed_paper_details",
+            "get_pubmed_author_profile",
+            "get_target_drugs",
+            "check_druggability",
+            "search_clinvar_variants",
+            "search_gwas_associations",
+            "summarize_clinical_trials_landscape",
+            "summarize_target_expression_context",
+            "summarize_target_competitive_landscape",
+            "summarize_target_safety_liabilities",
+            "compare_targets_multi_axis",
+        }
+    )
+    return sorted(base)
+
+
+def _create_step_runner(base_runner, allowed_tools: list[str]):
+    step_agent, step_mcp_tools = create_agent(tool_filter=allowed_tools)
+    step_runner = Runner(
+        agent=step_agent,
+        app_name=base_runner.app_name,
+        session_service=base_runner.session_service,
+        artifact_service=getattr(base_runner, "artifact_service", None),
+        memory_service=getattr(base_runner, "memory_service", None),
+        credential_service=getattr(base_runner, "credential_service", None),
+    )
+    return step_runner, step_mcp_tools
+
+
 async def _run_runner_turn(runner, session_id: str, user_id: str, prompt: str) -> str:
-    """Run one model turn and collect text output."""
+    """Run one model turn and return text only."""
+    response_text, _ = await _run_runner_turn_with_trace(runner, session_id, user_id, prompt)
+    return response_text
+
+
+def _safe_model_dump(value) -> dict:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump(exclude_none=True)
+        except TypeError:
+            dumped = value.model_dump()
+        return dumped if isinstance(dumped, dict) else {"value": dumped}
+    return {"value": str(value)}
+
+
+def _normalize_trace_detail(text: str, *, max_chars: int = 260) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "")).strip()
+    if not normalized:
+        return ""
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[: max_chars - 3].rstrip()}..."
+
+
+def _extract_response_excerpt(response_payload) -> str:
+    if not isinstance(response_payload, dict):
+        return "No structured response payload captured."
+
+    content = response_payload.get("content")
+    snippets: list[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    snippets.append(text)
+
+    if not snippets:
+        output_payload = response_payload.get("output")
+        if isinstance(output_payload, str) and output_payload.strip():
+            snippets.append(output_payload)
+        elif output_payload is not None:
+            snippets.append(str(output_payload))
+
+    if not snippets:
+        error_payload = response_payload.get("error")
+        if error_payload:
+            snippets.append(str(error_payload))
+
+    if not snippets:
+        snippets.append(str(response_payload))
+    return _normalize_trace_detail(" | ".join(snippets))
+
+
+def _classify_tool_response(response_payload) -> tuple[str, str]:
+    if response_payload is None:
+        return "no_response", "Tool call was issued but no response payload was returned."
+    if not isinstance(response_payload, dict):
+        return "unknown", _normalize_trace_detail(str(response_payload))
+
+    excerpt = _extract_response_excerpt(response_payload)
+
+    explicit_error = bool(response_payload.get("error")) or response_payload.get("isError") is True
+    if explicit_error:
+        return "error", excerpt
+
+    lower = excerpt.lower()
+    not_found_markers = (
+        "not found",
+        "no results",
+        "no matching",
+        "no records",
+        "no data found",
+        "no target data found",
+        "no clinical trials found",
+        "no expression context found",
+        "couldn't find",
+        "unable to find",
+        "did not find",
+        "no evidence found",
+    )
+    if any(marker in lower for marker in not_found_markers):
+        return "not_found_or_empty", excerpt
+
+    return "ok", excerpt
+
+
+async def _run_runner_turn_with_trace(
+    runner,
+    session_id: str,
+    user_id: str,
+    prompt: str,
+) -> tuple[str, list[dict]]:
+    """Run one model turn and collect both text output and exact tool trace."""
     from google.genai.types import Content, Part
 
     message = Content(role="user", parts=[Part(text=prompt)])
     response_text = ""
+    trace_entries: list[dict] = []
+    pending_by_call_id: dict[str, int] = {}
+    pending_by_tool_name: dict[str, list[int]] = {}
+    sequence = 0
+
     async for event in runner.run_async(
         session_id=session_id,
         user_id=user_id,
         new_message=message,
     ):
-        if hasattr(event, "content") and event.content and hasattr(event.content, "parts"):
-            for part in event.content.parts:
-                if hasattr(part, "text") and part.text:
-                    response_text += part.text
-    return response_text.strip()
+        if not hasattr(event, "content") or not event.content or not hasattr(event.content, "parts"):
+            continue
+        if not event.content.parts:
+            continue
+        for part in event.content.parts:
+            if hasattr(part, "text") and part.text:
+                response_text += part.text
+
+            function_call = getattr(part, "function_call", None)
+            if function_call:
+                payload = _safe_model_dump(function_call)
+                sequence += 1
+                call_id = str(payload.get("id") or f"call-{sequence}")
+                tool_name = str(payload.get("name") or "unknown_tool")
+                args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+                entry = {
+                    "sequence": sequence,
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "outcome": "pending",
+                    "detail": "",
+                    "phase": "main",
+                }
+                trace_entries.append(entry)
+                pending_by_call_id[call_id] = len(trace_entries) - 1
+                pending_by_tool_name.setdefault(tool_name, []).append(len(trace_entries) - 1)
+
+            function_response = getattr(part, "function_response", None)
+            if function_response:
+                payload = _safe_model_dump(function_response)
+                call_id = str(payload.get("id") or "")
+                tool_name = str(payload.get("name") or "unknown_tool")
+                response_payload = payload.get("response")
+                outcome, detail = _classify_tool_response(response_payload)
+
+                target_index = pending_by_call_id.get(call_id) if call_id else None
+                if target_index is None:
+                    for candidate_index in pending_by_tool_name.get(tool_name, []):
+                        if trace_entries[candidate_index].get("outcome") == "pending":
+                            target_index = candidate_index
+                            break
+
+                if target_index is None:
+                    sequence += 1
+                    trace_entries.append(
+                        {
+                            "sequence": sequence,
+                            "call_id": call_id or f"response-{sequence}",
+                            "tool_name": tool_name,
+                            "args": {},
+                            "outcome": outcome,
+                            "detail": detail,
+                            "phase": "main",
+                        }
+                    )
+                    continue
+
+                trace_entries[target_index]["outcome"] = outcome
+                trace_entries[target_index]["detail"] = detail
+
+    for entry in trace_entries:
+        if entry.get("outcome") == "pending":
+            entry["outcome"] = "no_response"
+            entry["detail"] = "Tool call was issued but no matching function_response event was captured."
+
+    return response_text.strip(), trace_entries
 
 
 async def _execute_step(runner, session_id: str, user_id: str, task: WorkflowTask, step_idx: int) -> str:
@@ -441,11 +704,41 @@ async def _execute_step(runner, session_id: str, user_id: str, task: WorkflowTas
     step.status = "in_progress"
     task.touch()
 
+    step.allowed_tools = _build_step_allowed_tools(task, step_idx)
     prompt = step_prompt(task, step)
-    output = await _run_runner_turn(runner, session_id, user_id, prompt)
+
+    step_runner, step_mcp_tools = _create_step_runner(runner, step.allowed_tools)
+    try:
+        output, trace_entries = await _run_runner_turn_with_trace(step_runner, session_id, user_id, prompt)
+    finally:
+        if step_mcp_tools:
+            await step_mcp_tools.close()
+
+    if _should_escalate_allowlist(step, trace_entries, output):
+        escalated_tools = _build_escalated_allowed_tools(task, step_idx)
+        if set(escalated_tools) != set(step.allowed_tools):
+            step.allowed_tools = escalated_tools
+            escalated_runner, escalated_mcp_tools = _create_step_runner(runner, step.allowed_tools)
+            try:
+                escalated_output, escalated_trace = await _run_runner_turn_with_trace(
+                    escalated_runner,
+                    session_id,
+                    user_id,
+                    prompt,
+                )
+            finally:
+                if escalated_mcp_tools:
+                    await escalated_mcp_tools.close()
+            for entry in escalated_trace:
+                entry["phase"] = "step_allowlist_escalation"
+            if escalated_trace:
+                trace_entries.extend(escalated_trace)
+            if escalated_output:
+                output = escalated_output
 
     step.output = output if output else "(No response generated)"
     step.evidence_refs = extract_evidence_refs(step.output)
+    step.tool_trace = trace_entries
     step.status = "completed" if output else "blocked"
     task.touch()
     return step.output
@@ -455,6 +748,7 @@ def _evaluate_quality_gates(task: WorkflowTask) -> dict:
     evidence_count = len({ref for step in task.steps for ref in step.evidence_refs})
     steps_with_output = sum(1 for step in task.steps if step.output and step.output != "(No response generated)")
     coverage_ratio = steps_with_output / len(task.steps) if task.steps else 0.0
+    tool_call_count = sum(len(step.tool_trace) for step in task.steps)
 
     unresolved_gaps: list[str] = []
     combined_output = "\n".join(step.output for step in task.steps if step.output).lower()
@@ -480,12 +774,25 @@ def _evaluate_quality_gates(task: WorkflowTask) -> dict:
             unresolved_gaps.append("No concrete target or clinical-trial entities were detected in the synthesis.")
     if evidence_count == 0:
         unresolved_gaps.append("No citation evidence IDs were detected in the response.")
+    if tool_call_count == 0:
+        unresolved_gaps.append("No tool calls were captured for the workflow.")
+    missing_tool_steps = [
+        step.title
+        for step in task.steps
+        if step.status == "completed" and step.recommended_tools and not step.tool_trace
+    ]
+    if missing_tool_steps:
+        unresolved_gaps.append(
+            "Completed steps with recommended tools but no recorded tool execution: "
+            + ", ".join(missing_tool_steps)
+        )
 
-    passed = evidence_count >= 2 and coverage_ratio >= 0.9 and len(unresolved_gaps) == 0
+    passed = evidence_count >= 2 and coverage_ratio >= 0.9 and tool_call_count >= 1 and len(unresolved_gaps) == 0
     return {
         "passed": passed,
         "evidence_count": evidence_count,
         "coverage_ratio": coverage_ratio,
+        "tool_call_count": tool_call_count,
         "unresolved_gaps": unresolved_gaps,
     }
 
@@ -495,6 +802,7 @@ def _render_quality_gate_message(report: dict) -> str:
         "[Quality Gate Check]",
         f"- Evidence references found: {report['evidence_count']}",
         f"- Step coverage ratio: {report['coverage_ratio']:.2f}",
+        f"- Tool calls captured: {report.get('tool_call_count', 0)}",
     ]
     if report["unresolved_gaps"]:
         lines.append("- Unresolved critical gaps:")
@@ -524,7 +832,7 @@ def _clean_recovery_text(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
-async def _run_fallback_recovery(runner, session_id: str, user_id: str, task: WorkflowTask) -> str:
+async def _run_fallback_recovery(runner, session_id: str, user_id: str, task: WorkflowTask) -> tuple[str, list[dict]]:
     fallback_tools: list[str] = []
     for step in task.steps:
         fallback_tools.extend(step.fallback_tools)
@@ -534,11 +842,14 @@ async def _run_fallback_recovery(runner, session_id: str, user_id: str, task: Wo
         f"Objective: {task.objective}\n"
         f"Intent tags: {', '.join(task.intent_tags)}\n"
         f"Fallback tools to prioritize: {', '.join(fallback_tools) if fallback_tools else 'N/A'}\n"
+        "You must execute at least one relevant tool call unless no relevant tool exists.\n"
         "Required output fields: selected_tools, why_chosen, key_results, remaining_gaps.\n"
         "Use explicit citations where possible."
     )
-    raw = await _run_runner_turn(runner, session_id, user_id, prompt)
-    return _clean_recovery_text(raw)
+    raw, trace_entries = await _run_runner_turn_with_trace(runner, session_id, user_id, prompt)
+    for entry in trace_entries:
+        entry["phase"] = "fallback_recovery"
+    return _clean_recovery_text(raw), trace_entries
 
 
 async def _complete_remaining_steps(runner, session_id: str, user_id: str, task: WorkflowTask, state_store: TaskStateStore) -> dict:
@@ -546,14 +857,16 @@ async def _complete_remaining_steps(runner, session_id: str, user_id: str, task:
     for idx in range(task.current_step_index + 1, len(task.steps)):
         print(f"\n[Executing Step {idx + 1}] {task.steps[idx].title}")
         step_text = await _execute_step(runner, session_id, user_id, task, idx)
-        state_store.save_task(task)
+        state_store.save_task(task, note=f"step_{idx + 1}_completed")
         print(step_text)
 
     quality = _evaluate_quality_gates(task)
     print("\n" + _render_quality_gate_message(quality))
     if not quality["passed"]:
         print("\nRunning one fallback recovery pass...")
-        recovery = await _run_fallback_recovery(runner, session_id, user_id, task)
+        recovery, recovery_trace = await _run_fallback_recovery(runner, session_id, user_id, task)
+        if recovery_trace:
+            task.steps[-1].tool_trace.extend(recovery_trace)
         if recovery:
             task.steps[-1].output = f"{task.steps[-1].output}\n\nFallback recovery notes:\n{recovery}"
             task.steps[-1].evidence_refs = extract_evidence_refs(task.steps[-1].output)
@@ -567,7 +880,49 @@ def _print_hitl_prompt() -> None:
     print("  - continue")
     print("  - revise <new scope>")
     print("  - stop")
-    print("You can also run: status")
+    print("You can also run: status | history | rollback")
+
+
+def _resolve_default_task_id(active_task: WorkflowTask | None, state_store: TaskStateStore) -> str | None:
+    if active_task:
+        return active_task.task_id
+    latest = state_store.latest_task()
+    return latest.task_id if latest else None
+
+
+def _print_revision_history(state_store: TaskStateStore, task_id: str, limit: int = 12) -> None:
+    revisions = state_store.list_revisions(task_id, limit=limit)
+    if not revisions:
+        print(f"\nNo revision history found for task {task_id}.")
+        return
+    print(f"\nRevision history for task {task_id} (offset 0 = latest):")
+    for offset, entry in enumerate(revisions):
+        note = entry.get("note", "") or "-"
+        awaiting_hitl = "yes" if entry.get("awaiting_hitl") else "no"
+        print(
+            f"  {offset}. {entry.get('revision_id')} | {entry.get('saved_at')} | "
+            f"status={entry.get('status')} | step={entry.get('current_step_index')} | "
+            f"hitl={awaiting_hitl} | note={note}"
+        )
+
+
+def _resolve_rollback_revision_id(
+    state_store: TaskStateStore,
+    task_id: str,
+    token: str,
+) -> tuple[str | None, str | None]:
+    normalized = token.strip()
+    if not normalized:
+        return None, "Missing revision token."
+    if normalized.isdigit():
+        offset = int(normalized)
+        if offset < 0:
+            return None, "Rollback offset cannot be negative."
+        revisions = state_store.list_revisions(task_id, limit=max(20, offset + 1))
+        if offset >= len(revisions):
+            return None, f"Offset {offset} is out of range. Run `history {task_id}` first."
+        return str(revisions[offset].get("revision_id", "")), None
+    return normalized, None
 
 
 async def _start_new_workflow_task(
@@ -578,16 +933,16 @@ async def _start_new_workflow_task(
     objective: str,
 ) -> WorkflowTask:
     task = create_task(objective)
-    state_store.save_task(task)
+    state_store.save_task(task, note="task_created")
     print("\n[Planner Output]")
     print(render_plan(task))
     print(f"\n[Executing Step 1] {task.steps[0].title}")
     step_text = await _execute_step(runner, session_id, user_id, task, 0)
-    state_store.save_task(task)
+    state_store.save_task(task, note="step_1_completed")
     print(step_text)
     task.awaiting_hitl = True
     task.touch()
-    state_store.save_task(task)
+    state_store.save_task(task, note="hitl_checkpoint_opened")
     _print_hitl_prompt()
     return task
 
@@ -669,7 +1024,7 @@ async def run_interactive_async():
     print("  - 'Find promising drug targets for Parkinson's disease'")
     print("  - 'Evaluate LRRK2 as a drug target'")
     print("  - 'What clinical trials exist for Alzheimer's gamma-secretase inhibitors?'")
-    print("\nCommands: status | resume [task_id] | help | quit")
+    print("\nCommands: status | resume [task_id] | history [task_id] | rollback <offset|revision_id> [task_id] | help | quit")
     print("At HITL checkpoint: continue | revise <scope> | stop\n")
     print("-" * 60)
     
@@ -690,7 +1045,7 @@ async def run_interactive_async():
 
                 lowered = user_input.lower().strip()
                 if lowered == "help":
-                    print("\nCommands: status | resume [task_id] | help | quit")
+                    print("\nCommands: status | resume [task_id] | history [task_id] | rollback <offset|revision_id> [task_id] | help | quit")
                     print("At HITL checkpoint: continue | revise <scope> | stop")
                     continue
 
@@ -706,6 +1061,42 @@ async def run_interactive_async():
                         print("\nNo workflow task available.")
                     else:
                         print("\n" + render_status(task))
+                    continue
+
+                if lowered.startswith("history"):
+                    parts = user_input.split(maxsplit=1)
+                    task_id = parts[1].strip() if len(parts) > 1 else _resolve_default_task_id(active_task, state_store)
+                    if not task_id:
+                        print("\nNo workflow task available. Ask a query first.")
+                        continue
+                    _print_revision_history(state_store, task_id)
+                    continue
+
+                if lowered.startswith("rollback"):
+                    parts = user_input.split(maxsplit=2)
+                    if len(parts) < 2:
+                        print("\nUse: rollback <offset|revision_id> [task_id]")
+                        continue
+                    rollback_token = parts[1].strip()
+                    task_id = parts[2].strip() if len(parts) > 2 else _resolve_default_task_id(active_task, state_store)
+                    if not task_id:
+                        print("\nNo workflow task available to rollback.")
+                        continue
+                    revision_id, error_msg = _resolve_rollback_revision_id(state_store, task_id, rollback_token)
+                    if error_msg or not revision_id:
+                        print(f"\n{error_msg or 'Could not resolve rollback revision.'}")
+                        continue
+                    rolled_back = state_store.rollback_task(task_id, revision_id)
+                    if not rolled_back:
+                        print(f"\nRevision {revision_id} not found for task {task_id}.")
+                        continue
+                    pending_clarification_query = None
+                    pending_clarification_prompt = None
+                    active_task = rolled_back
+                    print(f"\nRolled back task {task_id} to revision {revision_id}.")
+                    print(render_status(active_task))
+                    if active_task.awaiting_hitl:
+                        _print_hitl_prompt()
                     continue
 
                 if pending_clarification_query:
@@ -757,7 +1148,7 @@ async def run_interactive_async():
                     )
                     active_task.status = "completed"
                     active_task.touch()
-                    state_store.save_task(active_task)
+                    state_store.save_task(active_task, note="workflow_completed")
                     print("\n" + "=" * 60)
                     print(render_final_report(active_task, quality_report=quality))
                     print("=" * 60)
@@ -788,14 +1179,14 @@ async def run_interactive_async():
                     if lowered == "continue":
                         active_task.hitl_history.append("continue")
                         active_task.awaiting_hitl = False
-                        state_store.save_task(active_task)
+                        state_store.save_task(active_task, note="hitl_continue")
                         quality = await _complete_remaining_steps(
                             runner, session.id, "researcher", active_task, state_store
                         )
 
                         active_task.status = "completed"
                         active_task.touch()
-                        state_store.save_task(active_task)
+                        state_store.save_task(active_task, note="workflow_completed")
                         print("\n" + "=" * 60)
                         print(render_final_report(active_task, quality_report=quality))
                         print("=" * 60)
@@ -829,7 +1220,7 @@ async def run_interactive_async():
                         )
                         active_task.hitl_history.append(revision_note)
                         active_task.touch()
-                        state_store.save_task(active_task)
+                        state_store.save_task(active_task, note=revision_note)
                         continue
 
                     if lowered == "stop":
@@ -837,7 +1228,7 @@ async def run_interactive_async():
                         active_task.status = "blocked"
                         active_task.awaiting_hitl = False
                         active_task.touch()
-                        state_store.save_task(active_task)
+                        state_store.save_task(active_task, note="workflow_stopped")
                         print("\nWorkflow stopped and saved.")
                         continue
 
@@ -885,7 +1276,7 @@ def run_interactive():
     asyncio.run(run_interactive_async())
 
 
-async def run_single_query_async(query: str):
+async def run_single_query_async(query: str, *, state_store_path: Path | None = None):
     """Run a single query (async version)."""
     from google.adk.sessions import InMemorySessionService
 
@@ -928,17 +1319,20 @@ async def run_single_query_async(query: str):
         app_name="co_scientist",
         user_id="researcher",
     )
-    state_store = TaskStateStore(Path(__file__).parent / "state" / "workflow_tasks.json")
+    default_state_path = Path(__file__).parent / "state" / "workflow_tasks.json"
+    state_store = TaskStateStore(state_store_path or default_state_path)
     task = create_task(query)
-    state_store.save_task(task)
+    state_store.save_task(task, note="task_created_single_query")
 
     for idx in range(len(task.steps)):
         await _execute_step(runner, session.id, "researcher", task, idx)
-        state_store.save_task(task)
+        state_store.save_task(task, note=f"step_{idx + 1}_completed_single_query")
 
     quality = _evaluate_quality_gates(task)
     if not quality["passed"]:
-        recovery = await _run_fallback_recovery(runner, session.id, "researcher", task)
+        recovery, recovery_trace = await _run_fallback_recovery(runner, session.id, "researcher", task)
+        if recovery_trace:
+            task.steps[-1].tool_trace.extend(recovery_trace)
         if recovery:
             task.steps[-1].output = f"{task.steps[-1].output}\n\nFallback recovery notes:\n{recovery}"
             task.steps[-1].evidence_refs = extract_evidence_refs(task.steps[-1].output)
@@ -946,16 +1340,16 @@ async def run_single_query_async(query: str):
 
     task.status = "completed"
     task.touch()
-    state_store.save_task(task)
+    state_store.save_task(task, note="workflow_completed_single_query")
     report = render_final_report(task, quality_report=quality)
 
     await mcp_tools.close()
     return report
 
 
-def run_single_query(query: str):
+def run_single_query(query: str, *, state_store_path: Path | None = None):
     """Run a single query (useful for testing)."""
-    return asyncio.run(run_single_query_async(query))
+    return asyncio.run(run_single_query_async(query, state_store_path=state_store_path))
 
 
 if __name__ == "__main__":

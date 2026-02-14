@@ -1,0 +1,23 @@
+{
+  "scenarios": [
+    {
+      "id": "challenge7_ipf_researcher",
+      "challenge": "7",
+      "title": "Co-Investigator IPF Researcher Discovery",
+      "prompt": "Find researchers who have published on idiopathic pulmonary fibrosis treatment in the last 3 years, include affiliations, and summarize evidence with citations.",
+      "expected_themes": ["researcher", "affiliation", "pmid"]
+    },
+    {
+      "id": "challenge2_target_or_trap_bace1",
+      "challenge": "2",
+      "title": "Target or Trap BACE1 Risk Assessment",
+      "prompt": "Target or Trap: should BACE1 still be pursued for Alzheimer's disease? Provide a risk assessment with evidence, limitations, and next actions.",
+      "expected_themes": ["recommendation", "risk", "safety", "evidence"]
+    }
+  ],
+  "hitl_probe": {
+    "id": "challenge7_hitl_probe",
+    "title": "HITL Checkpoint Predictability Probe",
+    "prompt": "Find researchers who have published on idiopathic pulmonary fibrosis treatment in the last 3 years."
+  }
+}
