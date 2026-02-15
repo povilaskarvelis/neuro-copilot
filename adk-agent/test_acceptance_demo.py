@@ -5,6 +5,12 @@ from run_acceptance_demo import _score_report
 
 def test_score_report_passes_expected_contract():
     report = """
+## Decomposition
+1. Query disease/topic context and timeframe constraints. (completed)
+2. Identify topic-matched publications from OpenAlex/PubMed. (completed)
+3. Find candidate authors and affiliation signals. (completed)
+4. Assess author activity and produce ranked shortlist. (completed)
+
 ## Answer
 Recommendation: proceed cautiously with clear safety gating.
 
@@ -61,7 +67,7 @@ Recommendation: proceed cautiously with clear safety gating.
     checks, metrics = _score_report(report, ["researcher", "affiliation", "pmid", "risk", "safety", "evidence"])
 
     assert all(checks.values())
-    assert metrics["step_count"] == 3
+    assert metrics["decomposition_count"] == 4
     assert metrics["tool_call_count"] == 3
     assert metrics["evidence_count"] == 2
     assert metrics["source_family_count"] >= 2
@@ -77,4 +83,4 @@ def test_score_report_fails_on_missing_contract_sections():
     assert checks["evidence_refs_present"] is False
     assert checks["quality_gate_passed"] is False
     assert checks["multi_source_trace"] is False
-    assert metrics["step_count"] == 0
+    assert metrics["decomposition_count"] == 0

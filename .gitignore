@@ -11,6 +11,9 @@ venv/
 *.egg-info/
 .pytest_cache/
 adk-agent/acceptance/results/
+adk-agent/reports/
+output/
+outputs/
 
 # Node.js
 node_modules/
@@ -23,3 +26,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Local challenge notes
+challenges.txt

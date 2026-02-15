@@ -1,23 +1,26 @@
 {
   "scenarios": [
     {
-      "id": "challenge7_ipf_researcher",
+      "id": "challenge7_co_scientist_researcher_discovery",
       "challenge": "7",
-      "title": "Co-Investigator IPF Researcher Discovery",
-      "prompt": "Find researchers who have published on idiopathic pulmonary fibrosis treatment in the last 3 years, include affiliations, and summarize evidence with citations.",
+      "title": "Co-Scientist Capability Check: Researcher Discovery with Affiliations and Citations",
+      "topic_fixture": "LRRK2 inhibitor development in Parkinson's disease (example fixture)",
+      "prompt": "Find researchers who have published on LRRK2 inhibitor development for Parkinson's disease in the last 3 years, include affiliations, and summarize evidence with citations.",
       "expected_themes": ["researcher", "affiliation", "pmid"]
     },
     {
-      "id": "challenge2_target_or_trap_bace1",
+      "id": "challenge2_co_scientist_target_or_trap",
       "challenge": "2",
-      "title": "Target or Trap BACE1 Risk Assessment",
+      "title": "Co-Scientist Capability Check: Target-or-Trap Decision with Risks and Next Actions",
+      "topic_fixture": "BACE1 in Alzheimer's disease (example fixture)",
       "prompt": "Target or Trap: should BACE1 still be pursued for Alzheimer's disease? Provide a risk assessment with evidence, limitations, and next actions.",
       "expected_themes": ["recommendation", "risk", "safety", "evidence"]
     }
   ],
   "hitl_probe": {
-    "id": "challenge7_hitl_probe",
-    "title": "HITL Checkpoint Predictability Probe",
-    "prompt": "Find researchers who have published on idiopathic pulmonary fibrosis treatment in the last 3 years."
+    "id": "challenge7_co_scientist_hitl_checkpoint_probe",
+    "title": "Co-Scientist Capability Check: Predictable HITL Checkpoint",
+    "topic_fixture": "LRRK2 inhibitor development in Parkinson's disease (example fixture)",
+    "prompt": "Find researchers who have published on LRRK2 inhibitor development for Parkinson's disease in the last 3 years."
   }
 }

@@ -87,6 +87,7 @@ jobs:
           path: |
             ${{ steps.latest-run.outputs.path }}/scoreboard.json
             ${{ steps.latest-run.outputs.path }}/summary.md
+            ${{ steps.latest-run.outputs.path }}/summary.pdf
             ${{ steps.latest-run.outputs.path }}/reports
             ${{ steps.latest-run.outputs.path }}/hitl_probe_stdout.log
           if-no-files-found: warn

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+from report_pdf import write_markdown_pdf
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -31,10 +32,10 @@ DEFAULT_RESULTS_ROOT = SCRIPT_DIR / "acceptance" / "results"
 load_dotenv(SCRIPT_DIR / ".env")
 
 CRITERIA = {
-    "report_contract": "Report contains Answer, Methodology, Evidence, and Diagnostics sections.",
-    "step_count_2_to_3": "Methodology includes a fixed 2-3 step workflow.",
-    "tool_trace_present": "Methodology includes an explicit executed tool trace with call IDs.",
-    "evidence_refs_present": "Evidence section includes at least two citation identifiers.",
+    "report_contract": "Report contains Decomposition, Answer, Methodology, and Diagnostics sections.",
+    "decomposition_visible": "Decomposition includes explicit executable sub-tasks.",
+    "tool_trace_present": "Methodology includes a high-level tool activity summary.",
+    "evidence_refs_present": "Report includes at least two citation identifiers.",
     "quality_gate_passed": "Diagnostics reports a passing quality gate.",
     "theme_coverage": "Scenario-specific expected themes are present in the answer.",
     "multi_source_trace": "Tool trace spans at least two distinct source families.",
@@ -95,7 +96,7 @@ TOOL_FAMILY_MAP = {
     "local_data": {"list_local_datasets", "read_local_dataset"},
 }
 
-REQUIRED_REPORT_HEADINGS = ["Answer", "Methodology", "Evidence", "Diagnostics"]
+REQUIRED_REPORT_HEADINGS = ["Decomposition", "Answer", "Methodology", "Diagnostics"]
 
 
 def _now_iso_utc() -> str:
@@ -106,6 +107,24 @@ def _sha256_file(path: Path) -> str:
     hasher = hashlib.sha256()
     hasher.update(path.read_bytes())
     return hasher.hexdigest()
+
+
+def _write_markdown_with_pdf(
+    markdown_path: Path,
+    content: str,
+    *,
+    title: str,
+    enable_pdf: bool = True,
+) -> tuple[str, str | None]:
+    normalized = (content or "").rstrip() + "\n"
+    markdown_path.write_text(normalized, encoding="utf-8")
+    if not enable_pdf:
+        return "", "PDF export disabled by --no-pdf."
+    pdf_path = markdown_path.with_suffix(".pdf")
+    pdf_error = write_markdown_pdf(normalized, pdf_path, title=title)
+    if pdf_error:
+        return "", pdf_error
+    return str(pdf_path), None
 
 
 def _extract_section(report: str, heading: str) -> str:
@@ -121,8 +140,9 @@ def _extract_section(report: str, heading: str) -> str:
 
 
 def _extract_evidence_items(report: str) -> list[str]:
-    evidence_block = _extract_section(report, "Evidence")
     items: set[str] = set()
+    evidence_block = _extract_section(report, "Evidence")
+    # Backward-compatible parse for explicit evidence sections.
     for raw in evidence_block.splitlines():
         line = raw.strip()
         if not line.startswith("- "):
@@ -134,11 +154,39 @@ def _extract_evidence_items(report: str) -> list[str]:
         if lowered.startswith("no explicit citation"):
             continue
         items.add(item)
+
+    # New format: citations can appear inline across Answer/Methodology/Fallback sections.
+    citation_patterns = [
+        r"\bPMID:\d+\b",
+        r"\bNCT\d{8}\b",
+        r"\bDOI:[^\s,;)\]]+\b",
+        r"\bOpenAlex:[A-Za-z0-9]+\b",
+        r"https?://openalex\.org/[A-Za-z0-9._/-]+",
+    ]
+    for pattern in citation_patterns:
+        for match in re.findall(pattern, report, flags=re.IGNORECASE):
+            items.add(str(match).strip())
+
     return sorted(items)
 
 
 def _extract_tool_names(report: str) -> list[str]:
-    return re.findall(r"\[[^\]]+\]\s+([a-zA-Z0-9_]+)\(call_id=", report)
+    names = re.findall(r"\[[^\]]+\]\s+([a-zA-Z0-9_]+)\(call_id=", report)
+    if names:
+        return names
+    # Concise format fallback: parse "Tools involved: tool_a, tool_b"
+    fallback_names: list[str] = []
+    for line in report.splitlines():
+        if not line.strip().lower().startswith("- tools involved:"):
+            continue
+        raw = line.split(":", 1)[1].strip()
+        if not raw or raw.lower() == "none":
+            continue
+        for part in raw.split(","):
+            value = part.strip()
+            if value:
+                fallback_names.append(value)
+    return fallback_names
 
 
 def _tool_family(tool_name: str) -> str:
@@ -161,9 +209,14 @@ def _score_report(report: str, expected_themes: list[str]) -> tuple[dict[str, bo
         heading: bool(re.search(rf"^##\s+{re.escape(heading)}\s*$", report, flags=re.MULTILINE))
         for heading in REQUIRED_REPORT_HEADINGS
     }
-    step_count = len(re.findall(r"^### Step \d+:", report, flags=re.MULTILINE))
+    decomposition_block = _extract_section(report, "Decomposition")
+    decomposition_count = len(re.findall(r"^\s*(?:\d+[.)]|-)\s+.+$", decomposition_block, flags=re.MULTILINE))
     tool_call_count = report.count("call_id=")
-    tool_trace_visible = "- Executed tool trace:" in report
+    tool_trace_visible = (
+        "- Executed tool trace:" in report
+        or "- Tool activity summary:" in report
+        or "- Tools involved:" in report
+    )
     evidence_items = _extract_evidence_items(report)
     quality_gate_match = re.search(r"- Quality gate passed:\s*(yes|no)", report, flags=re.IGNORECASE)
     quality_gate_passed = bool(quality_gate_match and quality_gate_match.group(1).lower() == "yes")
@@ -176,8 +229,8 @@ def _score_report(report: str, expected_themes: list[str]) -> tuple[dict[str, bo
 
     checks = {
         "report_contract": all(section_presence.values()),
-        "step_count_2_to_3": 2 <= step_count <= 3,
-        "tool_trace_present": tool_trace_visible and tool_call_count >= 1,
+        "decomposition_visible": decomposition_count >= 2,
+        "tool_trace_present": tool_trace_visible,
         "evidence_refs_present": len(evidence_items) >= 2,
         "quality_gate_passed": quality_gate_passed,
         "theme_coverage": theme_coverage,
@@ -185,7 +238,7 @@ def _score_report(report: str, expected_themes: list[str]) -> tuple[dict[str, bo
     }
     metrics = {
         "sections_present": section_presence,
-        "step_count": step_count,
+        "decomposition_count": decomposition_count,
         "tool_call_count": tool_call_count,
         "diagnostics_tool_calls": diagnostics_tool_calls,
         "evidence_items": evidence_items,
@@ -203,6 +256,7 @@ async def _run_scenario(
     *,
     output_dir: Path,
     scenario_timeout_sec: int,
+    enable_pdf: bool = True,
 ) -> dict[str, Any]:
     from agent import run_single_query_async
 
@@ -212,6 +266,7 @@ async def _run_scenario(
     report_path = output_dir / "reports" / f"{scenario_id}.md"
     state_path = output_dir / "state" / f"{scenario_id}.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
+    pdf_title = f"Acceptance Scenario Report ({scenario_id})"
     started = time.perf_counter()
 
     try:
@@ -225,7 +280,12 @@ async def _run_scenario(
             f"Scenario timed out after {scenario_timeout_sec}s. "
             "Likely causes: external API latency or MCP request timeout."
         )
-        report_path.write_text(timeout_message + "\n", encoding="utf-8")
+        report_pdf_file, report_pdf_error = _write_markdown_with_pdf(
+            report_path,
+            timeout_message,
+            title=pdf_title,
+            enable_pdf=enable_pdf,
+        )
         return {
             "id": scenario_id,
             "challenge": str(scenario.get("challenge", "")),
@@ -239,11 +299,18 @@ async def _run_scenario(
             "metrics": {},
             "error": timeout_message,
             "report_file": str(report_path),
+            "report_pdf_file": report_pdf_file,
+            "report_pdf_error": report_pdf_error,
         }
     except Exception as exc:  # pragma: no cover - defensive catch for demo runs
         duration_sec = round(time.perf_counter() - started, 2)
         error_message = f"{type(exc).__name__}: {exc}"
-        report_path.write_text(error_message + "\n", encoding="utf-8")
+        report_pdf_file, report_pdf_error = _write_markdown_with_pdf(
+            report_path,
+            error_message,
+            title=pdf_title,
+            enable_pdf=enable_pdf,
+        )
         return {
             "id": scenario_id,
             "challenge": str(scenario.get("challenge", "")),
@@ -257,10 +324,17 @@ async def _run_scenario(
             "metrics": {},
             "error": error_message,
             "report_file": str(report_path),
+            "report_pdf_file": report_pdf_file,
+            "report_pdf_error": report_pdf_error,
         }
 
     duration_sec = round(time.perf_counter() - started, 2)
-    report_path.write_text(report + "\n", encoding="utf-8")
+    report_pdf_file, report_pdf_error = _write_markdown_with_pdf(
+        report_path,
+        report,
+        title=pdf_title,
+        enable_pdf=enable_pdf,
+    )
 
     if report.lstrip().startswith("## Clarification Needed"):
         checks = {name: False for name in CRITERIA}
@@ -277,6 +351,8 @@ async def _run_scenario(
             "metrics": {"clarification_needed": True},
             "error": "Scenario returned a clarification request instead of a final report.",
             "report_file": str(report_path),
+            "report_pdf_file": report_pdf_file,
+            "report_pdf_error": report_pdf_error,
         }
 
     checks, metrics = _score_report(report, expected_themes)
@@ -295,6 +371,8 @@ async def _run_scenario(
         "metrics": metrics,
         "error": None,
         "report_file": str(report_path),
+        "report_pdf_file": report_pdf_file,
+        "report_pdf_error": report_pdf_error,
     }
 
 
@@ -433,18 +511,18 @@ def _build_summary_markdown(scoreboard: dict[str, Any]) -> str:
         "",
         "## Scenario Results",
         "",
-        "| Scenario | Challenge | Status | Duration (s) | Steps | Tool Calls | Evidence IDs | Source Families | Failed Checks |",
+        "| Scenario | Challenge | Status | Duration (s) | Decomposition Items | Tool Calls | Evidence IDs | Source Families | Failed Checks |",
         "|---|---|---|---:|---:|---:|---:|---:|---|",
     ]
     for result in scoreboard["scenario_results"]:
         metrics = result.get("metrics", {})
         lines.append(
-            "| {id} | {challenge} | {status} | {duration:.2f} | {steps} | {tool_calls} | {evidence} | {families} | {failed} |".format(
+            "| {id} | {challenge} | {status} | {duration:.2f} | {decomposition} | {tool_calls} | {evidence} | {families} | {failed} |".format(
                 id=result.get("id", ""),
                 challenge=result.get("challenge", ""),
                 status=result.get("status", ""),
                 duration=float(result.get("duration_sec", 0.0)),
-                steps=int(metrics.get("step_count", 0)),
+                decomposition=int(metrics.get("decomposition_count", 0)),
                 tool_calls=int(metrics.get("tool_call_count", 0)),
                 evidence=int(metrics.get("evidence_count", 0)),
                 families=int(metrics.get("source_family_count", 0)),
@@ -517,6 +595,8 @@ async def _run_acceptance(args: argparse.Namespace) -> tuple[int, Path]:
                     "metrics": {},
                     "error": "Dry run: scenario execution skipped.",
                     "report_file": "",
+                    "report_pdf_file": "",
+                    "report_pdf_error": "PDF export disabled by --no-pdf." if args.no_pdf else None,
                 }
             )
     else:
@@ -527,6 +607,7 @@ async def _run_acceptance(args: argparse.Namespace) -> tuple[int, Path]:
                 scenario,
                 output_dir=run_dir,
                 scenario_timeout_sec=args.scenario_timeout_sec,
+                enable_pdf=not args.no_pdf,
             )
             scenario_results.append(result)
             print(
@@ -560,6 +641,7 @@ async def _run_acceptance(args: argparse.Namespace) -> tuple[int, Path]:
         "run_id": run_id,
         "generated_at_utc": _now_iso_utc(),
         "execution_mode": "dry_run" if args.dry_run else "live",
+        "pdf_enabled": not args.no_pdf,
         "config_path": str(args.config.resolve()),
         "config_sha256": _sha256_file(args.config),
         "criteria": CRITERIA,
@@ -580,11 +662,30 @@ async def _run_acceptance(args: argparse.Namespace) -> tuple[int, Path]:
 
     scoreboard_path = run_dir / "scoreboard.json"
     summary_path = run_dir / "summary.md"
+    summary_content = _build_summary_markdown(scoreboard)
+    summary_pdf_path = summary_path.with_suffix(".pdf")
+    summary_path.write_text(summary_content, encoding="utf-8")
+    if args.no_pdf:
+        summary_pdf_error = "PDF export disabled by --no-pdf."
+    else:
+        summary_pdf_error = write_markdown_pdf(
+            summary_content,
+            summary_pdf_path,
+            title=f"Acceptance Summary ({run_id})",
+        )
+    scoreboard["summary_file"] = str(summary_path)
+    scoreboard["summary_pdf_file"] = "" if summary_pdf_error else str(summary_pdf_path)
+    scoreboard["summary_pdf_error"] = summary_pdf_error
     scoreboard_path.write_text(json.dumps(scoreboard, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
-    summary_path.write_text(_build_summary_markdown(scoreboard), encoding="utf-8")
 
     print(f"[acceptance] scoreboard={scoreboard_path}")
     print(f"[acceptance] summary={summary_path}")
+    if args.no_pdf:
+        print("[acceptance] summary_pdf=disabled (--no-pdf)")
+    elif summary_pdf_error:
+        print(f"[acceptance] summary_pdf=not_generated ({summary_pdf_error})")
+    else:
+        print(f"[acceptance] summary_pdf={summary_pdf_path}")
     print(
         f"[acceptance] overall_pass={overall_pass} "
         f"scenarios_passed={scenarios_passed}/{len(evaluated)} hitl_passed={hitl_passed}"
@@ -647,6 +748,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate config and emit artifacts without running scenarios.",
+    )
+    parser.add_argument(
+        "--no-pdf",
+        action="store_true",
+        help="Skip PDF artifact generation and write markdown artifacts only.",
     )
     return parser
 

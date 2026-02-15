@@ -24,6 +24,7 @@ const GWAS_API = "https://www.ebi.ac.uk/gwas/rest/api";
 const CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data";
 const OLS_API = "https://www.ebi.ac.uk/ols4";
 const DATA_DIR = path.resolve(__dirname, "data");
+const OPENALEX_MAILTO = process.env.OPENALEX_MAILTO || process.env.CONTACT_EMAIL || "";
 
 function sanitizeXmlText(value) {
   if (!value) return "";
@@ -38,12 +39,41 @@ async function fetchJson(url) {
   return response.json();
 }
 
-async function fetchJsonWithRetry(url, options = {}) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseRetryAfterMs(value) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1000;
+  }
+  const retryDate = Date.parse(value);
+  if (Number.isFinite(retryDate)) {
+    const delta = retryDate - Date.now();
+    return delta > 0 ? delta : 0;
+  }
+  return null;
+}
+
+function buildOpenAlexUrl(pathname, params = new URLSearchParams()) {
+  const nextParams = new URLSearchParams(params);
+  if (OPENALEX_MAILTO && !nextParams.has("mailto")) {
+    nextParams.set("mailto", OPENALEX_MAILTO);
+  }
+  const query = nextParams.toString();
+  return query ? `${OPENALEX_API}${pathname}?${query}` : `${OPENALEX_API}${pathname}`;
+}
+
+async function fetchWithRetry(url, options = {}) {
   const retries = options.retries ?? 2;
-  const timeoutMs = options.timeoutMs ?? 20000;
+  const timeoutMs = options.timeoutMs ?? 12000;
+  const maxBackoffMs = options.maxBackoffMs ?? 4000;
   const fetchOptions = { ...options };
   delete fetchOptions.retries;
   delete fetchOptions.timeoutMs;
+  delete fetchOptions.maxBackoffMs;
 
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -52,26 +82,43 @@ async function fetchJsonWithRetry(url, options = {}) {
     try {
       const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
       clearTimeout(timer);
-      if (!response.ok) {
-        throw new Error(`Request failed (${response.status})`);
+      if (response.ok) {
+        return response;
       }
-      return await response.json();
+
+      const retryable = response.status === 429 || response.status >= 500;
+      const responseBody = await response.text().catch(() => "");
+      lastError = new Error(
+        `Request failed (${response.status}): ${url}${
+          responseBody ? ` | ${responseBody.slice(0, 220).replace(/\s+/g, " ").trim()}` : ""
+        }`
+      );
+      if (!retryable || attempt >= retries) {
+        throw lastError;
+      }
+      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+      const backoffMs = Math.min(maxBackoffMs, retryAfterMs ?? Math.min(maxBackoffMs, 600 * 2 ** attempt));
+      await sleep(backoffMs + Math.floor(Math.random() * 200));
     } catch (error) {
       clearTimeout(timer);
       lastError = error;
-      if (attempt < retries) {
-        await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+      if (attempt >= retries) {
+        throw lastError;
       }
+      const backoffMs = Math.min(maxBackoffMs, 600 * 2 ** attempt);
+      await sleep(backoffMs + Math.floor(Math.random() * 200));
     }
   }
   throw lastError;
 }
 
+async function fetchJsonWithRetry(url, options = {}) {
+  const response = await fetchWithRetry(url, options);
+  return response.json();
+}
+
 async function fetchText(url) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Request failed (${response.status}): ${url}`);
-  }
+  const response = await fetchWithRetry(url);
   return response.text();
 }
 
@@ -1762,8 +1809,8 @@ server.registerTool(
       if (toYear) filters.push(`to_publication_date:${toYear}-12-31`);
       const params = new URLSearchParams({ search: query, per_page: String(limit) });
       if (filters.length) params.set("filter", filters.join(","));
-      const url = `${OPENALEX_API}/works?${params.toString()}`;
-      const data = await fetchJsonWithRetry(url);
+      const url = buildOpenAlexUrl("/works", params);
+      const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
       const results = data?.results ?? [];
       const keyFields = results.map((w, idx) => {
         const firstAuthor = w.authorships?.[0]?.author?.display_name || "Unknown";
@@ -1802,8 +1849,8 @@ server.registerTool(
   },
   async ({ query, limit = 10 }) => {
     try {
-      const url = `${OPENALEX_API}/authors?${new URLSearchParams({ search: query, per_page: String(limit) }).toString()}`;
-      const data = await fetchJsonWithRetry(url);
+      const url = buildOpenAlexUrl("/authors", new URLSearchParams({ search: query, per_page: String(limit) }));
+      const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
       const results = data?.results ?? [];
       const keyFields = results.map((a, idx) => {
         const inst = a.last_known_institution?.display_name || "Unknown institution";
@@ -1843,38 +1890,160 @@ server.registerTool(
   },
   async ({ query, limit = 10, fromYear }) => {
     try {
-      const authorUrl = `${OPENALEX_API}/authors?${new URLSearchParams({ search: query, per_page: String(limit) }).toString()}`;
-      const data = await fetchJsonWithRetry(authorUrl);
-      const candidates = data?.results ?? [];
-      const scored = candidates.map((a) => {
-        const recentWorks =
-          (a.counts_by_year || [])
-            .filter((y) => Number(y.year) >= Number(fromYear))
-            .reduce((sum, y) => sum + (y.works_count || 0), 0);
-        const worksCount = a.works_count || 0;
-        const citedBy = a.cited_by_count || 0;
-        const score = 0.5 * Math.log1p(recentWorks) + 0.3 * Math.log1p(worksCount) + 0.2 * Math.log1p(citedBy);
+      const boundedLimit = Math.max(1, Math.min(25, Math.round(limit)));
+      const nowYear = new Date().getUTCFullYear();
+      const normalizedFromYear = Number.isFinite(Number(fromYear))
+        ? Math.max(1990, Math.min(nowYear, Math.round(Number(fromYear))))
+        : nowYear - 6;
+      const worksPerPage = 100;
+      const maxPages = 2;
+
+      const sources = [];
+      const byAuthor = new Map();
+      let scannedWorks = 0;
+
+      for (let page = 1; page <= maxPages; page++) {
+        const filters = [`from_publication_date:${normalizedFromYear}-01-01`, "type:article|review"];
+        const params = new URLSearchParams({
+          search: query,
+          sort: "cited_by_count:desc",
+          per_page: String(worksPerPage),
+          page: String(page),
+          filter: filters.join(","),
+        });
+        const worksUrl = buildOpenAlexUrl("/works", params);
+        const data = await fetchJsonWithRetry(worksUrl, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
+        const works = data?.results ?? [];
+        if (works.length === 0) {
+          break;
+        }
+        sources.push(worksUrl);
+        scannedWorks += works.length;
+
+        for (const work of works) {
+          const title = work?.display_name || "Untitled";
+          const citedBy = Number(work?.cited_by_count || 0);
+          const year = Number(work?.publication_year || 0);
+          const authorships = Array.isArray(work?.authorships) ? work.authorships : [];
+
+          for (let idx = 0; idx < authorships.length; idx++) {
+            const authorship = authorships[idx];
+            const authorId = authorship?.author?.id;
+            if (!authorId) continue;
+            const authorName = authorship?.author?.display_name || "Unknown";
+            const authorRecord = byAuthor.get(authorId) || {
+              id: authorId,
+              name: authorName,
+              topicWorks: 0,
+              topicCitations: 0,
+              recentTopicWorks: 0,
+              firstAuthorWorks: 0,
+              lastAuthorWorks: 0,
+              activeYears: new Set(),
+              institutionCounts: new Map(),
+              exampleWorks: [],
+            };
+
+            authorRecord.topicWorks += 1;
+            authorRecord.topicCitations += citedBy;
+            if (year >= nowYear - 3) {
+              authorRecord.recentTopicWorks += 1;
+            }
+            if (idx === 0) {
+              authorRecord.firstAuthorWorks += 1;
+            }
+            if (idx === authorships.length - 1) {
+              authorRecord.lastAuthorWorks += 1;
+            }
+            if (year > 0) {
+              authorRecord.activeYears.add(year);
+            }
+            const institutions = Array.isArray(authorship?.institutions) ? authorship.institutions : [];
+            for (const inst of institutions) {
+              const instName = inst?.display_name;
+              if (!instName) continue;
+              authorRecord.institutionCounts.set(instName, (authorRecord.institutionCounts.get(instName) || 0) + 1);
+            }
+            if (authorRecord.exampleWorks.length < 3) {
+              authorRecord.exampleWorks.push({
+                title,
+                year,
+                citedBy,
+              });
+            }
+            byAuthor.set(authorId, authorRecord);
+          }
+        }
+
+        if (works.length < worksPerPage) {
+          break;
+        }
+      }
+
+      if (byAuthor.size === 0) {
         return {
-          name: a.display_name || "Unknown",
-          id: a.id,
-          institution: a.last_known_institution?.display_name || "Unknown institution",
-          recentWorks,
-          worksCount,
-          citedBy,
-          score,
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: `No OpenAlex works matched query "${query}" for topic-based researcher ranking.`,
+                keyFields: [`From year: ${normalizedFromYear}`],
+                sources: sources.length > 0 ? sources : [buildOpenAlexUrl("/works", new URLSearchParams({ search: query }))],
+                limitations: ["Try broader disease/topic terms or an earlier fromYear."],
+              }),
+            },
+          ],
         };
+      }
+
+      const scored = Array.from(byAuthor.values())
+        .map((author) => {
+          const leadership = author.firstAuthorWorks + author.lastAuthorWorks;
+          const activeYears = author.activeYears.size;
+          const score =
+            0.45 * Math.log1p(author.topicWorks) +
+            0.35 * Math.log1p(author.topicCitations) +
+            0.12 * Math.log1p(author.recentTopicWorks) +
+            0.08 * Math.log1p(leadership) +
+            0.05 * Math.log1p(activeYears);
+          const topInstitution =
+            Array.from(author.institutionCounts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] || "Unknown institution";
+          return {
+            id: author.id,
+            name: author.name,
+            score,
+            topicWorks: author.topicWorks,
+            topicCitations: author.topicCitations,
+            recentTopicWorks: author.recentTopicWorks,
+            leadership,
+            activeYears,
+            institution: topInstitution,
+            exampleWorks: author.exampleWorks,
+          };
+        })
+        .sort((a, b) => b.score - a.score)
+        .slice(0, boundedLimit);
+
+      const keyFields = scored.map((r, idx) => {
+        const examples = r.exampleWorks
+          .slice(0, 2)
+          .map((work) => `${work.year || "n/a"}:${work.citedBy}c "${String(work.title).slice(0, 70)}"`)
+          .join(" | ");
+        return `${idx + 1}. ${r.name} | Activity score: ${r.score.toFixed(2)} | Topic works since ${normalizedFromYear}: ${r.topicWorks} | Topic citations: ${r.topicCitations} | Recent works (last 3y): ${r.recentTopicWorks} | Leadership (first/last): ${r.leadership} | Active years: ${r.activeYears} | Institution: ${r.institution} | ID: ${r.id}${examples ? ` | Example works: ${examples}` : ""}`;
       });
-      scored.sort((a, b) => b.score - a.score);
-      const keyFields = scored.map((r, idx) => `${idx + 1}. ${r.name} | Score: ${r.score.toFixed(2)} | Recent works since ${fromYear}: ${r.recentWorks} | Total works: ${r.worksCount} | Citations: ${r.citedBy} | ${r.institution}`);
       return {
         content: [
           {
             type: "text",
             text: renderStructuredResponse({
-              summary: `Ranked ${scored.length} researchers by activity for query "${query}".`,
+              summary: `Ranked ${scored.length} researchers by topic-specific activity for query "${query}" using OpenAlex works.`,
               keyFields,
-              sources: [authorUrl],
-              limitations: ["Score is heuristic and favors OpenAlex-indexed publication volume/citations."],
+              sources,
+              limitations: [
+                "Score is heuristic and based on topic-matched OpenAlex works; it does not directly model field-wide esteem.",
+                "Lexical topic matching can include adjacent subdomains for broad terms.",
+                `Scanned up to ${maxPages} OpenAlex works pages (${scannedWorks} works).`,
+              ],
             }),
           },
         ],
@@ -1903,12 +2072,12 @@ server.registerTool(
       let url = "";
       let results = [];
       if (authorId) {
-        url = `${OPENALEX_API}/authors/${encodeURIComponent(authorId.replace("https://openalex.org/", ""))}`;
-        const author = await fetchJsonWithRetry(url);
+        url = buildOpenAlexUrl(`/authors/${encodeURIComponent(authorId.replace("https://openalex.org/", ""))}`);
+        const author = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
         results = author ? [author] : [];
       } else {
-        url = `${OPENALEX_API}/authors?${new URLSearchParams({ search: authorName, per_page: String(limit) }).toString()}`;
-        const data = await fetchJsonWithRetry(url);
+        url = buildOpenAlexUrl("/authors", new URLSearchParams({ search: authorName, per_page: String(limit) }));
+        const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
         results = data?.results ?? [];
       }
       const keyFields = [];
@@ -1920,13 +2089,16 @@ server.registerTool(
 
         if (!inst && a.id) {
           // Fallback: derive institution from the author's latest work authorship record.
-          const worksUrl = `${OPENALEX_API}/works?${new URLSearchParams({
-            filter: `author.id:${a.id}`,
-            sort: "publication_date:desc",
-            per_page: "1",
-          }).toString()}`;
+          const worksUrl = buildOpenAlexUrl(
+            "/works",
+            new URLSearchParams({
+              filter: `author.id:${a.id}`,
+              sort: "publication_date:desc",
+              per_page: "1",
+            })
+          );
           try {
-            const workData = await fetchJsonWithRetry(worksUrl);
+            const workData = await fetchJsonWithRetry(worksUrl, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
             const latestWork = workData?.results?.[0];
             const authorship = (latestWork?.authorships || []).find((au) => au?.author?.id === a.id);
             const institutions = (authorship?.institutions || []).map((i) => i.display_name).filter(Boolean);
@@ -3996,7 +4168,6 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Research MCP server running on stdio");
 }
 
 main().catch(console.error);
