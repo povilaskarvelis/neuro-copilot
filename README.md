@@ -65,6 +65,16 @@ cd adk-agent
 python agent.py
 ```
 
+Optional web UI on top of the same task store/CLI workflow:
+
+```bash
+cd adk-agent
+python -m pip install -r requirements.txt
+python ui_server.py
+```
+
+Then open `http://127.0.0.1:8080` in your browser.
+
 Then ask questions like:
 - *"Find promising drug targets for Parkinson's disease"*
 - *"Evaluate LRRK2 as a drug target"*

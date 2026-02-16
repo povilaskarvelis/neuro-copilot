@@ -121,6 +121,8 @@ class TaskStateStore:
                     "status": task_payload.get("status", "unknown"),
                     "current_step_index": task_payload.get("current_step_index", -1),
                     "awaiting_hitl": bool(task_payload.get("awaiting_hitl", False)),
+                    "active_plan_version_id": task_payload.get("active_plan_version_id"),
+                    "checkpoint_reason": task_payload.get("checkpoint_reason", ""),
                 }
             )
             if len(revisions) >= max(1, limit):

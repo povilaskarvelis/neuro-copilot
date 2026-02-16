@@ -25,6 +25,7 @@ const CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data";
 const OLS_API = "https://www.ebi.ac.uk/ols4";
 const DATA_DIR = path.resolve(__dirname, "data");
 const OPENALEX_MAILTO = process.env.OPENALEX_MAILTO || process.env.CONTACT_EMAIL || "";
+let gwasCooldownUntilMs = 0;
 
 function sanitizeXmlText(value) {
   if (!value) return "";
@@ -120,6 +121,49 @@ async function fetchJsonWithRetry(url, options = {}) {
 async function fetchText(url) {
   const response = await fetchWithRetry(url);
   return response.text();
+}
+
+function isLikelyTransientUpstreamError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    message.includes("request failed (5") ||
+    message.includes("request failed (429)") ||
+    message.includes("operation was aborted") ||
+    message.includes("aborted") ||
+    message.includes("fetch failed") ||
+    message.includes("econnreset") ||
+    message.includes("etimedout") ||
+    message.includes("gateway timeout")
+  );
+}
+
+function isGwasEndpointError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return message.includes("/gwas/rest/api") || message.includes("gwas");
+}
+
+function isGwasCooldownActive() {
+  return Date.now() < gwasCooldownUntilMs;
+}
+
+function activateGwasCooldown(ms = 90_000) {
+  gwasCooldownUntilMs = Math.max(gwasCooldownUntilMs, Date.now() + ms);
+}
+
+async function fetchGwasJson(url, options = {}) {
+  if (isGwasCooldownActive()) {
+    throw new Error("GWAS service temporarily unavailable (cooldown active).");
+  }
+  const timeoutMs = options.timeoutMs ?? 9000;
+  const retries = options.retries ?? 1;
+  try {
+    return await fetchJsonWithRetry(url, { ...options, timeoutMs, retries });
+  } catch (error) {
+    if (isLikelyTransientUpstreamError(error) || isGwasEndpointError(error)) {
+      activateGwasCooldown();
+    }
+    throw error;
+  }
 }
 
 function renderStructuredResponse({ summary, keyFields = [], sources = [], limitations = [] }) {
@@ -635,6 +679,172 @@ function inferDirectionLabel(association) {
 function associationRiskAllele(association) {
   if (association?.riskAllele) return association.riskAllele;
   return association?.loci?.[0]?.strongestRiskAlleles?.[0]?.riskAlleleName || "N/A";
+}
+
+function getDatatypeScore(row, datatypeId) {
+  const scores = row?.datatypeScores || [];
+  const match = scores.find((item) => String(item?.id || "") === datatypeId);
+  return clamp01(match?.score ?? 0);
+}
+
+function normalizeTopRows(rows, limit = 8) {
+  return rows
+    .slice()
+    .sort((a, b) => {
+      const aScore = safeNumber(a?.score, 0);
+      const bScore = safeNumber(b?.score, 0);
+      return bScore - aScore;
+    })
+    .slice(0, limit);
+}
+
+async function buildOpenTargetsGeneGeneticsFallback(geneSymbol, diseaseQuery = "", limit = 8) {
+  const resolved = await resolveTargetIdFromInput({ geneSymbol });
+  if (resolved?.error || !resolved?.targetId) {
+    return null;
+  }
+
+  const associatedDiseasesQuery = `
+    query TargetAssociatedDiseases($targetId: String!, $size: Int!) {
+      target(ensemblId: $targetId) {
+        id
+        approvedSymbol
+        associatedDiseases(page: { size: $size, index: 0 }) {
+          rows {
+            disease {
+              id
+              name
+            }
+            score
+            datatypeScores {
+              id
+              score
+            }
+          }
+        }
+      }
+    }
+  `;
+  const result = await queryOpenTargets(associatedDiseasesQuery, {
+    targetId: resolved.targetId,
+    size: 120,
+  });
+  const target = result?.data?.target;
+  if (!target) {
+    return null;
+  }
+
+  const diseaseTokens = tokenizeQuery(diseaseQuery || "");
+  let rows = target?.associatedDiseases?.rows || [];
+  if (diseaseTokens.length > 0) {
+    rows = rows.filter((row) => {
+      const diseaseName = String(row?.disease?.name || "").toLowerCase();
+      return diseaseTokens.some((token) => diseaseName.includes(token));
+    });
+  }
+
+  const rowsWithGenetics = rows.filter(
+    (row) =>
+      getDatatypeScore(row, "genetic_association") > 0 ||
+      getDatatypeScore(row, "genetic_literature") > 0
+  );
+  const selected = normalizeTopRows(rowsWithGenetics.length ? rowsWithGenetics : rows, limit);
+  if (selected.length === 0) {
+    return null;
+  }
+
+  const keyFields = selected.map((row, idx) => {
+    const diseaseName = row?.disease?.name || "Unknown disease";
+    const overall = clamp01(row?.score ?? 0);
+    const ga = getDatatypeScore(row, "genetic_association");
+    const gl = getDatatypeScore(row, "genetic_literature");
+    return `${idx + 1}. ${diseaseName} | Overall score: ${formatPct(overall)} | Genetic association: ${formatPct(
+      ga
+    )} | Genetic literature: ${formatPct(gl)}`;
+  });
+
+  return {
+    summary: `CRITICAL GAP: GWAS API unavailable; returning Open Targets genetics proxy for ${target.approvedSymbol}.`,
+    keyFields: [
+      `Target: ${target.approvedSymbol} (${target.id})`,
+      ...(diseaseQuery ? [`Disease context filter: ${diseaseQuery}`] : []),
+      ...keyFields,
+    ],
+    sources: [...(resolved.sourceHints || []), `${OPEN_TARGETS_API}#target.associatedDiseases:${target.id}`],
+    limitations: [
+      "Fallback uses Open Targets genetics evidence scores and does not provide SNP-level effect direction.",
+      "Risk-increasing vs protective direction cannot be inferred from this fallback alone.",
+    ],
+  };
+}
+
+async function buildOpenTargetsDiseaseGeneticsFallback(diseaseQuery, limit = 8) {
+  const resolvedDisease = await resolveDiseaseFromInput({ diseaseQuery });
+  if (resolvedDisease?.error || !resolvedDisease?.diseaseId) {
+    return null;
+  }
+
+  const diseaseTargetsQuery = `
+    query DiseaseTargets($diseaseId: String!, $size: Int!) {
+      disease(efoId: $diseaseId) {
+        id
+        name
+        associatedTargets(page: { size: $size, index: 0 }) {
+          rows {
+            target {
+              id
+              approvedSymbol
+            }
+            score
+            datatypeScores {
+              id
+              score
+            }
+          }
+        }
+      }
+    }
+  `;
+  const result = await queryOpenTargets(diseaseTargetsQuery, {
+    diseaseId: resolvedDisease.diseaseId,
+    size: 120,
+  });
+  const disease = result?.data?.disease;
+  if (!disease) {
+    return null;
+  }
+
+  const rows = disease?.associatedTargets?.rows || [];
+  const withGenetics = rows.filter(
+    (row) =>
+      getDatatypeScore(row, "genetic_association") > 0 ||
+      getDatatypeScore(row, "genetic_literature") > 0
+  );
+  const selected = normalizeTopRows(withGenetics.length ? withGenetics : rows, limit);
+  if (selected.length === 0) {
+    return null;
+  }
+
+  const keyFields = selected.map((row, idx) => {
+    const symbol = row?.target?.approvedSymbol || "Unknown";
+    const targetId = row?.target?.id || "N/A";
+    const overall = clamp01(row?.score ?? 0);
+    const ga = getDatatypeScore(row, "genetic_association");
+    const gl = getDatatypeScore(row, "genetic_literature");
+    return `${idx + 1}. ${symbol} (${targetId}) | Overall score: ${formatPct(overall)} | Genetic association: ${formatPct(
+      ga
+    )} | Genetic literature: ${formatPct(gl)}`;
+  });
+
+  return {
+    summary: `CRITICAL GAP: GWAS API unavailable; returning Open Targets genetics proxy for ${disease.name}.`,
+    keyFields: [`Disease: ${disease.name} (${disease.id})`, ...keyFields],
+    sources: [...(resolvedDisease.sourceHints || []), `${OPEN_TARGETS_API}#disease.associatedTargets:${disease.id}`],
+    limitations: [
+      "Fallback uses Open Targets genetics evidence scores and is not variant-level GWAS output.",
+      "Risk-allele level statistics (OR/beta per rsID) are unavailable in this fallback.",
+    ],
+  };
 }
 
 // ============================================
@@ -2239,7 +2449,7 @@ server.registerTool(
       if (isRsId) {
         const sourceUrl = `${GWAS_API}/associations/search/findByRsId?rsId=${encodeURIComponent(query)}`;
         sourceUrls.push(sourceUrl);
-        const data = await fetchJsonWithRetry(sourceUrl, { timeoutMs: 9000, retries: 1 });
+        const data = await fetchGwasJson(sourceUrl, { timeoutMs: 9000, retries: 1 });
         associations = data?._embedded?.associations || [];
       } else if (/^[A-Z0-9-]{2,}$/.test(query.trim())) {
         const snpSearchUrl = `${GWAS_API}/singleNucleotidePolymorphisms/search/findByGene?geneName=${encodeURIComponent(query.trim())}&page=0&size=${Math.min(
@@ -2247,7 +2457,7 @@ server.registerTool(
           Math.max(limit, 8)
         )}`;
         sourceUrls.push(snpSearchUrl);
-        const snpData = await fetchJsonWithRetry(snpSearchUrl, { timeoutMs: 9000, retries: 1 });
+        const snpData = await fetchGwasJson(snpSearchUrl, { timeoutMs: 9000, retries: 1 });
         const snps = snpData?._embedded?.singleNucleotidePolymorphisms || [];
         const seen = new Set();
 
@@ -2259,7 +2469,7 @@ server.registerTool(
           const assocLink = snp?._links?.associations?.href;
           if (!assocLink) continue;
           sourceUrls.push(assocLink);
-          const assocData = await fetchJsonWithRetry(assocLink, { timeoutMs: 8000, retries: 1 });
+          const assocData = await fetchGwasJson(assocLink, { timeoutMs: 8000, retries: 1 });
           for (const association of assocData?._embedded?.associations || []) {
             const assocId = association.associationId || association.id || association?._links?.self?.href;
             if (assocId && seen.has(assocId)) continue;
@@ -2274,13 +2484,13 @@ server.registerTool(
         const directTraitUrl = `${GWAS_API}/associations/search/findByEfoTrait?efoTrait=${encodeURIComponent(query)}&page=0&size=${Math.max(limit, 10)}`;
         sourceUrls.push(directTraitUrl);
         try {
-          const traitAssocData = await fetchJsonWithRetry(directTraitUrl, { timeoutMs: 9000, retries: 1 });
+          const traitAssocData = await fetchGwasJson(directTraitUrl, { timeoutMs: 9000, retries: 1 });
           associations = traitAssocData?._embedded?.associations || [];
         } catch (error) {
           // Fallback for older deployments where trait lookup is routed through efoTraits search.
           const sourceUrl = `${GWAS_API}/efoTraits/search/findByTrait?trait=${encodeURIComponent(query)}`;
           sourceUrls.push(sourceUrl);
-          const traitData = await fetchJsonWithRetry(sourceUrl, { timeoutMs: 8000, retries: 1 });
+          const traitData = await fetchGwasJson(sourceUrl, { timeoutMs: 8000, retries: 1 });
           const traits = traitData?._embedded?.efoTraits || [];
           for (const trait of traits.slice(0, 3)) {
             if (Date.now() >= deadlineMs) {
@@ -2290,7 +2500,7 @@ server.registerTool(
             const assocLink = trait?._links?.associations?.href;
             if (!assocLink) continue;
             sourceUrls.push(assocLink);
-            const assocData = await fetchJsonWithRetry(assocLink, { timeoutMs: 8000, retries: 1 });
+            const assocData = await fetchGwasJson(assocLink, { timeoutMs: 8000, retries: 1 });
             associations.push(...(assocData?._embedded?.associations || []));
             if (associations.length >= limit) break;
           }
@@ -2312,6 +2522,51 @@ server.registerTool(
       }
       return { content: [{ type: "text", text: renderStructuredResponse({ summary: `Retrieved ${associations.length} GWAS associations.`, keyFields, sources: sources.length ? sources : [GWAS_API], limitations: ["Trait/variant harmonization may require downstream normalization."] }) }] };
     } catch (error) {
+      const trimmedQuery = String(query || "").trim();
+      const isRsIdQuery = /^rs\d+$/i.test(trimmedQuery);
+      const isGeneLike = /^[A-Z0-9-]{2,}$/.test(trimmedQuery);
+      if (isLikelyTransientUpstreamError(error) || isGwasEndpointError(error) || isGwasCooldownActive()) {
+        const fallback = isRsIdQuery
+          ? null
+          : isGeneLike
+            ? await buildOpenTargetsGeneGeneticsFallback(trimmedQuery, "", Math.min(limit, 8))
+            : await buildOpenTargetsDiseaseGeneticsFallback(trimmedQuery, Math.min(limit, 8));
+        if (fallback) {
+          const limitations = [
+            ...fallback.limitations,
+            `Underlying GWAS call error: ${String(error?.message || "unknown error").slice(0, 220)}`,
+          ];
+          return {
+            content: [
+              {
+                type: "text",
+                text: renderStructuredResponse({
+                  summary: fallback.summary,
+                  keyFields: fallback.keyFields,
+                  sources: fallback.sources,
+                  limitations,
+                }),
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: "CRITICAL GAP: GWAS service unavailable and no proxy fallback could be resolved.",
+                keyFields: [`Query: ${trimmedQuery}`],
+                sources: [GWAS_API],
+                limitations: [
+                  `Underlying GWAS call error: ${String(error?.message || "unknown error").slice(0, 220)}`,
+                  "Retry later or use gene/disease-level genetics proxy evidence from Open Targets.",
+                ],
+              }),
+            },
+          ],
+        };
+      }
       return { content: [{ type: "text", text: `Error in search_gwas_associations: ${error.message}` }] };
     }
   }
@@ -3131,7 +3386,7 @@ server.registerTool(
       const snpSearchUrl = `${GWAS_API}/singleNucleotidePolymorphisms/search/findByGene?geneName=${encodeURIComponent(
         geneSymbol.trim()
       )}&page=0&size=${boundedSnps}`;
-      const snpData = await fetchJsonWithRetry(snpSearchUrl, { timeoutMs: 10000, retries: 1 });
+      const snpData = await fetchGwasJson(snpSearchUrl, { timeoutMs: 10000, retries: 1 });
       const snps = dedupeArray((snpData?._embedded?.singleNucleotidePolymorphisms || []).map((snp) => snp?.rsId)).slice(
         0,
         boundedSnps
@@ -3168,7 +3423,7 @@ server.registerTool(
         if (matched.length >= boundedAssociations || scannedAssociations >= maxScanned) break;
         const assocUrl = `${GWAS_API}/associations/search/findByRsId?rsId=${encodeURIComponent(rsId)}`;
         if (sources.length < 12) sources.push(assocUrl);
-        const assocData = await fetchJsonWithRetry(assocUrl, { timeoutMs: 9000, retries: 1 });
+        const assocData = await fetchGwasJson(assocUrl, { timeoutMs: 9000, retries: 1 });
         const associations = assocData?._embedded?.associations || [];
 
         for (const association of associations) {
@@ -3188,7 +3443,7 @@ server.registerTool(
             if (traitCache.has(traitHref)) {
               traits = traitCache.get(traitHref);
             } else {
-              const traitData = await fetchJsonWithRetry(traitHref, { timeoutMs: 7000, retries: 0 });
+              const traitData = await fetchGwasJson(traitHref, { timeoutMs: 7000, retries: 0 });
               traits = (traitData?._embedded?.efoTraits || []).map((trait) => ({
                 name: String(trait?.trait || "").trim(),
                 shortForm: String(trait?.shortForm || "").trim(),
@@ -3315,6 +3570,47 @@ server.registerTool(
         ],
       };
     } catch (error) {
+      if (isLikelyTransientUpstreamError(error) || isGwasEndpointError(error) || isGwasCooldownActive()) {
+        const fallback = await buildOpenTargetsGeneGeneticsFallback(
+          String(geneSymbol || "").trim(),
+          String(diseaseQuery || "").trim(),
+          8
+        );
+        if (fallback) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: renderStructuredResponse({
+                  summary: fallback.summary,
+                  keyFields: fallback.keyFields,
+                  sources: fallback.sources,
+                  limitations: [
+                    ...fallback.limitations,
+                    `Underlying GWAS call error: ${String(error?.message || "unknown error").slice(0, 220)}`,
+                  ],
+                }),
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: `CRITICAL GAP: could not infer genetic direction-of-effect for ${geneSymbol} in "${diseaseQuery}" because GWAS service is unavailable.`,
+                keyFields: [`Gene: ${geneSymbol}`, `Disease context: ${diseaseQuery}`],
+                sources: [GWAS_API],
+                limitations: [
+                  `Underlying GWAS call error: ${String(error?.message || "unknown error").slice(0, 220)}`,
+                  "Retry later or use Open Targets genetics evidence as a non-directional proxy.",
+                ],
+              }),
+            },
+          ],
+        };
+      }
       return {
         content: [{ type: "text", text: `Error in infer_genetic_effect_direction: ${error.message}` }],
       };

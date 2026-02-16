@@ -40,11 +40,15 @@ from task_state_store import TaskStateStore
 from workflow import (
     VALID_INTENT_TAGS,
     VALID_REQUEST_TYPES,
+    RevisionIntent,
     WorkflowTask,
+    active_plan_version,
     classify_request_type,
     create_task,
     extract_evidence_refs,
     infer_intent_tags,
+    initialize_plan_version,
+    replan_remaining_steps,
     render_final_report,
     render_status,
     sanitize_intent_tags,
@@ -56,6 +60,7 @@ from workflow import (
 # Path to the MCP server
 MCP_SERVER_DIR = Path(__file__).parent.parent / "research-mcp"
 REPORT_ARTIFACTS_DIR = Path(__file__).resolve().parent / "reports"
+STEP_TURN_TIMEOUT_SECONDS = float(os.getenv("ADK_STEP_TURN_TIMEOUT_SECONDS", "150"))
 
 
 AGENT_INSTRUCTION = """You are an AI co-scientist specializing in preclinical drug target discovery.
@@ -239,6 +244,57 @@ Rules:
 - Never include tool names or extra keys.
 """
 
+REVISION_FEEDBACK_PARSER_INSTRUCTION = """You convert human feedback at a workflow checkpoint into structured intent updates.
+Return strict JSON only with this schema:
+{
+  "objective_adjustments": [string],
+  "constraints": [string],
+  "priorities": [string],
+  "exclusions": [string],
+  "evidence_preferences": [string],
+  "output_preferences": [string],
+  "confidence": number
+}
+
+Rules:
+- Do not mention tools unless the user explicitly named them.
+- Keep each item concise and action-oriented.
+- If a field has no signal, return [] for that field.
+- confidence must be between 0 and 1.
+"""
+
+CHAT_TITLE_SUMMARIZER_INSTRUCTION = """You generate concise chat titles for biomedical research requests.
+Return strict JSON only with this schema:
+{
+  "title": string
+}
+
+Rules:
+- The title must be <= 8 words.
+- Preserve key disease/target/drug entities.
+- Focus on objective, not conversational filler.
+- Do not include quotes, markdown, prefixes, or trailing punctuation.
+"""
+
+PROGRESS_SUMMARIZER_INSTRUCTION = """You summarize agent progress for end users.
+Return strict JSON only with this schema:
+{
+  "headline": string,
+  "summary": string,
+  "completed": [string],
+  "next": [string],
+  "confidence": "low" | "medium" | "high"
+}
+
+Rules:
+- Use only observable actions and outcomes from provided events.
+- Do not include private reasoning or chain-of-thought.
+- headline: <= 12 words.
+- summary: 1-2 short sentences.
+- completed: max 3 bullets.
+- next: max 2 bullets.
+"""
+
 QUERY_TYPO_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     (r"\breseachers\b", "researchers"),
     (r"\breseacher\b", "researcher"),
@@ -305,6 +361,39 @@ def _merge_query_with_clarification(original_query: str, clarification: str) -> 
     )
 
 
+def _extract_revision_directives(revised_scope: str) -> list[str]:
+    text = revised_scope.strip()
+    if not text:
+        return []
+
+    normalized = re.sub(r"\r\n?", "\n", text)
+    parts: list[str] = []
+    for line in normalized.splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        cleaned = re.sub(r"^(?:[-*]|\d+[.)])\s*", "", cleaned).strip()
+        if not cleaned:
+            continue
+        segments = [segment.strip() for segment in cleaned.split(";") if segment.strip()]
+        parts.extend(segments if segments else [cleaned])
+
+    directives: list[str] = []
+    for part in parts:
+        collapsed = re.sub(r"\s+", " ", part).strip(" .")
+        if not collapsed:
+            continue
+        if collapsed.lower().startswith("and "):
+            collapsed = collapsed[4:].strip()
+        if len(collapsed) < 3:
+            continue
+        if collapsed not in directives:
+            directives.append(collapsed)
+        if len(directives) >= 6:
+            break
+    return directives
+
+
 def _merge_objective_with_revision(original_objective: str, revised_scope: str) -> str:
     base = original_objective.strip()
     revision = revised_scope.strip()
@@ -312,10 +401,20 @@ def _merge_objective_with_revision(original_objective: str, revised_scope: str) 
         return revision
     if not revision:
         return base
+    directives = _extract_revision_directives(revision)
+    directives_block = ""
+    if directives:
+        rendered_directives = "\n".join(f"- {item}" for item in directives)
+        directives_block = (
+            "\nRevision directives to apply:\n"
+            f"{rendered_directives}\n"
+            "Treat these directives as mandatory when rebuilding and executing the workflow."
+        )
     return (
         f"{base}\n"
         f"User revision to scope/decomposition: {revision}\n"
         "Treat this revision as the authoritative update when rebuilding the workflow."
+        f"{directives_block}"
     )
 
 
@@ -592,6 +691,221 @@ async def _build_clarification_request(
     )
 
 
+def _dedupe_compact(items: list[str], *, limit: int = 8) -> list[str]:
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for item in items:
+        value = re.sub(r"\s+", " ", str(item or "")).strip(" .")
+        if not value:
+            continue
+        lowered = value.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        cleaned.append(value)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def _coerce_str_list(value) -> list[str]:
+    if isinstance(value, list):
+        raw_items = [str(item) for item in value]
+    elif isinstance(value, str):
+        raw_items = re.split(r"[\n;]+", value)
+    else:
+        raw_items = []
+    return _dedupe_compact(raw_items)
+
+
+def _build_deterministic_revision_intent(feedback: str) -> RevisionIntent:
+    parts = _extract_revision_directives(feedback)
+    constraints: list[str] = []
+    priorities: list[str] = []
+    exclusions: list[str] = []
+    evidence_prefs: list[str] = []
+    output_prefs: list[str] = []
+    objective_adjustments: list[str] = []
+
+    for item in parts:
+        lowered = item.lower()
+        if any(token in lowered for token in ("do not", "don't", "exclude", "avoid", "without")):
+            exclusions.append(item)
+            continue
+        if any(token in lowered for token in ("must", "need to", "required", "should")):
+            constraints.append(item)
+            continue
+        if any(token in lowered for token in ("prioritize", "focus", "first", "before")):
+            priorities.append(item)
+            continue
+        if any(token in lowered for token in ("evidence", "citation", "pmid", "nct", "source")):
+            evidence_prefs.append(item)
+            continue
+        if any(token in lowered for token in ("format", "table", "output", "report", "summary")):
+            output_prefs.append(item)
+            continue
+        objective_adjustments.append(item)
+
+    return RevisionIntent(
+        raw_feedback=feedback.strip(),
+        objective_adjustments=_dedupe_compact(objective_adjustments),
+        constraints=_dedupe_compact(constraints),
+        priorities=_dedupe_compact(priorities),
+        exclusions=_dedupe_compact(exclusions),
+        evidence_preferences=_dedupe_compact(evidence_prefs),
+        output_preferences=_dedupe_compact(output_prefs),
+        confidence=0.45,
+        parser_source="fallback",
+    )
+
+
+async def _parse_revision_intent(
+    feedback: str,
+    *,
+    feedback_parser_runner=None,
+    feedback_parser_session_id: str | None = None,
+    user_id: str = "researcher",
+) -> RevisionIntent:
+    deterministic = _build_deterministic_revision_intent(feedback)
+    if feedback_parser_runner is None or not feedback_parser_session_id:
+        return deterministic
+
+    prompt = (
+        "Parse this checkpoint feedback into structured intent updates.\n"
+        f"Feedback: {feedback}\n"
+        "Return strict JSON only."
+    )
+    try:
+        raw = await _run_runner_turn(feedback_parser_runner, feedback_parser_session_id, user_id, prompt)
+        payload = _extract_json_payload(raw)
+    except Exception:
+        payload = None
+    if not payload:
+        return deterministic
+
+    try:
+        confidence = float(payload.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    parsed = RevisionIntent(
+        raw_feedback=feedback.strip(),
+        objective_adjustments=_coerce_str_list(payload.get("objective_adjustments")),
+        constraints=_coerce_str_list(payload.get("constraints")),
+        priorities=_coerce_str_list(payload.get("priorities")),
+        exclusions=_coerce_str_list(payload.get("exclusions")),
+        evidence_preferences=_coerce_str_list(payload.get("evidence_preferences")),
+        output_preferences=_coerce_str_list(payload.get("output_preferences")),
+        confidence=confidence,
+        parser_source="model",
+    )
+
+    has_signal = any(
+        (
+            parsed.objective_adjustments,
+            parsed.constraints,
+            parsed.priorities,
+            parsed.exclusions,
+            parsed.evidence_preferences,
+            parsed.output_preferences,
+        )
+    )
+    if not has_signal:
+        return deterministic
+    return parsed
+
+
+def _render_revision_intent_as_text(intent: RevisionIntent) -> str:
+    lines = []
+    if intent.objective_adjustments:
+        lines.append("Objective adjustments:")
+        lines.extend([f"- {item}" for item in intent.objective_adjustments])
+    if intent.constraints:
+        lines.append("Constraints:")
+        lines.extend([f"- {item}" for item in intent.constraints])
+    if intent.priorities:
+        lines.append("Priorities:")
+        lines.extend([f"- {item}" for item in intent.priorities])
+    if intent.exclusions:
+        lines.append("Exclusions:")
+        lines.extend([f"- {item}" for item in intent.exclusions])
+    if intent.evidence_preferences:
+        lines.append("Evidence preferences:")
+        lines.extend([f"- {item}" for item in intent.evidence_preferences])
+    if intent.output_preferences:
+        lines.append("Output preferences:")
+        lines.extend([f"- {item}" for item in intent.output_preferences])
+    return "\n".join(lines).strip()
+
+
+def _merge_objective_with_revision_intent(original_objective: str, intent: RevisionIntent) -> str:
+    base = (original_objective or "").strip()
+    if not base:
+        base = (intent.raw_feedback or "").strip()
+    intent_text = _render_revision_intent_as_text(intent)
+    if not intent_text:
+        return _merge_objective_with_revision(base, intent.raw_feedback)
+    return (
+        f"{base}\n"
+        f"User revision to scope/decomposition: {intent.raw_feedback.strip()}\n"
+        "Revision directives to apply:\n"
+        f"{intent_text}\n"
+        "Treat these directives as mandatory when rebuilding and executing the workflow."
+    )
+
+
+def _merge_revision_intents(previous: RevisionIntent | None, incoming: RevisionIntent) -> RevisionIntent:
+    merged = RevisionIntent(
+        raw_feedback=incoming.raw_feedback.strip() or (previous.raw_feedback if previous else ""),
+        objective_adjustments=[],
+        constraints=[],
+        priorities=[],
+        exclusions=[],
+        evidence_preferences=[],
+        output_preferences=[],
+        confidence=max(float(previous.confidence if previous else 0.0), float(incoming.confidence)),
+        parser_source=incoming.parser_source or (previous.parser_source if previous else "fallback"),
+    )
+    merged.objective_adjustments = _dedupe_compact(
+        [
+            *(previous.objective_adjustments if previous else []),
+            *incoming.objective_adjustments,
+        ]
+    )
+    merged.constraints = _dedupe_compact(
+        [
+            *(previous.constraints if previous else []),
+            *incoming.constraints,
+        ]
+    )
+    merged.priorities = _dedupe_compact(
+        [
+            *(previous.priorities if previous else []),
+            *incoming.priorities,
+        ]
+    )
+    merged.exclusions = _dedupe_compact(
+        [
+            *(previous.exclusions if previous else []),
+            *incoming.exclusions,
+        ]
+    )
+    merged.evidence_preferences = _dedupe_compact(
+        [
+            *(previous.evidence_preferences if previous else []),
+            *incoming.evidence_preferences,
+        ]
+    )
+    merged.output_preferences = _dedupe_compact(
+        [
+            *(previous.output_preferences if previous else []),
+            *incoming.output_preferences,
+        ]
+    )
+    return merged
+
+
 def _normalize_user_query(query: str) -> str:
     normalized = query.strip()
     for pattern, replacement in QUERY_TYPO_REPLACEMENTS:
@@ -747,6 +1061,36 @@ def create_intent_router_agent():
     )
 
 
+def create_feedback_parser_agent():
+    """Create a no-tool parser for checkpoint feedback -> structured revision intent."""
+    return Agent(
+        name="feedback_parser",
+        model="gemini-2.5-flash",
+        instruction=REVISION_FEEDBACK_PARSER_INSTRUCTION,
+        tools=[],
+    )
+
+
+def create_title_summarizer_agent():
+    """Create a no-tool model for concise chat title generation."""
+    return Agent(
+        name="title_summarizer",
+        model="gemini-2.5-flash",
+        instruction=CHAT_TITLE_SUMMARIZER_INSTRUCTION,
+        tools=[],
+    )
+
+
+def create_progress_summarizer_agent():
+    """Create a no-tool model for user-facing checkpoint summaries."""
+    return Agent(
+        name="progress_summarizer",
+        model="gemini-2.5-flash",
+        instruction=PROGRESS_SUMMARIZER_INSTRUCTION,
+        tools=[],
+    )
+
+
 def create_agent(tool_filter: list[str] | None = None):
     """Create the ADK agent with MCP tools."""
     # Configure MCP server connection
@@ -827,7 +1171,7 @@ def _should_escalate_allowlist(step, trace_entries: list[dict], output: str) -> 
     if not trace_entries:
         return True
     outcomes = {str(entry.get("outcome", "unknown")) for entry in trace_entries}
-    if outcomes and outcomes.issubset({"error", "not_found_or_empty", "no_response"}):
+    if outcomes and outcomes.issubset({"error", "not_found_or_empty", "no_response", "degraded"}):
         return True
     lower = (output or "").lower()
     if any(token in lower for token in ["cannot be completed", "insufficient data", "unable to identify"]):
@@ -877,6 +1221,26 @@ async def _run_runner_turn(runner, session_id: str, user_id: str, prompt: str) -
     """Run one model turn and return text only."""
     response_text, _ = await _run_runner_turn_with_trace(runner, session_id, user_id, prompt)
     return response_text
+
+
+async def _run_runner_turn_with_timeout(
+    runner,
+    session_id: str,
+    user_id: str,
+    prompt: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> tuple[str, list[dict]]:
+    timeout = STEP_TURN_TIMEOUT_SECONDS if timeout_seconds is None else float(timeout_seconds)
+    if timeout <= 0:
+        return await _run_runner_turn_with_trace(runner, session_id, user_id, prompt)
+    try:
+        return await asyncio.wait_for(
+            _run_runner_turn_with_trace(runner, session_id, user_id, prompt),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"Step model/tool turn timed out after {timeout:g}s.") from exc
 
 
 def _extract_missing_tool_name(error: Exception) -> str | None:
@@ -985,7 +1349,9 @@ def _populate_step_rao_fields(step) -> None:
         suffix = f", +{len(step.evidence_refs) - 5} more" if len(step.evidence_refs) > 5 else ""
         observations.append(f"Citation IDs captured: {preview}{suffix}.")
     issue_count = sum(
-        1 for entry in trace_entries if str(entry.get("outcome", "")) in {"error", "not_found_or_empty", "no_response"}
+        1
+        for entry in trace_entries
+        if str(entry.get("outcome", "")) in {"error", "not_found_or_empty", "no_response", "degraded"}
     )
     if issue_count:
         observations.append(f"{issue_count} tool call(s) returned errors/empty responses.")
@@ -1058,6 +1424,17 @@ def _classify_tool_response(response_payload) -> tuple[str, str]:
     )
     if any(marker in lower for marker in not_found_markers):
         return "not_found_or_empty", excerpt
+
+    degraded_markers = (
+        "critical gap",
+        "service unavailable",
+        "underlying gwas call error",
+        "fallback uses open targets genetics evidence scores",
+        "risk-increasing vs protective direction cannot be inferred",
+        "could not infer genetic direction-of-effect",
+    )
+    if any(marker in lower for marker in degraded_markers):
+        return "degraded", excerpt
 
     return "ok", excerpt
 
@@ -1167,7 +1544,12 @@ async def _execute_step(runner, session_id: str, user_id: str, task: WorkflowTas
     step_runner, step_mcp_tools = _create_step_runner(runner, step.allowed_tools)
     try:
         try:
-            output, trace_entries = await _run_runner_turn_with_trace(step_runner, session_id, user_id, prompt)
+            output, trace_entries = await _run_runner_turn_with_timeout(
+                step_runner,
+                session_id,
+                user_id,
+                prompt,
+            )
         except Exception as exc:
             step_failed = True
             missing_tool = _extract_missing_tool_name(exc)
@@ -1179,7 +1561,7 @@ async def _execute_step(runner, session_id: str, user_id: str, task: WorkflowTas
                     "If no allowed tool is relevant, provide reasoning-only output for this step."
                 )
                 try:
-                    output, trace_entries = await _run_runner_turn_with_trace(
+                    output, trace_entries = await _run_runner_turn_with_timeout(
                         step_runner,
                         session_id,
                         user_id,
@@ -1205,7 +1587,7 @@ async def _execute_step(runner, session_id: str, user_id: str, task: WorkflowTas
             escalated_runner, escalated_mcp_tools = _create_step_runner(runner, step.allowed_tools)
             try:
                 try:
-                    escalated_output, escalated_trace = await _run_runner_turn_with_trace(
+                    escalated_output, escalated_trace = await _run_runner_turn_with_timeout(
                         escalated_runner,
                         session_id,
                         user_id,
@@ -1241,6 +1623,12 @@ def _evaluate_quality_gates(task: WorkflowTask) -> dict:
     tool_call_count = sum(len(step.tool_trace) for step in task.steps) + len(task.fallback_tool_trace)
 
     unresolved_gaps: list[str] = []
+
+    def _append_gap(message: str) -> None:
+        normalized = str(message or "").strip()
+        if normalized and normalized not in unresolved_gaps:
+            unresolved_gaps.append(normalized)
+
     combined_output = "\n".join(step.output for step in task.steps if step.output).lower()
     objective_lower = task.objective.lower()
     if "researcher_discovery" in task.intent_tags:
@@ -1312,20 +1700,72 @@ def _evaluate_quality_gates(task: WorkflowTask) -> dict:
                 "unable to identify target",
             ]
         ):
-            unresolved_gaps.append("Target/trial assessment appears incomplete based on model self-reported gaps.")
+            _append_gap("Target/trial assessment appears incomplete based on model self-reported gaps.")
         if not any(token in combined_output for token in ["ensg", "target id", "candidate target", "phase", "nct"]):
-            unresolved_gaps.append("No concrete target or clinical-trial entities were detected in the synthesis.")
+            _append_gap("No concrete target or clinical-trial entities were detected in the synthesis.")
+
+    failed_entries = [
+        entry
+        for step in task.steps
+        for entry in (step.tool_trace or [])
+        if str(entry.get("outcome", "")) in {"error", "not_found_or_empty", "no_response", "degraded"}
+    ]
+    failed_entries.extend(
+        entry
+        for entry in (task.fallback_tool_trace or [])
+        if str(entry.get("outcome", "")) in {"error", "not_found_or_empty", "no_response", "degraded"}
+    )
+    if failed_entries:
+        _append_gap(
+            "Tool execution issues were detected "
+            f"({len(failed_entries)} failed or empty tool calls)."
+        )
+
+    failed_tools = {
+        str(entry.get("tool_name", "")).strip()
+        for entry in failed_entries
+        if str(entry.get("tool_name", "")).strip()
+    }
+    genetics_priority = (
+        "genetics_direction" in task.intent_tags
+        or any(token in objective_lower for token in ["genetic", "gwas", "variant", "direction-of-effect"])
+    )
+    if genetics_priority and failed_tools.intersection(
+        {"infer_genetic_effect_direction", "search_gwas_associations", "search_clinvar_variants"}
+    ):
+        _append_gap("High-priority human genetics direction evidence is incomplete due to tool failures.")
+    if "safety_assessment" in task.intent_tags and (
+        "no safety liabilities" in combined_output
+        or "no safety liability" in combined_output
+        or "summarize_target_safety_liabilities" in failed_tools
+    ):
+        _append_gap("High-priority safety-liability evidence is incomplete or ambiguous.")
+
+    critical_markers = (
+        "critical gap",
+        "service unavailable",
+        "failed due to api error",
+        "failed due to api errors",
+        "could not retrieve",
+        "unable to retrieve",
+        "persistent failure",
+    )
+    if any(marker in combined_output for marker in critical_markers):
+        _append_gap("Output reports critical missing evidence that affects confidence in the recommendation.")
+    if any(marker in combined_output for marker in ["not directly from tool output", "historical knowledge"]):
+        _append_gap("Synthesis includes claims that are not directly supported by captured tool output.")
+
     if evidence_count == 0:
-        unresolved_gaps.append("No citation evidence IDs were detected in the response.")
+        _append_gap("No citation evidence IDs were detected in the response.")
     if tool_call_count == 0:
-        unresolved_gaps.append("No tool calls were captured for the workflow.")
+        _append_gap("No tool calls were captured for the workflow.")
     missing_tool_steps = [
         step.title
         for step in task.steps
         if step.status == "completed" and step.recommended_tools and not step.tool_trace
     ]
     if missing_tool_steps:
-        unresolved_gaps.append(
+        _append_gap(
             "Completed steps with recommended tools but no recorded tool execution: "
             + ", ".join(missing_tool_steps)
         )
@@ -1338,6 +1778,82 @@ def _evaluate_quality_gates(task: WorkflowTask) -> dict:
         "tool_call_count": tool_call_count,
         "unresolved_gaps": unresolved_gaps,
     }
+
+
+def should_open_checkpoint(
+    task: WorkflowTask,
+    next_step,
+    quality_state: dict | None = None,
+    queued_feedback: list[str] | None = None,
+) -> tuple[bool, str]:
+    queued = [str(item).strip() for item in (queued_feedback or []) if str(item).strip()]
+    if queued:
+        return True, "queued_feedback_pending"
+
+    if not next_step:
+        return False, "none"
+
+    quality_state = quality_state or {}
+    unresolved_gap_count = len(quality_state.get("unresolved_gaps", []) or [])
+    last_failures = int(quality_state.get("last_step_failures", 0) or 0)
+    last_output = str(quality_state.get("last_step_output", "") or "").lower()
+    plan = active_plan_version(task)
+    plan_id = plan.version_id if plan else str(task.active_plan_version_id or "none")
+    hitl_events = set(task.hitl_history)
+
+    def _is_gate_acknowledged(reason: str) -> bool:
+        token = _gate_ack_token(reason, plan_id)
+        return bool(token and token in hitl_events)
+
+    if next_step.recommended_tools and not any(step.tool_trace for step in task.steps if step.status == "completed"):
+        return True, "pre_evidence_execution"
+
+    is_pre_final = bool(task.steps) and next_step.step_id == task.steps[-1].step_id
+    if unresolved_gap_count >= 2:
+        if _is_gate_acknowledged("quality_gap_spike"):
+            return False, "none"
+        return True, "quality_gap_spike"
+    if is_pre_final and unresolved_gap_count >= 1:
+        if _is_gate_acknowledged("quality_gap_spike"):
+            return False, "none"
+        return True, "quality_gap_spike"
+
+    if last_failures >= 2:
+        if _is_gate_acknowledged("repeated_tool_failures"):
+            return False, "none"
+        return True, "repeated_tool_failures"
+
+    contradiction_markers = (
+        "contradict",
+        "inconsistent",
+        "conflict",
+        "uncertain",
+        "critical gap",
+        "service unavailable",
+        "failed due to api error",
+        "failed due to api errors",
+        "could not retrieve",
+        "unable to retrieve",
+    )
+    if any(marker in last_output for marker in contradiction_markers):
+        if _is_gate_acknowledged("uncertainty_spike"):
+            return False, "none"
+        return True, "uncertainty_spike"
+
+    if is_pre_final and any(event.lower().startswith("revise:") for event in task.hitl_history):
+        if _is_gate_acknowledged("pre_final_after_intent_change"):
+            return False, "none"
+        return True, "pre_final_after_intent_change"
+
+    return False, "none"
+
+
+def _gate_ack_token(reason: str, plan_version_id: str | None) -> str | None:
+    normalized_reason = str(reason or "").strip().lower()
+    if not normalized_reason:
+        return None
+    normalized_plan = str(plan_version_id or "none").strip() or "none"
+    return f"gate_ack:{normalized_reason}:{normalized_plan}"
 
 
 def _render_quality_gate_message(report: dict) -> str:
@@ -1425,6 +1941,166 @@ async def _complete_remaining_steps(runner, session_id: str, user_id: str, task:
     return quality
 
 
+def _format_checkpoint_reason(reason: str) -> str:
+    mapping = {
+        "pre_evidence_execution": "Before bulk evidence collection",
+        "quality_gap_spike": "Quality/uncertainty spike detected",
+        "repeated_tool_failures": "Repeated tool failures detected",
+        "uncertainty_spike": "Uncertainty spike detected",
+        "pre_final_after_intent_change": "Intent changed before final synthesis",
+        "feedback_replan": "Plan updated from user feedback",
+        "queued_feedback_pending": "Queued feedback pending application",
+    }
+    key = str(reason or "").strip()
+    return mapping.get(key, key.replace("_", " ") if key else "unspecified")
+
+
+def _print_checkpoint_plan(task: WorkflowTask) -> None:
+    print("\n[Checkpoint Plan]")
+    if task.latest_plan_delta:
+        delta = task.latest_plan_delta
+        print("What changed:")
+        print(f"- {delta.summary or 'No structural changes.'}")
+        if delta.added_steps:
+            print(f"- Added: {', '.join(delta.added_steps)}")
+        if delta.removed_steps:
+            print(f"- Removed: {', '.join(delta.removed_steps)}")
+        if delta.modified_steps:
+            print(f"- Modified: {', '.join(delta.modified_steps)}")
+        if delta.reordered_steps:
+            print(f"- Reordered: {', '.join(delta.reordered_steps)}")
+        print("")
+
+    version = active_plan_version(task)
+    if version and version.steps:
+        print("Remaining plan:")
+        for idx, step in enumerate(version.steps, start=1):
+            print(f"{idx}. {step.title}")
+    else:
+        print("Remaining plan: none")
+
+    if task.checkpoint_reason:
+        print(f"\nCheckpoint reason: {_format_checkpoint_reason(task.checkpoint_reason)}")
+
+
+async def _apply_feedback_replan_cli(
+    runner,
+    session_id: str,
+    user_id: str,
+    state_store: TaskStateStore,
+    task: WorkflowTask,
+    feedback_text: str,
+    *,
+    intent_router_runner=None,
+    intent_router_session_id: str | None = None,
+    feedback_parser_runner=None,
+    feedback_parser_session_id: str | None = None,
+    gate_reason: str = "feedback_replan",
+) -> WorkflowTask:
+    if not task.base_objective:
+        task.base_objective = task.objective
+
+    parsed_intent = await _parse_revision_intent(
+        feedback_text,
+        feedback_parser_runner=feedback_parser_runner,
+        feedback_parser_session_id=feedback_parser_session_id,
+        user_id=user_id,
+    )
+    prior_version = active_plan_version(task)
+    merged_intent = _merge_revision_intents(
+        prior_version.revision_intent if prior_version else None,
+        parsed_intent,
+    )
+    revised_objective = _merge_objective_with_revision_intent(task.base_objective or task.objective, merged_intent)
+
+    intent_route = await _route_query_intent(
+        revised_objective,
+        intent_router_runner=intent_router_runner,
+        intent_router_session_id=intent_router_session_id,
+        user_id=user_id,
+    )
+    request_type = str(intent_route.get("request_type", task.request_type) or task.request_type)
+    intent_tags = list(intent_route.get("intent_tags", task.intent_tags) or task.intent_tags)
+
+    replan_remaining_steps(
+        task,
+        revised_objective=revised_objective,
+        request_type=request_type,
+        intent_tags=intent_tags,
+        revision_intent=merged_intent,
+        gate_reason=gate_reason,
+    )
+    task.hitl_history.append(f"revise:{feedback_text}")
+    task.pending_feedback_queue = []
+    task.awaiting_hitl = True
+    task.checkpoint_state = "open"
+    task.checkpoint_reason = gate_reason
+    task.status = "in_progress"
+    task.touch()
+    state_store.save_task(task, note="feedback_replan")
+    _print_checkpoint_plan(task)
+    return task
+
+
+async def _execute_until_next_gate_or_completion_cli(
+    runner,
+    session_id: str,
+    user_id: str,
+    state_store: TaskStateStore,
+    task: WorkflowTask,
+    *,
+    bypass_first_gate: bool,
+) -> tuple[str, dict | None]:
+    quality_state: dict = {}
+    first_gate_check = True
+
+    while task.current_step_index + 1 < len(task.steps):
+        next_idx = task.current_step_index + 1
+        next_step = task.steps[next_idx]
+        queued_feedback = [str(item).strip() for item in task.pending_feedback_queue if str(item).strip()]
+        open_gate, gate_reason = should_open_checkpoint(task, next_step, quality_state, queued_feedback)
+        if open_gate:
+            if bypass_first_gate and first_gate_check and gate_reason == "pre_evidence_execution":
+                first_gate_check = False
+            else:
+                task.awaiting_hitl = True
+                task.checkpoint_state = "open"
+                task.checkpoint_reason = gate_reason
+                task.touch()
+                state_store.save_task(task, note="adaptive_hitl_checkpoint_opened")
+                print(f"\n[Adaptive Checkpoint] {_format_checkpoint_reason(gate_reason)}")
+                _print_checkpoint_plan(task)
+                return "awaiting_hitl", None
+
+        first_gate_check = False
+        step_text = await _execute_step(runner, session_id, user_id, task, next_idx)
+        state_store.save_task(task, note=f"step_{next_idx + 1}_completed")
+        print(step_text)
+
+        step = task.steps[next_idx]
+        tool_failures = sum(
+            1
+            for entry in (step.tool_trace or [])
+            if str(entry.get("outcome", "")) in {"error", "not_found_or_empty", "no_response", "degraded"}
+        )
+        base_quality = _evaluate_quality_gates(task)
+        quality_state = {
+            "unresolved_gaps": base_quality.get("unresolved_gaps", []),
+            "last_step_failures": tool_failures,
+            "last_step_output": step.output,
+        }
+
+    quality = _evaluate_quality_gates(task)
+    print("\n" + _render_quality_gate_message(quality))
+    if not quality["passed"]:
+        print("\nRunning one fallback recovery pass...")
+        recovery, recovery_trace = await _run_fallback_recovery(runner, session_id, user_id, task)
+        task.fallback_tool_trace = recovery_trace
+        task.fallback_recovery_notes = recovery or ""
+        quality = _evaluate_quality_gates(task)
+    return "completed", quality
+
+
 def _persist_report_artifacts(task: WorkflowTask, report: str) -> tuple[Path, Path | None, str | None]:
     REPORT_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     safe_task_id = re.sub(r"[^a-zA-Z0-9_-]", "_", task.task_id)
@@ -1458,8 +2134,8 @@ def _print_final_report_with_artifacts(task: WorkflowTask, quality_report: dict)
 def _print_hitl_prompt() -> None:
     print("\n[HITL Checkpoint]")
     print("Reply with one of:")
-    print("  - continue")
-    print("  - revise <new scope>")
+    print("  - start (or continue)")
+    print("  - any feedback text to revise the remaining plan")
     print("  - stop")
     print("You can also run: status | history | rollback")
 
@@ -1513,6 +2189,9 @@ async def _start_new_workflow_task(
     state_store: TaskStateStore,
     objective: str,
     intent_route: dict | None = None,
+    task_id_override: str | None = None,
+    created_at_override: str | None = None,
+    hitl_history_seed: list[str] | None = None,
 ) -> WorkflowTask:
     route = intent_route or _default_intent_route(objective)
     routed_objective = str(route.get("normalized_query") or objective).strip() or objective
@@ -1536,11 +2215,21 @@ async def _start_new_workflow_task(
         request_type_override=routed_request_type,
         intent_tags_override=routed_intent_tags,
     )
+    task.base_objective = _extract_primary_objective_text(routed_objective) or routed_objective
+    if task_id_override and task_id_override.strip():
+        task.task_id = task_id_override.strip()
+    if created_at_override and created_at_override.strip():
+        task.created_at = created_at_override.strip()
+    if hitl_history_seed is not None:
+        task.hitl_history = [str(item).strip() for item in hitl_history_seed if str(item).strip()]
     state_store.save_task(task, note="task_created")
     step_text = await _execute_step(runner, session_id, user_id, task, 0)
     state_store.save_task(task, note="step_1_completed")
     print(_render_hitl_scope_summary(task, step_text))
     task.awaiting_hitl = True
+    task.checkpoint_state = "open"
+    task.checkpoint_reason = "pre_evidence_execution"
+    initialize_plan_version(task, gate_reason=task.checkpoint_reason)
     task.touch()
     state_store.save_task(task, note="hitl_checkpoint_opened")
     _print_hitl_prompt()
@@ -1609,6 +2298,11 @@ async def run_interactive_async():
         app_name="co_scientist_intent_router",
         session_service=session_service,
     )
+    feedback_parser_runner = Runner(
+        agent=create_feedback_parser_agent(),
+        app_name="co_scientist_feedback_parser",
+        session_service=session_service,
+    )
     
     # Create a session
     session = await session_service.create_session(
@@ -1623,6 +2317,10 @@ async def run_interactive_async():
         app_name="co_scientist_intent_router",
         user_id="researcher",
     )
+    feedback_parser_session = await session_service.create_session(
+        app_name="co_scientist_feedback_parser",
+        user_id="researcher",
+    )
     state_store = TaskStateStore(Path(__file__).parent / "state" / "workflow_tasks.json")
     active_task: WorkflowTask | None = None
     pending_clarification_query: str | None = None
@@ -1634,7 +2332,7 @@ async def run_interactive_async():
     print("  - 'Evaluate LRRK2 as a drug target'")
     print("  - 'What clinical trials exist for Alzheimer's gamma-secretase inhibitors?'")
     print("\nCommands: status | resume [task_id] | history [task_id] | rollback <offset|revision_id> [task_id] | help | quit")
-    print("At HITL checkpoint: continue | revise <scope> | stop\n")
+    print("At HITL checkpoint: start | continue | <feedback text> | stop\n")
     print("-" * 60)
     
     try:
@@ -1655,7 +2353,7 @@ async def run_interactive_async():
                 lowered = user_input.lower().strip()
                 if lowered == "help":
                     print("\nCommands: status | resume [task_id] | history [task_id] | rollback <offset|revision_id> [task_id] | help | quit")
-                    print("At HITL checkpoint: continue | revise <scope> | stop")
+                    print("At HITL checkpoint: start | continue | <feedback text> | stop")
                     continue
 
                 if lowered == "status":
@@ -1753,26 +2451,37 @@ async def run_interactive_async():
                     continue
 
                 if (
-                    lowered == "continue"
+                    lowered in {"continue", "start"}
                     and active_task
                     and not active_task.awaiting_hitl
                     and active_task.status in {"pending", "in_progress"}
                     and active_task.current_step_index < len(active_task.steps) - 1
                 ):
-                    quality = await _complete_remaining_steps(
-                        runner, session.id, "researcher", active_task, state_store
+                    terminal_status, quality = await _execute_until_next_gate_or_completion_cli(
+                        runner,
+                        session.id,
+                        "researcher",
+                        state_store,
+                        active_task,
+                        bypass_first_gate=False,
                     )
+                    if terminal_status == "awaiting_hitl":
+                        active_task.status = "in_progress"
+                        active_task.touch()
+                        state_store.save_task(active_task, note="adaptive_checkpoint_waiting")
+                        _print_hitl_prompt()
+                        continue
                     active_task.status = "completed"
+                    active_task.awaiting_hitl = False
+                    active_task.checkpoint_state = "closed"
+                    active_task.checkpoint_reason = ""
                     active_task.touch()
                     state_store.save_task(active_task, note="workflow_completed")
-                    _print_final_report_with_artifacts(active_task, quality)
+                    _print_final_report_with_artifacts(active_task, quality or _evaluate_quality_gates(active_task))
                     continue
 
-                if lowered in {"continue", "stop"} and not (active_task and active_task.awaiting_hitl):
+                if lowered in {"continue", "start", "stop"} and not (active_task and active_task.awaiting_hitl):
                     print("\nNo pending checkpoint. Ask a new query or use `status`.")
-                    continue
-                if lowered.startswith("revise") and not (active_task and active_task.awaiting_hitl):
-                    print("\nNo pending checkpoint to revise. Ask a new query first.")
                     continue
 
                 if lowered.startswith("resume"):
@@ -1790,56 +2499,68 @@ async def run_interactive_async():
                     continue
 
                 if active_task and active_task.awaiting_hitl:
-                    if lowered == "continue":
+                    if lowered in {"continue", "start"}:
                         active_task.hitl_history.append("continue")
                         active_task.awaiting_hitl = False
-                        state_store.save_task(active_task, note="hitl_continue")
-                        quality = await _complete_remaining_steps(
-                            runner, session.id, "researcher", active_task, state_store
-                        )
-
-                        active_task.status = "completed"
+                        active_task.checkpoint_state = "closed"
+                        active_task.checkpoint_reason = ""
                         active_task.touch()
-                        state_store.save_task(active_task, note="workflow_completed")
-                        _print_final_report_with_artifacts(active_task, quality)
-                        continue
-
-                    if lowered.startswith("revise"):
-                        revised_scope = user_input[6:].strip()
-                        if not revised_scope:
-                            print("\nUse: revise <new scope>")
-                            continue
-                        revision_note = f"revise:{revised_scope}"
-                        revised_objective = _merge_objective_with_revision(
-                            active_task.objective,
-                            revised_scope,
-                        )
-                        intent_route = await _route_query_intent(
-                            revised_objective,
-                            intent_router_runner=intent_router_runner,
-                            intent_router_session_id=intent_router_session.id,
-                            user_id="researcher",
-                        )
-                        active_task = await _start_new_workflow_task(
+                        state_store.save_task(active_task, note="hitl_start")
+                        terminal_status, quality = await _execute_until_next_gate_or_completion_cli(
                             runner,
                             session.id,
                             "researcher",
                             state_store,
-                            revised_objective,
-                            intent_route=intent_route,
+                            active_task,
+                            bypass_first_gate=True,
                         )
-                        active_task.hitl_history.append(revision_note)
+                        if terminal_status == "awaiting_hitl":
+                            active_task.status = "in_progress"
+                            active_task.touch()
+                            state_store.save_task(active_task, note="adaptive_checkpoint_waiting")
+                            _print_hitl_prompt()
+                            continue
+
+                        active_task.status = "completed"
+                        active_task.awaiting_hitl = False
+                        active_task.checkpoint_state = "closed"
+                        active_task.checkpoint_reason = ""
                         active_task.touch()
-                        state_store.save_task(active_task, note=revision_note)
+                        state_store.save_task(active_task, note="workflow_completed")
+                        _print_final_report_with_artifacts(active_task, quality or _evaluate_quality_gates(active_task))
                         continue
 
                     if lowered == "stop":
                         active_task.hitl_history.append("stop")
                         active_task.status = "blocked"
                         active_task.awaiting_hitl = False
+                        active_task.checkpoint_state = "closed"
+                        active_task.checkpoint_reason = ""
                         active_task.touch()
                         state_store.save_task(active_task, note="workflow_stopped")
                         print("\nWorkflow stopped and saved.")
+                        continue
+
+                    if lowered.startswith("revise"):
+                        feedback_text = user_input[6:].strip()
+                    else:
+                        feedback_text = user_input.strip()
+
+                    if feedback_text:
+                        await _apply_feedback_replan_cli(
+                            runner=runner,
+                            session_id=session.id,
+                            user_id="researcher",
+                            state_store=state_store,
+                            task=active_task,
+                            feedback_text=feedback_text,
+                            intent_router_runner=intent_router_runner,
+                            intent_router_session_id=intent_router_session.id,
+                            feedback_parser_runner=feedback_parser_runner,
+                            feedback_parser_session_id=feedback_parser_session.id,
+                            gate_reason="feedback_replan",
+                        )
+                        _print_hitl_prompt()
                         continue
 
                     print("\nThis task is waiting at HITL checkpoint.")
