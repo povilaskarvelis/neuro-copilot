@@ -21,8 +21,6 @@ import os
 import asyncio
 from pathlib import Path
 import traceback
-import re
-import json
 import logging
 from dotenv import load_dotenv
 
@@ -37,16 +35,18 @@ from mcp.client.stdio import StdioServerParameters
 from google.adk.tools.mcp_tool.mcp_toolset import StdioConnectionParams
 from report_pdf import write_markdown_pdf
 from task_state_store import TaskStateStore
+from co_scientist.planning import intent as _planning_intent
+from co_scientist.planning import revision as _planning_revision
+from co_scientist.presentation import cli_output as _presentation_cli
+from co_scientist.presentation import hitl_summary as _presentation_hitl
+from co_scientist.runtime import execution as _runtime_exec
+from co_scientist.runtime import quality_gates as _runtime_quality
 from workflow import (
-    VALID_INTENT_TAGS,
-    VALID_REQUEST_TYPES,
     RevisionIntent,
     WorkflowTask,
     active_plan_version,
-    classify_request_type,
     create_task,
     extract_evidence_refs,
-    infer_intent_tags,
     initialize_plan_version,
     replan_remaining_steps,
     render_final_report,
@@ -295,336 +295,78 @@ Rules:
 - next: max 2 bullets.
 """
 
-QUERY_TYPO_REPLACEMENTS: tuple[tuple[str, str], ...] = (
-    (r"\breseachers\b", "researchers"),
-    (r"\breseacher\b", "researcher"),
-    (r"\bresearchs\b", "researchers"),
-    (r"\bwich\b", "which"),
-    (r"\btime\s*frame\b", "timeframe"),
-)
+QUERY_TYPO_REPLACEMENTS: tuple[tuple[str, str], ...] = _planning_intent.QUERY_TYPO_REPLACEMENTS
 
 
-AMBIGUOUS_ABBREVIATIONS: dict[str, dict[str, list[str]]] = {
-    "ER": {
-        "options": ["Estrogen receptor (ESR1/ESR2)", "Endoplasmic reticulum pathway"],
-        "disambiguators": ["estrogen receptor", "esr1", "esr2", "endoplasmic reticulum", "er stress"],
-    },
-    "AD": {
-        "options": ["Alzheimer disease", "Atopic dermatitis", "Autosomal dominant context"],
-        "disambiguators": ["alzheimer", "atopic dermatitis", "autosomal dominant"],
-    },
-    "PD": {
-        "options": ["Parkinson disease", "Pharmacodynamics", "PD-1/PD-L1 axis context"],
-        "disambiguators": ["parkinson", "pharmacodynamic", "pd-1", "pd-l1", "programmed death"],
-    },
-    "MS": {
-        "options": ["Multiple sclerosis", "Mass spectrometry"],
-        "disambiguators": ["multiple sclerosis", "mass spectrometry", "proteomics"],
-    },
-    "RA": {
-        "options": ["Rheumatoid arthritis", "Retinoic acid signaling"],
-        "disambiguators": ["rheumatoid arthritis", "retinoic acid"],
-    },
-}
+AMBIGUOUS_ABBREVIATIONS: dict[str, dict[str, list[str]]] = _planning_intent.AMBIGUOUS_ABBREVIATIONS
 
 
 def _find_ambiguous_abbreviations(query: str) -> list[tuple[str, list[str]]]:
-    lowered = query.lower()
-    matches: list[tuple[str, list[str]]] = []
-    for abbr, cfg in AMBIGUOUS_ABBREVIATIONS.items():
-        if not re.search(rf"\b{abbr}\b", query):
-            continue
-        if any(hint in lowered for hint in cfg["disambiguators"]):
-            continue
-        matches.append((abbr, cfg["options"]))
-    return matches
+    return _planning_intent.find_ambiguous_abbreviations(query)
 
 
 def _build_deterministic_clarification_request(query: str) -> str | None:
-    matches = _find_ambiguous_abbreviations(query)
-    if not matches:
-        return None
-
-    lines = ["I need a quick clarification before I run tools:"]
-    for abbr, options in matches[:3]:
-        option_text = " or ".join(options)
-        lines.append(f"- `{abbr}` could mean {option_text}. Which one do you mean?")
-    lines.append("Reply with a short clarification and I will continue.")
-    return "\n".join(lines)
+    return _planning_intent.build_deterministic_clarification_request(query)
 
 
 def _merge_query_with_clarification(original_query: str, clarification: str) -> str:
-    return (
-        f"{original_query}\n"
-        f"User clarification: {clarification.strip()}\n"
-        "Use this clarification as the intended meaning for ambiguous abbreviations."
-    )
+    return _planning_intent.merge_query_with_clarification(original_query, clarification)
 
 
 def _extract_revision_directives(revised_scope: str) -> list[str]:
-    text = revised_scope.strip()
-    if not text:
-        return []
-
-    normalized = re.sub(r"\r\n?", "\n", text)
-    parts: list[str] = []
-    for line in normalized.splitlines():
-        cleaned = line.strip()
-        if not cleaned:
-            continue
-        cleaned = re.sub(r"^(?:[-*]|\d+[.)])\s*", "", cleaned).strip()
-        if not cleaned:
-            continue
-        segments = [segment.strip() for segment in cleaned.split(";") if segment.strip()]
-        parts.extend(segments if segments else [cleaned])
-
-    directives: list[str] = []
-    for part in parts:
-        collapsed = re.sub(r"\s+", " ", part).strip(" .")
-        if not collapsed:
-            continue
-        if collapsed.lower().startswith("and "):
-            collapsed = collapsed[4:].strip()
-        if len(collapsed) < 3:
-            continue
-        if collapsed not in directives:
-            directives.append(collapsed)
-        if len(directives) >= 6:
-            break
-    return directives
+    return _planning_revision.extract_revision_directives(revised_scope)
 
 
 def _merge_objective_with_revision(original_objective: str, revised_scope: str) -> str:
-    base = original_objective.strip()
-    revision = revised_scope.strip()
-    if not base:
-        return revision
-    if not revision:
-        return base
-    directives = _extract_revision_directives(revision)
-    directives_block = ""
-    if directives:
-        rendered_directives = "\n".join(f"- {item}" for item in directives)
-        directives_block = (
-            "\nRevision directives to apply:\n"
-            f"{rendered_directives}\n"
-            "Treat these directives as mandatory when rebuilding and executing the workflow."
-        )
-    return (
-        f"{base}\n"
-        f"User revision to scope/decomposition: {revision}\n"
-        "Treat this revision as the authoritative update when rebuilding the workflow."
-        f"{directives_block}"
-    )
+    return _planning_revision.merge_objective_with_revision(original_objective, revised_scope)
 
 
 def _extract_revision_directive_from_objective(objective: str) -> str | None:
-    match = re.search(r"User revision to scope/decomposition:\s*(.+)", objective or "", flags=re.IGNORECASE)
-    return match.group(1).strip() if match else None
+    return _planning_revision.extract_revision_directive_from_objective(objective)
 
 
 def _extract_timeframe_hint(text: str) -> str | None:
-    if not text:
-        return None
-    range_match = re.search(
-        r"\b((?:19|20)\d{2})\s*(?:-|–|to|through)\s*((?:19|20)\d{2})\b",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if range_match:
-        start_year = int(range_match.group(1))
-        end_year = int(range_match.group(2))
-        if start_year <= end_year:
-            return f"{start_year}-{end_year}"
-    current_year_match = re.search(r"\bcurrent year is\s+((?:19|20)\d{2})\b", text, flags=re.IGNORECASE)
-    if current_year_match:
-        return f"up to {current_year_match.group(1)}"
-    relative_match = re.search(
-        r"\b(?:last|past)\s+(\d{1,2})(?:\s*(?:-|to)\s*(\d{1,2}))?\s+years?\b",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if relative_match:
-        first = relative_match.group(1)
-        second = relative_match.group(2)
-        return f"last {first}-{second} years" if second else f"last {first} years"
-    return None
+    return _planning_revision.extract_timeframe_hint(text)
 
 
 def _extract_primary_objective_text(objective: str) -> str:
-    text = (objective or "").strip()
-    markers = [
-        "\nUser revision to scope/decomposition:",
-        "\nUser clarification:",
-        "\nUse this clarification as the intended meaning for ambiguous abbreviations.",
-    ]
-    for marker in markers:
-        if marker in text:
-            text = text.split(marker, 1)[0].strip()
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return lines[0] if lines else text
+    return _planning_revision.extract_primary_objective_text(objective)
 
 
 def _clean_model_text(value: str) -> str:
-    text = (value or "").strip()
-    text = re.sub(r"`+", "", text)
-    text = text.replace("**", "")
-    text = text.replace("*", "")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return _presentation_hitl.clean_model_text(value)
 
 
 def _extract_labeled_value(text: str, labels: list[str]) -> str | None:
-    lowered_labels = [label.lower() for label in labels]
-    for raw in (text or "").splitlines():
-        stripped = raw.strip()
-        if not stripped:
-            continue
-        stripped = re.sub(r"^(?:[-*]|\d+[.)])\s+", "", stripped)
-        cleaned = _clean_model_text(stripped)
-        lower = cleaned.lower()
-        for label in lowered_labels:
-            if not lower.startswith(label):
-                continue
-            if ":" in cleaned:
-                candidate = cleaned.split(":", 1)[1].strip()
-                if candidate:
-                    return candidate
-    return None
+    return _presentation_hitl.extract_labeled_value(text, labels)
 
 
 def _extract_decomposition_subtasks(text: str) -> list[str]:
-    if not text:
-        return []
-    lines = [line.rstrip() for line in text.splitlines()]
-    capture = False
-    items: list[str] = []
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if capture and items:
-                break
-            continue
-
-        normalized = _clean_model_text(stripped).lower().replace(" ", "_")
-        if any(token in normalized for token in ["decomposition_subtasks", "decomposition", "subtasks", "sub_tasks"]):
-            capture = True
-            continue
-
-        bullet_match = re.match(r"^(?:[-*]|\d+[.)])\s+(.+)$", stripped)
-        if not bullet_match:
-            if capture and items:
-                break
-            continue
-        if not capture:
-            continue
-        item = _clean_model_text(bullet_match.group(1))
-        if item:
-            if ":" in item and len(item.split(":", 1)[0].split()) <= 5:
-                item = item.split(":", 1)[1].strip() or item
-            items.append(item)
-    return items
+    return _presentation_hitl.extract_decomposition_subtasks(text)
 
 
 def _default_hitl_subtasks(task: WorkflowTask) -> list[str]:
-    if "researcher_discovery" in task.intent_tags:
-        return [
-            "Query disease/topic context and confirm timeframe.",
-            "Identify topic-matched publications.",
-            "Extract authors and affiliations.",
-            "Rank researchers by activity and impact.",
-        ]
-    return [
-        "Confirm scope and concrete entities.",
-        "Gather evidence from primary sources.",
-        "Synthesize findings into a direct answer.",
-    ]
+    return _presentation_hitl.default_hitl_subtasks(task)
 
 
 def _extract_focus_from_step_output(step_output: str) -> str | None:
-    disease = _extract_labeled_value(step_output, ["Disease Area", "Disease", "Focus"])
-    if not disease:
-        return None
-    focus = _clean_model_text(disease)
-    focus = re.sub(r"\s*\([^)]*[_:]\d+[^)]*\)\s*", "", focus).strip()
-    focus = re.sub(r"\s+", " ", focus).strip(" .")
-    return focus or None
+    return _presentation_hitl.extract_focus_from_step_output(step_output)
 
 
 def _render_hitl_scope_summary(task: WorkflowTask, step_output: str) -> str:
-    subtasks = _extract_decomposition_subtasks(step_output)
-    if len(subtasks) < 2:
-        subtasks = _default_hitl_subtasks(task)
-
-    if "researcher_discovery" in task.intent_tags:
-        focus = _extract_focus_from_step_output(step_output)
-        lead = (
-            f"To find the top researchers in {focus}, I will:"
-            if focus
-            else "To find the top researchers for your query, I will:"
-        )
-    else:
-        lead = "To answer your request, I will:"
-
-    lines = [lead]
-    for idx, subtask in enumerate(subtasks[:5], start=1):
-        lines.append(f"{idx}. {subtask}")
-    if len(subtasks) > 5:
-        lines.append(f"... plus {len(subtasks) - 5} additional sub-task(s).")
-    return "\n".join(lines)
+    return _presentation_hitl.render_hitl_scope_summary(task, step_output)
 
 
 def _extract_json_payload(text: str) -> dict | None:
-    if not text:
-        return None
-    cleaned = text.strip()
-    try:
-        payload = json.loads(cleaned)
-        return payload if isinstance(payload, dict) else None
-    except json.JSONDecodeError:
-        pass
-
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    snippet = cleaned[start : end + 1]
-    try:
-        payload = json.loads(snippet)
-        return payload if isinstance(payload, dict) else None
-    except json.JSONDecodeError:
-        return None
+    return _planning_intent.extract_json_payload(text)
 
 
 def _contains_malformed_biomedical_identifier(query: str) -> bool:
-    tokens = re.findall(r"\b[A-Za-z0-9_]+\b", query)
-    for token in tokens:
-        upper = token.upper()
-        if upper.startswith("ENSG") and not re.fullmatch(r"ENSG\d{11}", upper):
-            return True
-        if upper.startswith("MONDO_") and not re.fullmatch(r"MONDO_\d{7}", upper):
-            return True
-        if upper.startswith("EFO_") and not re.fullmatch(r"EFO_\d+", upper):
-            return True
-        if upper.startswith("NCT") and not re.fullmatch(r"NCT\d{8}", upper):
-            return True
-        if upper.startswith("PMID") and not re.fullmatch(r"PMID\d{5,9}", upper):
-            return True
-    return False
+    return _planning_intent.contains_malformed_biomedical_identifier(query)
 
 
 def _looks_like_low_value_typo_clarification(query: str, questions: list[str], reason: str) -> bool:
-    combined = " ".join(questions + [reason]).lower()
-    typo_like = any(
-        phrase in combined
-        for phrase in ["did you mean", "did you intend", "possible typo", "spelling", "misspell"]
-    )
-    if not typo_like:
-        return False
-    if _contains_malformed_biomedical_identifier(query):
-        return False
-    return True
+    return _planning_intent.looks_like_low_value_typo_clarification(query, questions, reason)
 
 
 async def _build_model_clarification_request(
@@ -633,42 +375,13 @@ async def _build_model_clarification_request(
     user_id: str,
     query: str,
 ) -> str | None:
-    prompt = (
-        "Analyze whether this biomedical query requires clarification before tools run.\n"
-        f"Query: {query}\n"
-        "Return strict JSON only."
+    return await _planning_intent.build_model_clarification_request(
+        clarifier_runner,
+        clarifier_session_id,
+        user_id,
+        query,
+        run_runner_turn_fn=_run_runner_turn,
     )
-    raw = await _run_runner_turn(clarifier_runner, clarifier_session_id, user_id, prompt)
-    payload = _extract_json_payload(raw)
-    if not payload:
-        return None
-
-    needs_clarification = bool(payload.get("needs_clarification"))
-    if not needs_clarification:
-        return None
-
-    try:
-        confidence = float(payload.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    if confidence < 0.8:
-        return None
-
-    questions = [str(q).strip() for q in payload.get("questions", []) if str(q).strip()]
-    if not questions:
-        return None
-    reason = str(payload.get("reason", "")).strip()
-    if _looks_like_low_value_typo_clarification(query, questions, reason):
-        return None
-
-    lines = ["I need a quick clarification before I run tools:"]
-    for question in questions[:2]:
-        if question.startswith("-"):
-            lines.append(question)
-        else:
-            lines.append(f"- {question}")
-    lines.append("Reply with a short clarification and I will continue.")
-    return "\n".join(lines)
 
 
 async def _build_clarification_request(
@@ -678,85 +391,25 @@ async def _build_clarification_request(
     clarifier_session_id: str | None = None,
     user_id: str = "researcher",
 ) -> str | None:
-    deterministic = _build_deterministic_clarification_request(query)
-    if deterministic:
-        return deterministic
-    if clarifier_runner is None or not clarifier_session_id:
-        return None
-    return await _build_model_clarification_request(
-        clarifier_runner,
-        clarifier_session_id,
-        user_id,
+    return await _planning_intent.build_clarification_request(
         query,
+        clarifier_runner=clarifier_runner,
+        clarifier_session_id=clarifier_session_id,
+        user_id=user_id,
+        run_runner_turn_fn=_run_runner_turn,
     )
 
 
 def _dedupe_compact(items: list[str], *, limit: int = 8) -> list[str]:
-    seen: set[str] = set()
-    cleaned: list[str] = []
-    for item in items:
-        value = re.sub(r"\s+", " ", str(item or "")).strip(" .")
-        if not value:
-            continue
-        lowered = value.lower()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        cleaned.append(value)
-        if len(cleaned) >= limit:
-            break
-    return cleaned
+    return _planning_revision.dedupe_compact(items, limit=limit)
 
 
 def _coerce_str_list(value) -> list[str]:
-    if isinstance(value, list):
-        raw_items = [str(item) for item in value]
-    elif isinstance(value, str):
-        raw_items = re.split(r"[\n;]+", value)
-    else:
-        raw_items = []
-    return _dedupe_compact(raw_items)
+    return _planning_revision.coerce_str_list(value)
 
 
 def _build_deterministic_revision_intent(feedback: str) -> RevisionIntent:
-    parts = _extract_revision_directives(feedback)
-    constraints: list[str] = []
-    priorities: list[str] = []
-    exclusions: list[str] = []
-    evidence_prefs: list[str] = []
-    output_prefs: list[str] = []
-    objective_adjustments: list[str] = []
-
-    for item in parts:
-        lowered = item.lower()
-        if any(token in lowered for token in ("do not", "don't", "exclude", "avoid", "without")):
-            exclusions.append(item)
-            continue
-        if any(token in lowered for token in ("must", "need to", "required", "should")):
-            constraints.append(item)
-            continue
-        if any(token in lowered for token in ("prioritize", "focus", "first", "before")):
-            priorities.append(item)
-            continue
-        if any(token in lowered for token in ("evidence", "citation", "pmid", "nct", "source")):
-            evidence_prefs.append(item)
-            continue
-        if any(token in lowered for token in ("format", "table", "output", "report", "summary")):
-            output_prefs.append(item)
-            continue
-        objective_adjustments.append(item)
-
-    return RevisionIntent(
-        raw_feedback=feedback.strip(),
-        objective_adjustments=_dedupe_compact(objective_adjustments),
-        constraints=_dedupe_compact(constraints),
-        priorities=_dedupe_compact(priorities),
-        exclusions=_dedupe_compact(exclusions),
-        evidence_preferences=_dedupe_compact(evidence_prefs),
-        output_preferences=_dedupe_compact(output_prefs),
-        confidence=0.45,
-        parser_source="fallback",
-    )
+    return _planning_revision.build_deterministic_revision_intent(feedback)
 
 
 async def _parse_revision_intent(
@@ -766,173 +419,37 @@ async def _parse_revision_intent(
     feedback_parser_session_id: str | None = None,
     user_id: str = "researcher",
 ) -> RevisionIntent:
-    deterministic = _build_deterministic_revision_intent(feedback)
-    if feedback_parser_runner is None or not feedback_parser_session_id:
-        return deterministic
-
-    prompt = (
-        "Parse this checkpoint feedback into structured intent updates.\n"
-        f"Feedback: {feedback}\n"
-        "Return strict JSON only."
+    return await _planning_revision.parse_revision_intent(
+        feedback,
+        feedback_parser_runner=feedback_parser_runner,
+        feedback_parser_session_id=feedback_parser_session_id,
+        user_id=user_id,
+        run_runner_turn_fn=_run_runner_turn,
     )
-    try:
-        raw = await _run_runner_turn(feedback_parser_runner, feedback_parser_session_id, user_id, prompt)
-        payload = _extract_json_payload(raw)
-    except Exception:
-        payload = None
-    if not payload:
-        return deterministic
-
-    try:
-        confidence = float(payload.get("confidence", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        confidence = 0.0
-    confidence = max(0.0, min(1.0, confidence))
-
-    parsed = RevisionIntent(
-        raw_feedback=feedback.strip(),
-        objective_adjustments=_coerce_str_list(payload.get("objective_adjustments")),
-        constraints=_coerce_str_list(payload.get("constraints")),
-        priorities=_coerce_str_list(payload.get("priorities")),
-        exclusions=_coerce_str_list(payload.get("exclusions")),
-        evidence_preferences=_coerce_str_list(payload.get("evidence_preferences")),
-        output_preferences=_coerce_str_list(payload.get("output_preferences")),
-        confidence=confidence,
-        parser_source="model",
-    )
-
-    has_signal = any(
-        (
-            parsed.objective_adjustments,
-            parsed.constraints,
-            parsed.priorities,
-            parsed.exclusions,
-            parsed.evidence_preferences,
-            parsed.output_preferences,
-        )
-    )
-    if not has_signal:
-        return deterministic
-    return parsed
 
 
 def _render_revision_intent_as_text(intent: RevisionIntent) -> str:
-    lines = []
-    if intent.objective_adjustments:
-        lines.append("Objective adjustments:")
-        lines.extend([f"- {item}" for item in intent.objective_adjustments])
-    if intent.constraints:
-        lines.append("Constraints:")
-        lines.extend([f"- {item}" for item in intent.constraints])
-    if intent.priorities:
-        lines.append("Priorities:")
-        lines.extend([f"- {item}" for item in intent.priorities])
-    if intent.exclusions:
-        lines.append("Exclusions:")
-        lines.extend([f"- {item}" for item in intent.exclusions])
-    if intent.evidence_preferences:
-        lines.append("Evidence preferences:")
-        lines.extend([f"- {item}" for item in intent.evidence_preferences])
-    if intent.output_preferences:
-        lines.append("Output preferences:")
-        lines.extend([f"- {item}" for item in intent.output_preferences])
-    return "\n".join(lines).strip()
+    return _planning_revision.render_revision_intent_as_text(intent)
 
 
 def _merge_objective_with_revision_intent(original_objective: str, intent: RevisionIntent) -> str:
-    base = (original_objective or "").strip()
-    if not base:
-        base = (intent.raw_feedback or "").strip()
-    intent_text = _render_revision_intent_as_text(intent)
-    if not intent_text:
-        return _merge_objective_with_revision(base, intent.raw_feedback)
-    return (
-        f"{base}\n"
-        f"User revision to scope/decomposition: {intent.raw_feedback.strip()}\n"
-        "Revision directives to apply:\n"
-        f"{intent_text}\n"
-        "Treat these directives as mandatory when rebuilding and executing the workflow."
-    )
+    return _planning_revision.merge_objective_with_revision_intent(original_objective, intent)
 
 
 def _merge_revision_intents(previous: RevisionIntent | None, incoming: RevisionIntent) -> RevisionIntent:
-    merged = RevisionIntent(
-        raw_feedback=incoming.raw_feedback.strip() or (previous.raw_feedback if previous else ""),
-        objective_adjustments=[],
-        constraints=[],
-        priorities=[],
-        exclusions=[],
-        evidence_preferences=[],
-        output_preferences=[],
-        confidence=max(float(previous.confidence if previous else 0.0), float(incoming.confidence)),
-        parser_source=incoming.parser_source or (previous.parser_source if previous else "fallback"),
-    )
-    merged.objective_adjustments = _dedupe_compact(
-        [
-            *(previous.objective_adjustments if previous else []),
-            *incoming.objective_adjustments,
-        ]
-    )
-    merged.constraints = _dedupe_compact(
-        [
-            *(previous.constraints if previous else []),
-            *incoming.constraints,
-        ]
-    )
-    merged.priorities = _dedupe_compact(
-        [
-            *(previous.priorities if previous else []),
-            *incoming.priorities,
-        ]
-    )
-    merged.exclusions = _dedupe_compact(
-        [
-            *(previous.exclusions if previous else []),
-            *incoming.exclusions,
-        ]
-    )
-    merged.evidence_preferences = _dedupe_compact(
-        [
-            *(previous.evidence_preferences if previous else []),
-            *incoming.evidence_preferences,
-        ]
-    )
-    merged.output_preferences = _dedupe_compact(
-        [
-            *(previous.output_preferences if previous else []),
-            *incoming.output_preferences,
-        ]
-    )
-    return merged
+    return _planning_revision.merge_revision_intents(previous, incoming)
 
 
 def _normalize_user_query(query: str) -> str:
-    normalized = query.strip()
-    for pattern, replacement in QUERY_TYPO_REPLACEMENTS:
-        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", normalized).strip()
+    return _planning_intent.normalize_user_query(query)
 
 
 def _coerce_model_intent_tags(value) -> list[str]:
-    if isinstance(value, list):
-        raw_items = value
-    elif isinstance(value, str):
-        raw_items = re.split(r"[,\n;]+", value)
-    else:
-        return []
-    return sanitize_intent_tags([str(item).strip() for item in raw_items if str(item).strip()])
+    return _planning_intent.coerce_model_intent_tags(value)
 
 
 def _default_intent_route(query: str) -> dict:
-    normalized_query = _normalize_user_query(query)
-    return {
-        "normalized_query": normalized_query or query,
-        "request_type": classify_request_type(normalized_query or query),
-        "intent_tags": infer_intent_tags(normalized_query or query),
-        "confidence": 0.0,
-        "reason": "Deterministic routing fallback.",
-        "source": "deterministic",
-    }
+    return _planning_intent.default_intent_route(query)
 
 
 async def _build_model_intent_route(
@@ -941,82 +458,17 @@ async def _build_model_intent_route(
     user_id: str,
     query: str,
 ) -> dict | None:
-    prompt = (
-        "Route this biomedical request into workflow intent metadata.\n"
-        f"Request: {query}\n"
-        f"Valid request_type values: {', '.join(sorted(VALID_REQUEST_TYPES))}\n"
-        f"Valid intent_tags values: {', '.join(sorted(VALID_INTENT_TAGS))}\n"
-        "Return strict JSON only."
+    return await _planning_intent.build_model_intent_route(
+        intent_router_runner,
+        intent_router_session_id,
+        user_id,
+        query,
+        run_runner_turn_fn=_run_runner_turn,
     )
-    raw = await _run_runner_turn(intent_router_runner, intent_router_session_id, user_id, prompt)
-    payload = _extract_json_payload(raw)
-    if not payload:
-        return None
-
-    normalized_query = str(payload.get("normalized_query", "")).strip()
-    request_type = sanitize_request_type(str(payload.get("request_type", "")).strip())
-    intent_tags = _coerce_model_intent_tags(payload.get("intent_tags"))
-    try:
-        confidence = float(payload.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    confidence = max(0.0, min(1.0, confidence))
-    reason = str(payload.get("reason", "")).strip()
-
-    return {
-        "normalized_query": normalized_query,
-        "request_type": request_type,
-        "intent_tags": intent_tags,
-        "confidence": confidence,
-        "reason": reason,
-        "source": "model",
-    }
 
 
 def _merge_intent_routes(deterministic_route: dict, model_route: dict | None) -> dict:
-    if not model_route:
-        return deterministic_route
-
-    confidence = float(model_route.get("confidence", 0.0) or 0.0)
-    deterministic_tags = sanitize_intent_tags(deterministic_route.get("intent_tags"))
-    model_tags = sanitize_intent_tags(model_route.get("intent_tags"))
-    if model_tags:
-        if confidence >= 0.78:
-            merged_tags = model_tags
-        elif confidence >= 0.55:
-            merged_tags = sorted(set(deterministic_tags + model_tags))
-        else:
-            merged_tags = deterministic_tags
-    else:
-        merged_tags = deterministic_tags
-
-    deterministic_request_type = sanitize_request_type(str(deterministic_route.get("request_type", "")).strip())
-    model_request_type = sanitize_request_type(str(model_route.get("request_type", "")).strip())
-    if model_request_type and confidence >= 0.68:
-        merged_request_type = model_request_type
-    else:
-        merged_request_type = deterministic_request_type or classify_request_type(
-            str(deterministic_route.get("normalized_query") or "")
-        )
-
-    merged_query = str(deterministic_route.get("normalized_query") or "").strip()
-    model_query = str(model_route.get("normalized_query") or "").strip()
-    if model_query and confidence >= 0.60:
-        merged_query = model_query
-
-    merged_reason_parts = [str(deterministic_route.get("reason", "")).strip()]
-    model_reason = str(model_route.get("reason", "")).strip()
-    if model_reason:
-        merged_reason_parts.append(f"Model route: {model_reason}")
-
-    return {
-        "normalized_query": merged_query or str(deterministic_route.get("normalized_query", "")).strip(),
-        "request_type": merged_request_type,
-        "intent_tags": merged_tags or deterministic_tags,
-        "confidence": confidence,
-        "reason": " ".join(part for part in merged_reason_parts if part).strip(),
-        "source": "hybrid",
-    }
+    return _planning_intent.merge_intent_routes(deterministic_route, model_route)
 
 
 async def _route_query_intent(
@@ -1026,19 +478,14 @@ async def _route_query_intent(
     intent_router_session_id: str | None = None,
     user_id: str = "researcher",
 ) -> dict:
-    deterministic_route = _default_intent_route(query)
-    if intent_router_runner is None or not intent_router_session_id:
-        return deterministic_route
-    try:
-        model_route = await _build_model_intent_route(
-            intent_router_runner,
-            intent_router_session_id,
-            user_id,
-            deterministic_route["normalized_query"],
-        )
-    except Exception:
-        return deterministic_route
-    return _merge_intent_routes(deterministic_route, model_route)
+    return await _planning_intent.route_query_intent(
+        query,
+        intent_router_runner=intent_router_runner,
+        intent_router_session_id=intent_router_session_id,
+        user_id=user_id,
+        run_runner_turn_fn=_run_runner_turn,
+        build_model_intent_route_fn=_build_model_intent_route,
+    )
 
 
 def create_clarifier_agent():
@@ -1126,101 +573,38 @@ def create_agent(tool_filter: list[str] | None = None):
     return agent, mcp_tools
 
 
-STEP_SCOPE_TOOLS = {
-    "search_diseases",
-    "search_targets",
-    "expand_disease_context",
-}
-
-STEP_EVIDENCE_BACKSTOP_TOOLS = {
-    "search_pubmed_advanced",
-    "search_openalex_works",
-    "search_openalex_authors",
-    "search_clinical_trials",
-    "search_disease_targets",
-    "search_diseases",
-    "search_targets",
-    "expand_disease_context",
-    "get_target_info",
-    "get_gene_info",
-    "list_local_datasets",
-    "read_local_dataset",
-}
+STEP_SCOPE_TOOLS = _runtime_exec.STEP_SCOPE_TOOLS
+STEP_EVIDENCE_BACKSTOP_TOOLS = _runtime_exec.STEP_EVIDENCE_BACKSTOP_TOOLS
 
 
 def _is_reasoning_only_step(task: WorkflowTask, step_idx: int) -> bool:
-    return step_idx == 0 or step_idx == len(task.steps) - 1
+    return _runtime_exec.is_reasoning_only_step(task, step_idx)
 
 
 def _build_step_allowed_tools(task: WorkflowTask, step_idx: int) -> list[str]:
-    step = task.steps[step_idx]
-
-    # Keep request framing and final synthesis deterministic.
-    if _is_reasoning_only_step(task, step_idx):
-        return sorted(STEP_SCOPE_TOOLS) if step_idx == 0 else []
-
-    preferred, fallback = tool_bundle_for_intent(task.intent_tags)
-    allowed = set(step.recommended_tools + step.fallback_tools + preferred + fallback)
-    allowed.update(STEP_EVIDENCE_BACKSTOP_TOOLS)
-    return sorted(allowed)
+    return _runtime_exec.build_step_allowed_tools(task, step_idx, tool_bundle_for_intent)
 
 
 def _should_escalate_allowlist(step, trace_entries: list[dict], output: str) -> bool:
-    if not step.recommended_tools:
-        return False
-    if not trace_entries:
-        return True
-    outcomes = {str(entry.get("outcome", "unknown")) for entry in trace_entries}
-    if outcomes and outcomes.issubset({"error", "not_found_or_empty", "no_response", "degraded"}):
-        return True
-    lower = (output or "").lower()
-    if any(token in lower for token in ["cannot be completed", "insufficient data", "unable to identify"]):
-        return True
-    return False
+    return _runtime_exec.should_escalate_allowlist(step, trace_entries, output)
 
 
 def _build_escalated_allowed_tools(task: WorkflowTask, step_idx: int) -> list[str]:
-    base = set(_build_step_allowed_tools(task, step_idx))
-    # Escalation broadens coverage while keeping synthesis steps tool-free.
-    if _is_reasoning_only_step(task, step_idx):
-        return sorted(base)
-    base.update(
-        {
-            "search_pubmed",
-            "get_pubmed_abstract",
-            "get_pubmed_paper_details",
-            "get_pubmed_author_profile",
-            "get_target_drugs",
-            "check_druggability",
-            "search_clinvar_variants",
-            "search_gwas_associations",
-            "summarize_clinical_trials_landscape",
-            "summarize_target_expression_context",
-            "summarize_target_competitive_landscape",
-            "summarize_target_safety_liabilities",
-            "compare_targets_multi_axis",
-        }
-    )
-    return sorted(base)
+    return _runtime_exec.build_escalated_allowed_tools(task, step_idx, tool_bundle_for_intent)
 
 
 def _create_step_runner(base_runner, allowed_tools: list[str]):
-    step_agent, step_mcp_tools = create_agent(tool_filter=allowed_tools)
-    step_runner = Runner(
-        agent=step_agent,
-        app_name=base_runner.app_name,
-        session_service=base_runner.session_service,
-        artifact_service=getattr(base_runner, "artifact_service", None),
-        memory_service=getattr(base_runner, "memory_service", None),
-        credential_service=getattr(base_runner, "credential_service", None),
-    )
-    return step_runner, step_mcp_tools
+    return _runtime_exec.create_step_runner(base_runner, allowed_tools, create_agent, Runner)
 
 
 async def _run_runner_turn(runner, session_id: str, user_id: str, prompt: str) -> str:
-    """Run one model turn and return text only."""
-    response_text, _ = await _run_runner_turn_with_trace(runner, session_id, user_id, prompt)
-    return response_text
+    return await _runtime_exec.run_runner_turn(
+        runner,
+        session_id,
+        user_id,
+        prompt,
+        run_runner_turn_with_trace_fn=_run_runner_turn_with_trace,
+    )
 
 
 async def _run_runner_turn_with_timeout(
@@ -1231,212 +615,70 @@ async def _run_runner_turn_with_timeout(
     *,
     timeout_seconds: float | None = None,
 ) -> tuple[str, list[dict]]:
-    timeout = STEP_TURN_TIMEOUT_SECONDS if timeout_seconds is None else float(timeout_seconds)
-    if timeout <= 0:
-        return await _run_runner_turn_with_trace(runner, session_id, user_id, prompt)
-    try:
-        return await asyncio.wait_for(
-            _run_runner_turn_with_trace(runner, session_id, user_id, prompt),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError as exc:
-        raise TimeoutError(f"Step model/tool turn timed out after {timeout:g}s.") from exc
+    return await _runtime_exec.run_runner_turn_with_timeout(
+        runner,
+        session_id,
+        user_id,
+        prompt,
+        run_runner_turn_with_trace_fn=_run_runner_turn_with_trace,
+        default_timeout_seconds=STEP_TURN_TIMEOUT_SECONDS,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _extract_missing_tool_name(error: Exception) -> str | None:
-    match = re.search(r"Tool '([^']+)' not found", str(error))
-    return match.group(1).strip() if match else None
+    return _runtime_exec.extract_missing_tool_name(error)
+
+
+def _normalize_trace_detail(text: str, *, max_chars: int = 260) -> str:
+    return _runtime_exec.normalize_trace_detail(text, max_chars=max_chars)
 
 
 def _format_step_execution_error(error: Exception, allowed_tools: list[str]) -> str:
-    allowed_text = ", ".join(allowed_tools) if allowed_tools else "none"
-    detail = _normalize_trace_detail(str(error), max_chars=420)
-    return (
-        "Step execution issue encountered.\n"
-        f"Details: {detail}\n"
-        f"Allowed tools for this step: {allowed_text}\n"
-        "Continuing with best-effort output under current constraints."
+    return _runtime_exec.format_step_execution_error(
+        error,
+        allowed_tools,
+        normalize_trace_detail_fn=_normalize_trace_detail,
     )
 
 
 def _runtime_tool_constraint_suffix(tool_filter: list[str] | None) -> str:
-    if tool_filter is None:
-        return ""
-    allowed = sorted(set(tool_filter))
-    if not allowed:
-        return (
-            "\n\n## Runtime Tool Constraint\n"
-            "No tools are available for this run. Do not emit any tool calls.\n"
-            "Produce reasoning-only output."
-        )
-    return (
-        "\n\n## Runtime Tool Constraint\n"
-        "You may call ONLY these tools in this run:\n"
-        f"- {', '.join(allowed)}\n"
-        "Do not call any tool that is not in this list."
-    )
+    return _runtime_exec.runtime_tool_constraint_suffix(tool_filter)
 
 
 def _safe_model_dump(value) -> dict:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return value
-    if hasattr(value, "model_dump"):
-        try:
-            dumped = value.model_dump(exclude_none=True)
-        except TypeError:
-            dumped = value.model_dump()
-        return dumped if isinstance(dumped, dict) else {"value": dumped}
-    return {"value": str(value)}
-
-
-def _normalize_trace_detail(text: str, *, max_chars: int = 260) -> str:
-    normalized = re.sub(r"\s+", " ", (text or "")).strip()
-    if not normalized:
-        return ""
-    if len(normalized) <= max_chars:
-        return normalized
-    return f"{normalized[: max_chars - 3].rstrip()}..."
+    return _runtime_exec.safe_model_dump(value)
 
 
 def _compact_json(value, *, max_chars: int = 100) -> str:
-    try:
-        text = json.dumps(value, ensure_ascii=True, sort_keys=True)
-    except TypeError:
-        text = str(value)
-    normalized = re.sub(r"\s+", " ", text).strip()
-    if len(normalized) <= max_chars:
-        return normalized
-    return f"{normalized[: max_chars - 3].rstrip()}..."
+    return _runtime_exec.compact_json(value, max_chars=max_chars)
 
 
 def _summarize_for_report(text: str, *, max_chars: int = 220) -> str:
-    normalized = re.sub(r"\s+", " ", (text or "")).strip()
-    if not normalized:
-        return ""
-    sentence = re.split(r"(?<=[.!?])\s+", normalized, maxsplit=1)[0]
-    if len(sentence) <= max_chars:
-        return sentence
-    return f"{sentence[: max_chars - 3].rstrip()}..."
+    return _runtime_exec.summarize_for_report(text, max_chars=max_chars)
 
 
 def _populate_step_rao_fields(step) -> None:
-    """Populate explicit Reasoning/Actions/Observations fields for report rendering."""
-    reasoning = _summarize_for_report(step.output) or _summarize_for_report(step.instruction, max_chars=180)
-    actions: list[str] = []
-    observations: list[str] = []
-
-    trace_entries = step.tool_trace if isinstance(step.tool_trace, list) else []
-    if trace_entries:
-        for entry in trace_entries[:4]:
-            tool_name = str(entry.get("tool_name", "unknown_tool"))
-            outcome = str(entry.get("outcome", "unknown"))
-            args = entry.get("args") if isinstance(entry.get("args"), dict) else {}
-            args_text = f" args={_compact_json(args, max_chars=80)}" if args else ""
-            actions.append(f"Called `{tool_name}` ({outcome}).{args_text}")
-        omitted = len(trace_entries) - 4
-        if omitted > 0:
-            actions.append(f"{omitted} additional tool call(s) omitted for brevity.")
-    else:
-        actions.append("No tool calls executed; step completed as reasoning/synthesis.")
-
-    output_summary = _summarize_for_report(step.output, max_chars=260)
-    if output_summary:
-        observations.append(output_summary)
-    if step.evidence_refs:
-        preview = ", ".join(step.evidence_refs[:5])
-        suffix = f", +{len(step.evidence_refs) - 5} more" if len(step.evidence_refs) > 5 else ""
-        observations.append(f"Citation IDs captured: {preview}{suffix}.")
-    issue_count = sum(
-        1
-        for entry in trace_entries
-        if str(entry.get("outcome", "")) in {"error", "not_found_or_empty", "no_response", "degraded"}
+    _runtime_exec.populate_step_rao_fields(
+        step,
+        summarize_for_report_fn=_summarize_for_report,
+        compact_json_fn=_compact_json,
     )
-    if issue_count:
-        observations.append(f"{issue_count} tool call(s) returned errors/empty responses.")
-    if not observations:
-        observations.append("No additional observations captured.")
-
-    step.reasoning_summary = reasoning or "Reasoning summary unavailable."
-    step.actions = actions
-    step.observations = observations
 
 
 def _extract_response_excerpt(response_payload) -> str:
-    if not isinstance(response_payload, dict):
-        return "No structured response payload captured."
-
-    content = response_payload.get("content")
-    snippets: list[str] = []
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str) and text.strip():
-                    snippets.append(text)
-
-    if not snippets:
-        output_payload = response_payload.get("output")
-        if isinstance(output_payload, str) and output_payload.strip():
-            snippets.append(output_payload)
-        elif output_payload is not None:
-            snippets.append(str(output_payload))
-
-    if not snippets:
-        error_payload = response_payload.get("error")
-        if error_payload:
-            snippets.append(str(error_payload))
-
-    if not snippets:
-        snippets.append(str(response_payload))
-    return _normalize_trace_detail(" | ".join(snippets))
+    return _runtime_exec.extract_response_excerpt(
+        response_payload,
+        normalize_trace_detail_fn=_normalize_trace_detail,
+    )
 
 
 def _classify_tool_response(response_payload) -> tuple[str, str]:
-    if response_payload is None:
-        return "no_response", "Tool call was issued but no response payload was returned."
-    if not isinstance(response_payload, dict):
-        return "unknown", _normalize_trace_detail(str(response_payload))
-
-    excerpt = _extract_response_excerpt(response_payload)
-
-    explicit_error = bool(response_payload.get("error")) or response_payload.get("isError") is True
-    if explicit_error:
-        return "error", excerpt
-
-    lower = excerpt.lower()
-    if lower.startswith("error in ") or lower.startswith("error:") or "request failed (" in lower:
-        return "error", excerpt
-    not_found_markers = (
-        "not found",
-        "no results",
-        "no matching",
-        "no records",
-        "no data found",
-        "no target data found",
-        "no clinical trials found",
-        "no expression context found",
-        "couldn't find",
-        "unable to find",
-        "did not find",
-        "no evidence found",
+    return _runtime_exec.classify_tool_response(
+        response_payload,
+        normalize_trace_detail_fn=_normalize_trace_detail,
+        extract_response_excerpt_fn=_extract_response_excerpt,
     )
-    if any(marker in lower for marker in not_found_markers):
-        return "not_found_or_empty", excerpt
-
-    degraded_markers = (
-        "critical gap",
-        "service unavailable",
-        "underlying gwas call error",
-        "fallback uses open targets genetics evidence scores",
-        "risk-increasing vs protective direction cannot be inferred",
-        "could not infer genetic direction-of-effect",
-    )
-    if any(marker in lower for marker in degraded_markers):
-        return "degraded", excerpt
-
-    return "ok", excerpt
 
 
 async def _run_runner_turn_with_trace(
@@ -1445,339 +687,38 @@ async def _run_runner_turn_with_trace(
     user_id: str,
     prompt: str,
 ) -> tuple[str, list[dict]]:
-    """Run one model turn and collect both text output and exact tool trace."""
-    from google.genai.types import Content, Part
-
-    message = Content(role="user", parts=[Part(text=prompt)])
-    response_text = ""
-    trace_entries: list[dict] = []
-    pending_by_call_id: dict[str, int] = {}
-    pending_by_tool_name: dict[str, list[int]] = {}
-    sequence = 0
-
-    async for event in runner.run_async(
-        session_id=session_id,
-        user_id=user_id,
-        new_message=message,
-    ):
-        if not hasattr(event, "content") or not event.content or not hasattr(event.content, "parts"):
-            continue
-        if not event.content.parts:
-            continue
-        for part in event.content.parts:
-            if hasattr(part, "text") and part.text:
-                response_text += part.text
-
-            function_call = getattr(part, "function_call", None)
-            if function_call:
-                payload = _safe_model_dump(function_call)
-                sequence += 1
-                call_id = str(payload.get("id") or f"call-{sequence}")
-                tool_name = str(payload.get("name") or "unknown_tool")
-                args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
-                entry = {
-                    "sequence": sequence,
-                    "call_id": call_id,
-                    "tool_name": tool_name,
-                    "args": args,
-                    "outcome": "pending",
-                    "detail": "",
-                    "phase": "main",
-                }
-                trace_entries.append(entry)
-                pending_by_call_id[call_id] = len(trace_entries) - 1
-                pending_by_tool_name.setdefault(tool_name, []).append(len(trace_entries) - 1)
-
-            function_response = getattr(part, "function_response", None)
-            if function_response:
-                payload = _safe_model_dump(function_response)
-                call_id = str(payload.get("id") or "")
-                tool_name = str(payload.get("name") or "unknown_tool")
-                response_payload = payload.get("response")
-                outcome, detail = _classify_tool_response(response_payload)
-
-                target_index = pending_by_call_id.get(call_id) if call_id else None
-                if target_index is None:
-                    for candidate_index in pending_by_tool_name.get(tool_name, []):
-                        if trace_entries[candidate_index].get("outcome") == "pending":
-                            target_index = candidate_index
-                            break
-
-                if target_index is None:
-                    sequence += 1
-                    trace_entries.append(
-                        {
-                            "sequence": sequence,
-                            "call_id": call_id or f"response-{sequence}",
-                            "tool_name": tool_name,
-                            "args": {},
-                            "outcome": outcome,
-                            "detail": detail,
-                            "phase": "main",
-                        }
-                    )
-                    continue
-
-                trace_entries[target_index]["outcome"] = outcome
-                trace_entries[target_index]["detail"] = detail
-
-    for entry in trace_entries:
-        if entry.get("outcome") == "pending":
-            entry["outcome"] = "no_response"
-            entry["detail"] = "Tool call was issued but no matching function_response event was captured."
-
-    return response_text.strip(), trace_entries
+    return await _runtime_exec.run_runner_turn_with_trace(
+        runner,
+        session_id,
+        user_id,
+        prompt,
+        safe_model_dump_fn=_safe_model_dump,
+        classify_tool_response_fn=_classify_tool_response,
+    )
 
 
 async def _execute_step(runner, session_id: str, user_id: str, task: WorkflowTask, step_idx: int) -> str:
-    """Execute a single workflow step and update task status."""
-    step = task.steps[step_idx]
-    task.status = "in_progress"
-    task.current_step_index = step_idx
-    step.status = "in_progress"
-    task.touch()
-
-    step.allowed_tools = _build_step_allowed_tools(task, step_idx)
-    prompt = step_prompt(task, step)
-
-    step_failed = False
-    step_runner, step_mcp_tools = _create_step_runner(runner, step.allowed_tools)
-    try:
-        try:
-            output, trace_entries = await _run_runner_turn_with_timeout(
-                step_runner,
-                session_id,
-                user_id,
-                prompt,
-            )
-        except Exception as exc:
-            step_failed = True
-            missing_tool = _extract_missing_tool_name(exc)
-            if missing_tool:
-                retry_prompt = (
-                    f"{prompt}\n\n"
-                    f"IMPORTANT: The prior attempt called unavailable tool `{missing_tool}`.\n"
-                    "Do not call unavailable tools. Use only the allowed-tools list above. "
-                    "If no allowed tool is relevant, provide reasoning-only output for this step."
-                )
-                try:
-                    output, trace_entries = await _run_runner_turn_with_timeout(
-                        step_runner,
-                        session_id,
-                        user_id,
-                        retry_prompt,
-                    )
-                    for entry in trace_entries:
-                        entry["phase"] = "retry_after_missing_tool"
-                    step_failed = False
-                except Exception as retry_exc:
-                    output = _format_step_execution_error(retry_exc, step.allowed_tools)
-                    trace_entries = []
-            else:
-                output = _format_step_execution_error(exc, step.allowed_tools)
-                trace_entries = []
-    finally:
-        if step_mcp_tools:
-            await step_mcp_tools.close()
-
-    if _should_escalate_allowlist(step, trace_entries, output):
-        escalated_tools = _build_escalated_allowed_tools(task, step_idx)
-        if set(escalated_tools) != set(step.allowed_tools):
-            step.allowed_tools = escalated_tools
-            escalated_runner, escalated_mcp_tools = _create_step_runner(runner, step.allowed_tools)
-            try:
-                try:
-                    escalated_output, escalated_trace = await _run_runner_turn_with_timeout(
-                        escalated_runner,
-                        session_id,
-                        user_id,
-                        prompt,
-                    )
-                except Exception as exc:
-                    step_failed = True
-                    escalated_output = _format_step_execution_error(exc, step.allowed_tools)
-                    escalated_trace = []
-            finally:
-                if escalated_mcp_tools:
-                    await escalated_mcp_tools.close()
-            for entry in escalated_trace:
-                entry["phase"] = "step_allowlist_escalation"
-            if escalated_trace:
-                trace_entries.extend(escalated_trace)
-            if escalated_output:
-                output = escalated_output
-
-    step.output = output if output else "(No response generated)"
-    step.evidence_refs = extract_evidence_refs(step.output)
-    step.tool_trace = trace_entries
-    _populate_step_rao_fields(step)
-    step.status = "blocked" if step_failed else ("completed" if output else "blocked")
-    task.touch()
-    return step.output
+    return await _runtime_exec.execute_step(
+        runner,
+        session_id,
+        user_id,
+        task,
+        step_idx,
+        step_prompt_fn=step_prompt,
+        extract_evidence_refs_fn=extract_evidence_refs,
+        build_step_allowed_tools_fn=_build_step_allowed_tools,
+        create_step_runner_fn=_create_step_runner,
+        run_runner_turn_with_timeout_fn=_run_runner_turn_with_timeout,
+        extract_missing_tool_name_fn=_extract_missing_tool_name,
+        format_step_execution_error_fn=_format_step_execution_error,
+        should_escalate_allowlist_fn=_should_escalate_allowlist,
+        build_escalated_allowed_tools_fn=_build_escalated_allowed_tools,
+        populate_step_rao_fields_fn=_populate_step_rao_fields,
+    )
 
 
 def _evaluate_quality_gates(task: WorkflowTask) -> dict:
-    evidence_count = len({ref for step in task.steps for ref in step.evidence_refs})
-    steps_with_output = sum(1 for step in task.steps if step.output and step.output != "(No response generated)")
-    coverage_ratio = steps_with_output / len(task.steps) if task.steps else 0.0
-    tool_call_count = sum(len(step.tool_trace) for step in task.steps) + len(task.fallback_tool_trace)
-
-    unresolved_gaps: list[str] = []
-
-    def _append_gap(message: str) -> None:
-        normalized = str(message or "").strip()
-        if normalized and normalized not in unresolved_gaps:
-            unresolved_gaps.append(normalized)
-
-    combined_output = "\n".join(step.output for step in task.steps if step.output).lower()
-    objective_lower = task.objective.lower()
-    if "researcher_discovery" in task.intent_tags:
-        if "cannot be directly listed" in combined_output or "tool limitation" in combined_output:
-            unresolved_gaps.append("Researcher identification appears incomplete due to tool limitations.")
-        if not any(token in combined_output for token in ["author", "researcher", "investigator"]):
-            unresolved_gaps.append("No explicit researcher entities were reported.")
-        researcher_step = next((step for step in task.steps if "evidence" in step.title.lower()), None)
-        if researcher_step:
-            ranking_calls = [
-                entry
-                for entry in researcher_step.tool_trace
-                if str(entry.get("tool_name", "")) == "rank_researchers_by_activity"
-            ]
-            successful_ranking = [entry for entry in ranking_calls if str(entry.get("outcome")) == "ok"]
-            if not ranking_calls:
-                unresolved_gaps.append(
-                    "No quantitative ranking tool call (`rank_researchers_by_activity`) was executed."
-                )
-            elif not successful_ranking:
-                unresolved_gaps.append(
-                    "No successful quantitative researcher ranking call completed."
-                )
-            openalex_topic_calls = [
-                entry
-                for entry in researcher_step.tool_trace
-                if str(entry.get("tool_name", "")) in {"rank_researchers_by_activity", "search_openalex_works"}
-            ]
-            failed_openalex_topic_calls = [
-                entry
-                for entry in openalex_topic_calls
-                if str(entry.get("outcome", "")) in {"error", "no_response"}
-            ]
-            if openalex_topic_calls and len(failed_openalex_topic_calls) == len(openalex_topic_calls):
-                unresolved_gaps.append(
-                    "All topic-specific OpenAlex ranking/evidence calls failed; researcher ranking is unreliable."
-                )
-        top_query = any(
-            marker in objective_lower
-            for marker in [" top ", "top ", "most active", "prominent", "leading", "most prominent"]
-        ) or task.request_type == "prioritization"
-        if top_query and not any(
-            marker in combined_output for marker in ["activity score", "score:", "ranked", "topic works"]
-        ):
-            unresolved_gaps.append(
-                "Output lacks quantitative ranking metrics for a top/prominent researcher request."
-            )
-        if any(
-            marker in combined_output
-            for marker in [
-                "request failed (429)",
-                "rate limit",
-                "preliminary",
-                "could not perform",
-                "could not be performed",
-            ]
-        ):
-            unresolved_gaps.append(
-                "Researcher ranking output still signals degraded evidence quality due to rate limits or incomplete ranking."
-            )
-    if any(token in objective_lower for token in ["target", "druggab", "candidate"]) or "clinical_landscape" in task.intent_tags:
-        if any(
-            token in combined_output
-            for token in [
-                "cannot be fulfilled",
-                "cannot be completed",
-                "insufficient data",
-                "no target candidates",
-                "unable to identify target",
-            ]
-        ):
-            _append_gap("Target/trial assessment appears incomplete based on model self-reported gaps.")
-        if not any(token in combined_output for token in ["ensg", "target id", "candidate target", "phase", "nct"]):
-            _append_gap("No concrete target or clinical-trial entities were detected in the synthesis.")
-
-    failed_entries = [
-        entry
-        for step in task.steps
-        for entry in (step.tool_trace or [])
-        if str(entry.get("outcome", "")) in {"error", "not_found_or_empty", "no_response", "degraded"}
-    ]
-    failed_entries.extend(
-        entry
-        for entry in (task.fallback_tool_trace or [])
-        if str(entry.get("outcome", "")) in {"error", "not_found_or_empty", "no_response", "degraded"}
-    )
-    if failed_entries:
-        _append_gap(
-            "Tool execution issues were detected "
-            f"({len(failed_entries)} failed or empty tool calls)."
-        )
-
-    failed_tools = {
-        str(entry.get("tool_name", "")).strip()
-        for entry in failed_entries
-        if str(entry.get("tool_name", "")).strip()
-    }
-    genetics_priority = (
-        "genetics_direction" in task.intent_tags
-        or any(token in objective_lower for token in ["genetic", "gwas", "variant", "direction-of-effect"])
-    )
-    if genetics_priority and failed_tools.intersection(
-        {"infer_genetic_effect_direction", "search_gwas_associations", "search_clinvar_variants"}
-    ):
-        _append_gap("High-priority human genetics direction evidence is incomplete due to tool failures.")
-    if "safety_assessment" in task.intent_tags and (
-        "no safety liabilities" in combined_output
-        or "no safety liability" in combined_output
-        or "summarize_target_safety_liabilities" in failed_tools
-    ):
-        _append_gap("High-priority safety-liability evidence is incomplete or ambiguous.")
-
-    critical_markers = (
-        "critical gap",
-        "service unavailable",
-        "failed due to api error",
-        "failed due to api errors",
-        "could not retrieve",
-        "unable to retrieve",
-        "persistent failure",
-    )
-    if any(marker in combined_output for marker in critical_markers):
-        _append_gap("Output reports critical missing evidence that affects confidence in the recommendation.")
-    if any(marker in combined_output for marker in ["not directly from tool output", "historical knowledge"]):
-        _append_gap("Synthesis includes claims that are not directly supported by captured tool output.")
-
-    if evidence_count == 0:
-        _append_gap("No citation evidence IDs were detected in the response.")
-    if tool_call_count == 0:
-        _append_gap("No tool calls were captured for the workflow.")
-    missing_tool_steps = [
-        step.title
-        for step in task.steps
-        if step.status == "completed" and step.recommended_tools and not step.tool_trace
-    ]
-    if missing_tool_steps:
-        _append_gap(
-            "Completed steps with recommended tools but no recorded tool execution: "
-            + ", ".join(missing_tool_steps)
-        )
-
-    passed = evidence_count >= 2 and coverage_ratio >= 0.9 and tool_call_count >= 1 and len(unresolved_gaps) == 0
-    return {
-        "passed": passed,
-        "evidence_count": evidence_count,
-        "coverage_ratio": coverage_ratio,
-        "tool_call_count": tool_call_count,
-        "unresolved_gaps": unresolved_gaps,
-    }
+    return _runtime_quality.evaluate_quality_gates(task)
 
 
 def should_open_checkpoint(
@@ -1786,201 +727,66 @@ def should_open_checkpoint(
     quality_state: dict | None = None,
     queued_feedback: list[str] | None = None,
 ) -> tuple[bool, str]:
-    queued = [str(item).strip() for item in (queued_feedback or []) if str(item).strip()]
-    if queued:
-        return True, "queued_feedback_pending"
-
-    if not next_step:
-        return False, "none"
-
-    quality_state = quality_state or {}
-    unresolved_gap_count = len(quality_state.get("unresolved_gaps", []) or [])
-    last_failures = int(quality_state.get("last_step_failures", 0) or 0)
-    last_output = str(quality_state.get("last_step_output", "") or "").lower()
-    plan = active_plan_version(task)
-    plan_id = plan.version_id if plan else str(task.active_plan_version_id or "none")
-    hitl_events = set(task.hitl_history)
-
-    def _is_gate_acknowledged(reason: str) -> bool:
-        token = _gate_ack_token(reason, plan_id)
-        return bool(token and token in hitl_events)
-
-    if next_step.recommended_tools and not any(step.tool_trace for step in task.steps if step.status == "completed"):
-        return True, "pre_evidence_execution"
-
-    is_pre_final = bool(task.steps) and next_step.step_id == task.steps[-1].step_id
-    if unresolved_gap_count >= 2:
-        if _is_gate_acknowledged("quality_gap_spike"):
-            return False, "none"
-        return True, "quality_gap_spike"
-    if is_pre_final and unresolved_gap_count >= 1:
-        if _is_gate_acknowledged("quality_gap_spike"):
-            return False, "none"
-        return True, "quality_gap_spike"
-
-    if last_failures >= 2:
-        if _is_gate_acknowledged("repeated_tool_failures"):
-            return False, "none"
-        return True, "repeated_tool_failures"
-
-    contradiction_markers = (
-        "contradict",
-        "inconsistent",
-        "conflict",
-        "uncertain",
-        "critical gap",
-        "service unavailable",
-        "failed due to api error",
-        "failed due to api errors",
-        "could not retrieve",
-        "unable to retrieve",
+    return _runtime_quality.should_open_checkpoint(
+        task,
+        next_step,
+        quality_state,
+        queued_feedback,
+        active_plan_version_fn=active_plan_version,
+        gate_ack_token_fn=_gate_ack_token,
     )
-    if any(marker in last_output for marker in contradiction_markers):
-        if _is_gate_acknowledged("uncertainty_spike"):
-            return False, "none"
-        return True, "uncertainty_spike"
-
-    if is_pre_final and any(event.lower().startswith("revise:") for event in task.hitl_history):
-        if _is_gate_acknowledged("pre_final_after_intent_change"):
-            return False, "none"
-        return True, "pre_final_after_intent_change"
-
-    return False, "none"
 
 
 def _gate_ack_token(reason: str, plan_version_id: str | None) -> str | None:
-    normalized_reason = str(reason or "").strip().lower()
-    if not normalized_reason:
-        return None
-    normalized_plan = str(plan_version_id or "none").strip() or "none"
-    return f"gate_ack:{normalized_reason}:{normalized_plan}"
+    return _runtime_quality.gate_ack_token(reason, plan_version_id)
 
 
 def _render_quality_gate_message(report: dict) -> str:
-    lines = [
-        "[Quality Gate Check]",
-        f"- Evidence references found: {report['evidence_count']}",
-        f"- Step coverage ratio: {report['coverage_ratio']:.2f}",
-        f"- Tool calls captured: {report.get('tool_call_count', 0)}",
-    ]
-    if report["unresolved_gaps"]:
-        lines.append("- Unresolved critical gaps:")
-        lines.extend([f"  - {gap}" for gap in report["unresolved_gaps"]])
-    else:
-        lines.append("- Unresolved critical gaps: none")
-    return "\n".join(lines)
+    return _runtime_quality.render_quality_gate_message(report)
 
 
 def _clean_recovery_text(text: str) -> str:
-    if not text:
-        return text
-    seen = set()
-    cleaned_lines: list[str] = []
-    for raw in text.splitlines():
-        line = raw.rstrip()
-        normalized = re.sub(r"\s+", " ", line.strip().lower())
-        if normalized in {"**3. key results:**", "3. key results:"}:
-            if "3-key-results" in seen:
-                continue
-            seen.add("3-key-results")
-        if normalized and normalized in seen and normalized.startswith("**"):
-            continue
-        if normalized:
-            seen.add(normalized)
-        cleaned_lines.append(line)
-    return "\n".join(cleaned_lines).strip()
+    return _runtime_quality.clean_recovery_text(text)
 
 
 async def _run_fallback_recovery(runner, session_id: str, user_id: str, task: WorkflowTask) -> tuple[str, list[dict]]:
-    fallback_tools: list[str] = []
-    for step in task.steps:
-        fallback_tools.extend(step.fallback_tools)
-    fallback_tools = sorted(set(fallback_tools))
-    fallback_guidance = ""
-    if "researcher_discovery" in task.intent_tags:
-        fallback_guidance = (
-            "For researcher ranking requests, prioritize publication-centric recovery tools in this order: "
-            "rank_researchers_by_activity, search_openalex_works, search_pubmed_advanced, get_pubmed_author_profile. "
-            "Avoid clinical-trials-only fallback unless explicitly requested.\n"
-        )
-    prompt = (
-        "Perform one fallback recovery pass before final synthesis.\n"
-        f"Objective: {task.objective}\n"
-        f"Intent tags: {', '.join(task.intent_tags)}\n"
-        f"Fallback tools to prioritize: {', '.join(fallback_tools) if fallback_tools else 'N/A'}\n"
-        f"{fallback_guidance}"
-        "You must execute at least one relevant tool call unless no relevant tool exists.\n"
-        "Required output fields: selected_tools, why_chosen, key_results, remaining_gaps.\n"
-        "Use explicit citations where possible."
+    return await _runtime_quality.run_fallback_recovery(
+        runner,
+        session_id,
+        user_id,
+        task,
+        run_runner_turn_with_trace_fn=_run_runner_turn_with_trace,
+        format_step_execution_error_fn=_format_step_execution_error,
+        clean_recovery_text_fn=_clean_recovery_text,
     )
-    try:
-        raw, trace_entries = await _run_runner_turn_with_trace(runner, session_id, user_id, prompt)
-    except Exception as exc:
-        return _format_step_execution_error(exc, fallback_tools), []
-    for entry in trace_entries:
-        entry["phase"] = "fallback_recovery"
-    return _clean_recovery_text(raw), trace_entries
 
 
 async def _complete_remaining_steps(runner, session_id: str, user_id: str, task: WorkflowTask, state_store: TaskStateStore) -> dict:
-    task.fallback_recovery_notes = ""
-    task.fallback_tool_trace = []
-    for idx in range(task.current_step_index + 1, len(task.steps)):
-        step_text = await _execute_step(runner, session_id, user_id, task, idx)
-        state_store.save_task(task, note=f"step_{idx + 1}_completed")
-        print(step_text)
-
-    quality = _evaluate_quality_gates(task)
-    print("\n" + _render_quality_gate_message(quality))
-    if not quality["passed"]:
-        print("\nRunning one fallback recovery pass...")
-        recovery, recovery_trace = await _run_fallback_recovery(runner, session_id, user_id, task)
-        task.fallback_tool_trace = recovery_trace
-        task.fallback_recovery_notes = recovery or ""
-        quality = _evaluate_quality_gates(task)
-    return quality
+    return await _runtime_quality.complete_remaining_steps(
+        runner,
+        session_id,
+        user_id,
+        task,
+        state_store,
+        execute_step_fn=_execute_step,
+        evaluate_quality_gates_fn=_evaluate_quality_gates,
+        render_quality_gate_message_fn=_render_quality_gate_message,
+        run_fallback_recovery_fn=_run_fallback_recovery,
+        print_fn=print,
+    )
 
 
 def _format_checkpoint_reason(reason: str) -> str:
-    mapping = {
-        "pre_evidence_execution": "Before bulk evidence collection",
-        "quality_gap_spike": "Quality/uncertainty spike detected",
-        "repeated_tool_failures": "Repeated tool failures detected",
-        "uncertainty_spike": "Uncertainty spike detected",
-        "pre_final_after_intent_change": "Intent changed before final synthesis",
-        "feedback_replan": "Plan updated from user feedback",
-        "queued_feedback_pending": "Queued feedback pending application",
-    }
-    key = str(reason or "").strip()
-    return mapping.get(key, key.replace("_", " ") if key else "unspecified")
+    return _runtime_quality.format_checkpoint_reason(reason)
 
 
 def _print_checkpoint_plan(task: WorkflowTask) -> None:
-    print("\n[Checkpoint Plan]")
-    if task.latest_plan_delta:
-        delta = task.latest_plan_delta
-        print("What changed:")
-        print(f"- {delta.summary or 'No structural changes.'}")
-        if delta.added_steps:
-            print(f"- Added: {', '.join(delta.added_steps)}")
-        if delta.removed_steps:
-            print(f"- Removed: {', '.join(delta.removed_steps)}")
-        if delta.modified_steps:
-            print(f"- Modified: {', '.join(delta.modified_steps)}")
-        if delta.reordered_steps:
-            print(f"- Reordered: {', '.join(delta.reordered_steps)}")
-        print("")
-
-    version = active_plan_version(task)
-    if version and version.steps:
-        print("Remaining plan:")
-        for idx, step in enumerate(version.steps, start=1):
-            print(f"{idx}. {step.title}")
-    else:
-        print("Remaining plan: none")
-
-    if task.checkpoint_reason:
-        print(f"\nCheckpoint reason: {_format_checkpoint_reason(task.checkpoint_reason)}")
+    _runtime_quality.print_checkpoint_plan(
+        task,
+        active_plan_version_fn=active_plan_version,
+        format_checkpoint_reason_fn=_format_checkpoint_reason,
+        print_fn=print,
+    )
 
 
 async def _apply_feedback_replan_cli(
@@ -2102,65 +908,48 @@ async def _execute_until_next_gate_or_completion_cli(
 
 
 def _persist_report_artifacts(task: WorkflowTask, report: str) -> tuple[Path, Path | None, str | None]:
-    REPORT_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    safe_task_id = re.sub(r"[^a-zA-Z0-9_-]", "_", task.task_id)
-    markdown_path = REPORT_ARTIFACTS_DIR / f"{safe_task_id}.md"
-    pdf_path = REPORT_ARTIFACTS_DIR / f"{safe_task_id}.pdf"
-    normalized_report = (report or "").rstrip() + "\n"
-    markdown_path.write_text(normalized_report, encoding="utf-8")
-    pdf_error = write_markdown_pdf(
-        normalized_report,
-        pdf_path,
-        title=f"Workflow Report ({task.task_id})",
+    return _presentation_cli.persist_report_artifacts(
+        task,
+        report,
+        reports_dir=REPORT_ARTIFACTS_DIR,
+        write_markdown_pdf_fn=lambda markdown, pdf_path, title: write_markdown_pdf(
+            markdown,
+            pdf_path,
+            title=title,
+        ),
     )
-    if pdf_error:
-        return markdown_path, None, pdf_error
-    return markdown_path, pdf_path, None
 
 
 def _print_final_report_with_artifacts(task: WorkflowTask, quality_report: dict) -> None:
-    report = render_final_report(task, quality_report=quality_report)
-    markdown_path, pdf_path, pdf_error = _persist_report_artifacts(task, report)
-    print("\n" + "=" * 60)
-    print(report)
-    print("=" * 60)
-    print(f"[report] markdown={markdown_path}")
-    if pdf_path:
-        print(f"[report] pdf={pdf_path}")
-    else:
-        print(f"[report] pdf=not_generated ({pdf_error})")
+    _presentation_cli.print_final_report_with_artifacts(
+        task,
+        quality_report,
+        render_final_report_fn=render_final_report,
+        reports_dir=REPORT_ARTIFACTS_DIR,
+        write_markdown_pdf_fn=lambda markdown, pdf_path, title: write_markdown_pdf(
+            markdown,
+            pdf_path,
+            title=title,
+        ),
+        print_fn=print,
+    )
 
 
 def _print_hitl_prompt() -> None:
-    print("\n[HITL Checkpoint]")
-    print("Reply with one of:")
-    print("  - start (or continue)")
-    print("  - any feedback text to revise the remaining plan")
-    print("  - stop")
-    print("You can also run: status | history | rollback")
+    _presentation_cli.print_hitl_prompt(print_fn=print)
 
 
 def _resolve_default_task_id(active_task: WorkflowTask | None, state_store: TaskStateStore) -> str | None:
-    if active_task:
-        return active_task.task_id
-    latest = state_store.latest_task()
-    return latest.task_id if latest else None
+    return _presentation_cli.resolve_default_task_id(active_task, state_store)
 
 
 def _print_revision_history(state_store: TaskStateStore, task_id: str, limit: int = 12) -> None:
-    revisions = state_store.list_revisions(task_id, limit=limit)
-    if not revisions:
-        print(f"\nNo revision history found for task {task_id}.")
-        return
-    print(f"\nRevision history for task {task_id} (offset 0 = latest):")
-    for offset, entry in enumerate(revisions):
-        note = entry.get("note", "") or "-"
-        awaiting_hitl = "yes" if entry.get("awaiting_hitl") else "no"
-        print(
-            f"  {offset}. {entry.get('revision_id')} | {entry.get('saved_at')} | "
-            f"status={entry.get('status')} | step={entry.get('current_step_index')} | "
-            f"hitl={awaiting_hitl} | note={note}"
-        )
+    _presentation_cli.print_revision_history(
+        state_store,
+        task_id,
+        limit=limit,
+        print_fn=print,
+    )
 
 
 def _resolve_rollback_revision_id(

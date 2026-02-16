@@ -1,0 +1,324 @@
+"""
+Core workflow domain models shared across planner/runtime layers.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import re
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def generate_chat_title(objective: str, *, max_words: int = 8) -> str:
+    text = str(objective or "").strip()
+    if not text:
+        return "Untitled Research"
+
+    markers = [
+        "\nUser revision to scope/decomposition:",
+        "\nRevision directives to apply:",
+        "\nRequired revision constraints:",
+        "\nUser clarification:",
+    ]
+    for marker in markers:
+        if marker in text:
+            text = text.split(marker, 1)[0].strip()
+
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), text)
+    compact = re.sub(r"\s+", " ", first_line).strip(" .")
+    compact = re.sub(
+        r"^(?:please\s+|can you\s+|could you\s+|i need\s+|find me\s+|show me\s+|tell me\s+)",
+        "",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    compact = compact.strip(" .")
+    if not compact:
+        return "Untitled Research"
+
+    words = compact.split()
+    title = " ".join(words[:max(3, max_words)])
+    if len(words) > max_words:
+        title = f"{title}..."
+    if len(title) > 72:
+        title = f"{title[:69].rstrip()}..."
+    return title or "Untitled Research"
+
+
+@dataclass
+class WorkflowStep:
+    """A single executable step in a multi-step workflow."""
+
+    step_id: str
+    title: str
+    instruction: str
+    status: str = "pending"
+    output: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+    recommended_tools: list[str] = field(default_factory=list)
+    fallback_tools: list[str] = field(default_factory=list)
+    allowed_tools: list[str] = field(default_factory=list)
+    tool_trace: list[dict] = field(default_factory=list)
+    rationale: str = ""
+    expected_output_fields: list[str] = field(default_factory=list)
+    reasoning_summary: str = ""
+    actions: list[str] = field(default_factory=list)
+    observations: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "step_id": self.step_id,
+            "title": self.title,
+            "instruction": self.instruction,
+            "status": self.status,
+            "output": self.output,
+            "evidence_refs": self.evidence_refs,
+            "recommended_tools": self.recommended_tools,
+            "fallback_tools": self.fallback_tools,
+            "allowed_tools": self.allowed_tools,
+            "tool_trace": self.tool_trace,
+            "rationale": self.rationale,
+            "expected_output_fields": self.expected_output_fields,
+            "reasoning_summary": self.reasoning_summary,
+            "actions": self.actions,
+            "observations": self.observations,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "WorkflowStep":
+        return cls(
+            step_id=payload.get("step_id", ""),
+            title=payload.get("title", ""),
+            instruction=payload.get("instruction", ""),
+            status=payload.get("status", "pending"),
+            output=payload.get("output", ""),
+            evidence_refs=list(payload.get("evidence_refs", [])),
+            recommended_tools=list(payload.get("recommended_tools", [])),
+            fallback_tools=list(payload.get("fallback_tools", [])),
+            allowed_tools=list(payload.get("allowed_tools", [])),
+            tool_trace=list(payload.get("tool_trace", [])),
+            rationale=payload.get("rationale", ""),
+            expected_output_fields=list(payload.get("expected_output_fields", [])),
+            reasoning_summary=payload.get("reasoning_summary", ""),
+            actions=list(payload.get("actions", [])),
+            observations=list(payload.get("observations", [])),
+        )
+
+
+@dataclass
+class RevisionIntent:
+    raw_feedback: str
+    objective_adjustments: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    priorities: list[str] = field(default_factory=list)
+    exclusions: list[str] = field(default_factory=list)
+    evidence_preferences: list[str] = field(default_factory=list)
+    output_preferences: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    parser_source: str = "fallback"
+
+    def to_dict(self) -> dict:
+        return {
+            "raw_feedback": self.raw_feedback,
+            "objective_adjustments": list(self.objective_adjustments),
+            "constraints": list(self.constraints),
+            "priorities": list(self.priorities),
+            "exclusions": list(self.exclusions),
+            "evidence_preferences": list(self.evidence_preferences),
+            "output_preferences": list(self.output_preferences),
+            "confidence": float(self.confidence),
+            "parser_source": self.parser_source,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict | None) -> "RevisionIntent | None":
+        if not isinstance(payload, dict):
+            return None
+        return cls(
+            raw_feedback=str(payload.get("raw_feedback", "")).strip(),
+            objective_adjustments=[str(x).strip() for x in payload.get("objective_adjustments", []) if str(x).strip()],
+            constraints=[str(x).strip() for x in payload.get("constraints", []) if str(x).strip()],
+            priorities=[str(x).strip() for x in payload.get("priorities", []) if str(x).strip()],
+            exclusions=[str(x).strip() for x in payload.get("exclusions", []) if str(x).strip()],
+            evidence_preferences=[str(x).strip() for x in payload.get("evidence_preferences", []) if str(x).strip()],
+            output_preferences=[str(x).strip() for x in payload.get("output_preferences", []) if str(x).strip()],
+            confidence=float(payload.get("confidence", 0.0) or 0.0),
+            parser_source=str(payload.get("parser_source", "fallback") or "fallback"),
+        )
+
+
+@dataclass
+class PlanDelta:
+    from_version_id: str | None
+    to_version_id: str
+    added_steps: list[str] = field(default_factory=list)
+    removed_steps: list[str] = field(default_factory=list)
+    modified_steps: list[str] = field(default_factory=list)
+    reordered_steps: list[str] = field(default_factory=list)
+    summary: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "from_version_id": self.from_version_id,
+            "to_version_id": self.to_version_id,
+            "added_steps": list(self.added_steps),
+            "removed_steps": list(self.removed_steps),
+            "modified_steps": list(self.modified_steps),
+            "reordered_steps": list(self.reordered_steps),
+            "summary": self.summary,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict | None) -> "PlanDelta | None":
+        if not isinstance(payload, dict):
+            return None
+        return cls(
+            from_version_id=str(payload.get("from_version_id", "")).strip() or None,
+            to_version_id=str(payload.get("to_version_id", "")).strip(),
+            added_steps=[str(x).strip() for x in payload.get("added_steps", []) if str(x).strip()],
+            removed_steps=[str(x).strip() for x in payload.get("removed_steps", []) if str(x).strip()],
+            modified_steps=[str(x).strip() for x in payload.get("modified_steps", []) if str(x).strip()],
+            reordered_steps=[str(x).strip() for x in payload.get("reordered_steps", []) if str(x).strip()],
+            summary=str(payload.get("summary", "")).strip(),
+        )
+
+
+@dataclass
+class PlanVersion:
+    version_id: str
+    created_at: str
+    base_from_step_index: int
+    request_type: str
+    intent_tags: list[str] = field(default_factory=list)
+    revision_intent: RevisionIntent | None = None
+    steps: list[WorkflowStep] = field(default_factory=list)
+    gate_reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "version_id": self.version_id,
+            "created_at": self.created_at,
+            "base_from_step_index": self.base_from_step_index,
+            "request_type": self.request_type,
+            "intent_tags": list(self.intent_tags),
+            "revision_intent": self.revision_intent.to_dict() if self.revision_intent else None,
+            "steps": [step.to_dict() for step in self.steps],
+            "gate_reason": self.gate_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict | None) -> "PlanVersion | None":
+        if not isinstance(payload, dict):
+            return None
+        return cls(
+            version_id=str(payload.get("version_id", "")).strip(),
+            created_at=str(payload.get("created_at", "")).strip() or _utc_now(),
+            base_from_step_index=int(payload.get("base_from_step_index", 0) or 0),
+            request_type=str(payload.get("request_type", "exploration") or "exploration"),
+            intent_tags=[str(x).strip() for x in payload.get("intent_tags", []) if str(x).strip()],
+            revision_intent=RevisionIntent.from_dict(payload.get("revision_intent")),
+            steps=[WorkflowStep.from_dict(step) for step in payload.get("steps", []) if isinstance(step, dict)],
+            gate_reason=str(payload.get("gate_reason", "")).strip(),
+        )
+
+
+@dataclass
+class WorkflowTask:
+    """A task with explicit planner output and execution state."""
+
+    task_id: str
+    objective: str
+    title: str = ""
+    request_type: str = "exploration"
+    intent_tags: list[str] = field(default_factory=list)
+    success_criteria: list[str] = field(default_factory=list)
+    status: str = "pending"
+    steps: list[WorkflowStep] = field(default_factory=list)
+    current_step_index: int = -1
+    awaiting_hitl: bool = False
+    hitl_history: list[str] = field(default_factory=list)
+    fallback_recovery_notes: str = ""
+    fallback_tool_trace: list[dict] = field(default_factory=list)
+    base_objective: str = ""
+    plan_versions: list[PlanVersion] = field(default_factory=list)
+    active_plan_version_id: str | None = None
+    pending_feedback_queue: list[str] = field(default_factory=list)
+    latest_plan_delta: PlanDelta | None = None
+    checkpoint_state: str = "closed"
+    checkpoint_reason: str = ""
+    progress_events: list[dict] = field(default_factory=list)
+    progress_summaries: list[dict] = field(default_factory=list)
+    created_at: str = field(default_factory=_utc_now)
+    updated_at: str = field(default_factory=_utc_now)
+
+    def touch(self) -> None:
+        self.updated_at = _utc_now()
+
+    def to_dict(self) -> dict:
+        title = (self.title or "").strip() or generate_chat_title(self.objective)
+        return {
+            "task_id": self.task_id,
+            "objective": self.objective,
+            "title": title,
+            "request_type": self.request_type,
+            "intent_tags": self.intent_tags,
+            "success_criteria": self.success_criteria,
+            "status": self.status,
+            "steps": [step.to_dict() for step in self.steps],
+            "current_step_index": self.current_step_index,
+            "awaiting_hitl": self.awaiting_hitl,
+            "hitl_history": self.hitl_history,
+            "fallback_recovery_notes": self.fallback_recovery_notes,
+            "fallback_tool_trace": self.fallback_tool_trace,
+            "base_objective": self.base_objective or self.objective,
+            "plan_versions": [version.to_dict() for version in self.plan_versions],
+            "active_plan_version_id": self.active_plan_version_id,
+            "pending_feedback_queue": list(self.pending_feedback_queue),
+            "latest_plan_delta": self.latest_plan_delta.to_dict() if self.latest_plan_delta else None,
+            "checkpoint_state": self.checkpoint_state,
+            "checkpoint_reason": self.checkpoint_reason,
+            "progress_events": list(self.progress_events),
+            "progress_summaries": list(self.progress_summaries),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "WorkflowTask":
+        checkpoint_state_raw = str(
+            payload.get("checkpoint_state", "open" if payload.get("awaiting_hitl") else "closed")
+        ).strip().lower()
+        checkpoint_state = "open" if checkpoint_state_raw == "open" else "closed"
+        return cls(
+            task_id=payload.get("task_id", ""),
+            objective=payload.get("objective", ""),
+            title=(str(payload.get("title", "")).strip() or generate_chat_title(payload.get("objective", ""))),
+            request_type=payload.get("request_type", "exploration"),
+            intent_tags=list(payload.get("intent_tags", [])),
+            success_criteria=list(payload.get("success_criteria", [])),
+            status=payload.get("status", "pending"),
+            steps=[WorkflowStep.from_dict(step) for step in payload.get("steps", [])],
+            current_step_index=payload.get("current_step_index", -1),
+            awaiting_hitl=bool(payload.get("awaiting_hitl", False)),
+            hitl_history=list(payload.get("hitl_history", [])),
+            fallback_recovery_notes=payload.get("fallback_recovery_notes", ""),
+            fallback_tool_trace=list(payload.get("fallback_tool_trace", [])),
+            base_objective=payload.get("base_objective", "") or payload.get("objective", ""),
+            plan_versions=[
+                version
+                for version in (PlanVersion.from_dict(item) for item in payload.get("plan_versions", []))
+                if version is not None
+            ],
+            active_plan_version_id=payload.get("active_plan_version_id"),
+            pending_feedback_queue=[str(x).strip() for x in payload.get("pending_feedback_queue", []) if str(x).strip()],
+            latest_plan_delta=PlanDelta.from_dict(payload.get("latest_plan_delta")),
+            checkpoint_state=checkpoint_state,
+            checkpoint_reason=str(payload.get("checkpoint_reason", "")),
+            progress_events=[item for item in payload.get("progress_events", []) if isinstance(item, dict)],
+            progress_summaries=[item for item in payload.get("progress_summaries", []) if isinstance(item, dict)],
+            created_at=payload.get("created_at", _utc_now()),
+            updated_at=payload.get("updated_at", _utc_now()),
+        )

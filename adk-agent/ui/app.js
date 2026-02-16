@@ -28,7 +28,6 @@ const el = {
   composerForm: document.getElementById("composerForm"),
   newChatBtn: document.getElementById("newChatBtn"),
   notice: document.getElementById("notice"),
-  loadingChip: document.getElementById("loadingChip"),
   activityCard: document.getElementById("activityCard"),
   activityWheel: document.getElementById("activityWheel"),
   activityTitle: document.getElementById("activityTitle"),
@@ -248,7 +247,6 @@ function updateSendVisibility() {
 
 function setLoading(isLoading) {
   state.isLoading = isLoading;
-  el.loadingChip.classList.toggle("hidden", !isLoading);
   updateSendVisibility();
 }
 
@@ -1307,8 +1305,9 @@ function renderActivity() {
   const effectiveStatus = runStatus || taskStatus;
   const isComplete = effectiveStatus === "completed" || progressDerivedComplete;
   const isError = effectiveStatus === "failed";
+  const hasActiveRunStatus = Boolean(runStatus);
   const isPausedForCheckpoint =
-    !isComplete && (runStatus === "awaiting_hitl" || Boolean(selectedTask?.awaiting_hitl));
+    !isComplete && (runStatus === "awaiting_hitl" || (!hasActiveRunStatus && Boolean(selectedTask?.awaiting_hitl)));
   const isRunning = !isComplete && !isError && !isPausedForCheckpoint;
 
   el.activityCard.classList.toggle("is-running", isRunning);
@@ -1771,8 +1770,11 @@ function handleTerminalRunState(run) {
   state.latestRun = run;
   renderActivity();
 
-  const terminalStates = new Set(["completed", "failed", "awaiting_hitl", "needs_clarification", "queued"]);
-  if (!terminalStates.has(run.status)) return;
+  const status = String(run.status || "");
+  const kind = String(run.kind || "");
+  const isQueuedFeedbackAck = status === "queued" && kind === "feedback_task";
+  const terminalStates = new Set(["completed", "failed", "awaiting_hitl", "needs_clarification"]);
+  if (!terminalStates.has(status) && !isQueuedFeedbackAck) return;
 
   stopRunPolling();
 
@@ -1788,12 +1790,12 @@ function handleTerminalRunState(run) {
     })
     .catch((err) => setNotice(`Could not refresh chats: ${err.message}`, true));
 
-  if (run.status === "failed") {
+  if (status === "failed") {
     setNotice(run.error || "Run failed.", true);
     return;
   }
 
-  if (run.status === "needs_clarification") {
+  if (status === "needs_clarification") {
     state.clarificationMessage = run.clarification || "Clarification needed before execution.";
     setExpanded(true);
     renderMessages();
@@ -1801,7 +1803,7 @@ function handleTerminalRunState(run) {
     return;
   }
 
-  if (run.status === "queued") {
+  if (status === "queued") {
     const taskId = run.task_id || state.selectedTaskId;
     if (taskId) {
       addLocalEvent(
@@ -1816,7 +1818,7 @@ function handleTerminalRunState(run) {
     return;
   }
 
-  if (run.status === "awaiting_hitl") {
+  if (status === "awaiting_hitl") {
     setNotice("");
     return;
   }

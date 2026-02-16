@@ -24,26 +24,7 @@ from google.adk import Runner
 from google.adk.sessions import InMemorySessionService
 from pydantic import BaseModel, Field
 
-from agent import (
-    _gate_ack_token,
-    _build_clarification_request,
-    _execute_step,
-    _evaluate_quality_gates,
-    _merge_objective_with_revision_intent,
-    _merge_revision_intents,
-    _parse_revision_intent,
-    _resolve_rollback_revision_id,
-    _route_query_intent,
-    _run_runner_turn,
-    _start_new_workflow_task,
-    should_open_checkpoint,
-    create_agent,
-    create_clarifier_agent,
-    create_feedback_parser_agent,
-    create_intent_router_agent,
-    create_progress_summarizer_agent,
-    create_title_summarizer_agent,
-)
+from co_scientist.app import service as app_service
 from report_pdf import write_markdown_pdf
 from task_state_store import TaskStateStore
 from workflow import (
@@ -214,69 +195,23 @@ class UiRuntime:
 
         try:
             self.session_service = InMemorySessionService()
-            agent, mcp_tools = create_agent()
-            self.mcp_tools = mcp_tools
-            self.runner = Runner(
-                agent=agent,
-                app_name="co_scientist_ui",
-                session_service=self.session_service,
-            )
-            self.clarifier_runner = Runner(
-                agent=create_clarifier_agent(),
-                app_name="co_scientist_clarifier_ui",
-                session_service=self.session_service,
-            )
-            self.intent_router_runner = Runner(
-                agent=create_intent_router_agent(),
-                app_name="co_scientist_intent_router_ui",
-                session_service=self.session_service,
-            )
-            self.feedback_parser_runner = Runner(
-                agent=create_feedback_parser_agent(),
-                app_name="co_scientist_feedback_parser_ui",
-                session_service=self.session_service,
-            )
-            self.title_summarizer_runner = Runner(
-                agent=create_title_summarizer_agent(),
-                app_name="co_scientist_title_summarizer_ui",
-                session_service=self.session_service,
-            )
-            self.progress_summarizer_runner = Runner(
-                agent=create_progress_summarizer_agent(),
-                app_name="co_scientist_progress_summarizer_ui",
-                session_service=self.session_service,
-            )
-
-            main_session = await self.session_service.create_session(
-                app_name="co_scientist_ui",
+            components = await app_service.create_runtime_components(
+                self.session_service,
                 user_id=self.user_id,
             )
-            clarifier_session = await self.session_service.create_session(
-                app_name="co_scientist_clarifier_ui",
-                user_id=self.user_id,
-            )
-            intent_session = await self.session_service.create_session(
-                app_name="co_scientist_intent_router_ui",
-                user_id=self.user_id,
-            )
-            feedback_parser_session = await self.session_service.create_session(
-                app_name="co_scientist_feedback_parser_ui",
-                user_id=self.user_id,
-            )
-            title_summarizer_session = await self.session_service.create_session(
-                app_name="co_scientist_title_summarizer_ui",
-                user_id=self.user_id,
-            )
-            progress_summarizer_session = await self.session_service.create_session(
-                app_name="co_scientist_progress_summarizer_ui",
-                user_id=self.user_id,
-            )
-            self.session_id = main_session.id
-            self.clarifier_session_id = clarifier_session.id
-            self.intent_router_session_id = intent_session.id
-            self.feedback_parser_session_id = feedback_parser_session.id
-            self.title_summarizer_session_id = title_summarizer_session.id
-            self.progress_summarizer_session_id = progress_summarizer_session.id
+            self.runner = components.runner
+            self.clarifier_runner = components.clarifier_runner
+            self.intent_router_runner = components.intent_router_runner
+            self.feedback_parser_runner = components.feedback_parser_runner
+            self.title_summarizer_runner = components.title_summarizer_runner
+            self.progress_summarizer_runner = components.progress_summarizer_runner
+            self.session_id = components.session_id
+            self.clarifier_session_id = components.clarifier_session_id
+            self.intent_router_session_id = components.intent_router_session_id
+            self.feedback_parser_session_id = components.feedback_parser_session_id
+            self.title_summarizer_session_id = components.title_summarizer_session_id
+            self.progress_summarizer_session_id = components.progress_summarizer_session_id
+            self.mcp_tools = components.mcp_tools
 
             if self.mcp_tools:
                 tools = await self.mcp_tools.get_tools()
@@ -330,7 +265,7 @@ class UiRuntime:
         existing = (report_text or "").strip()
         if existing and not _LEGACY_REPORT_SECTION_RE.search(existing):
             return existing
-        quality = _evaluate_quality_gates(task)
+        quality = app_service.evaluate_quality_gates(task)
         regenerated = render_final_report(task, quality_report=quality)
         self.write_report_markdown(task.task_id, regenerated)
         return regenerated
@@ -400,7 +335,7 @@ class UiRuntime:
             f"Query: {query}"
         )
         try:
-            raw = await _run_runner_turn(
+            raw = await app_service.run_runner_turn(
                 self.title_summarizer_runner,
                 self.title_summarizer_session_id,
                 self.user_id,
@@ -531,7 +466,7 @@ class UiRuntime:
             f"Events window: {json.dumps(rendered_events, ensure_ascii=True)}"
         )
         try:
-            raw = await _run_runner_turn(
+            raw = await app_service.run_runner_turn(
                 self.progress_summarizer_runner,
                 self.progress_summarizer_session_id,
                 self.user_id,
@@ -760,7 +695,7 @@ class UiRuntime:
         return await self.feedback_task(task_id, scope)
 
     def rollback_task(self, task_id: str, token: str) -> dict:
-        revision_id, error_msg = _resolve_rollback_revision_id(self.state_store, task_id, token)
+        revision_id, error_msg = app_service.resolve_rollback_revision_id(self.state_store, task_id, token)
         if error_msg or not revision_id:
             raise HTTPException(status_code=400, detail=error_msg or "Could not resolve rollback revision.")
         rolled_back = self.state_store.rollback_task(task_id, revision_id)
@@ -799,7 +734,7 @@ class UiRuntime:
                     status="progress",
                     human_line="Checking whether clarification is required.",
                 )
-                clarification_msg = await _build_clarification_request(
+                clarification_msg = await app_service.build_clarification_request(
                     query,
                     clarifier_runner=self.clarifier_runner,
                     clarifier_session_id=self.clarifier_session_id,
@@ -827,7 +762,7 @@ class UiRuntime:
                     status="start",
                     human_line="Routing intent and building initial plan.",
                 )
-                intent_route = await _route_query_intent(
+                intent_route = await app_service.route_query_intent(
                     query,
                     intent_router_runner=self.intent_router_runner,
                     intent_router_session_id=self.intent_router_session_id,
@@ -847,7 +782,7 @@ class UiRuntime:
                     },
                 )
 
-                task = await _start_new_workflow_task(
+                task = await app_service.start_new_workflow_task(
                     self.runner,
                     self.session_id,
                     self.user_id,
@@ -956,19 +891,22 @@ class UiRuntime:
     ) -> None:
         if not task.base_objective:
             task.base_objective = task.objective
-        revision_intent = await _parse_revision_intent(
+        revision_intent = await app_service.parse_revision_intent(
             feedback_text,
             feedback_parser_runner=self.feedback_parser_runner,
             feedback_parser_session_id=self.feedback_parser_session_id,
             user_id=self.user_id,
         )
         prior_version = active_plan_version(task)
-        merged_intent = _merge_revision_intents(
+        merged_intent = app_service.merge_revision_intents(
             prior_version.revision_intent if prior_version else None,
             revision_intent,
         )
-        revised_objective = _merge_objective_with_revision_intent(task.base_objective or task.objective, merged_intent)
-        intent_route = await _route_query_intent(
+        revised_objective = app_service.merge_objective_with_revision_intent(
+            task.base_objective or task.objective,
+            merged_intent,
+        )
+        intent_route = await app_service.route_query_intent(
             revised_objective,
             intent_router_runner=self.intent_router_runner,
             intent_router_session_id=self.intent_router_session_id,
@@ -1040,7 +978,12 @@ class UiRuntime:
             next_idx = task.current_step_index + 1
             next_step = task.steps[next_idx]
             queued_feedback = [*task.pending_feedback_queue, *self.runtime_feedback_queue.get(task.task_id, [])]
-            open_gate, gate_reason = should_open_checkpoint(task, next_step, quality_state, queued_feedback)
+            open_gate, gate_reason = app_service.should_open_checkpoint(
+                task,
+                next_step,
+                quality_state,
+                queued_feedback,
+            )
             if open_gate:
                 if bypass_first_gate and first_gate_check and gate_reason == "pre_evidence_execution":
                     first_gate_check = False
@@ -1084,7 +1027,13 @@ class UiRuntime:
                     return "awaiting_hitl", None
 
             first_gate_check = False
-            step_text = await _execute_step(self.runner, self.session_id, self.user_id, task, next_idx)
+            step_text = await app_service.execute_step(
+                self.runner,
+                self.session_id,
+                self.user_id,
+                task,
+                next_idx,
+            )
             await self._log(run_id, step_text[:4000])
             step = task.steps[next_idx]
             tool_failures = sum(
@@ -1111,14 +1060,14 @@ class UiRuntime:
             )
             await self._save_task(task, note=f"step_{next_idx + 1}_completed_ui", run_id=run_id)
 
-            base_quality = _evaluate_quality_gates(task)
+            base_quality = app_service.evaluate_quality_gates(task)
             quality_state = {
                 "unresolved_gaps": base_quality.get("unresolved_gaps", []),
                 "last_step_failures": tool_failures,
                 "last_step_output": step.output,
             }
 
-        final_quality = _evaluate_quality_gates(task)
+        final_quality = app_service.evaluate_quality_gates(task)
         await self._append_progress_event(
             run_id,
             phase="finalize",
@@ -1181,7 +1130,7 @@ class UiRuntime:
                     human_line=f"Execution resumed for task {task_id}.",
                     task_id=task_id,
                 )
-                ack_token = _gate_ack_token(task.checkpoint_reason, task.active_plan_version_id)
+                ack_token = app_service.gate_ack_token(task.checkpoint_reason, task.active_plan_version_id)
                 if ack_token and ack_token not in task.hitl_history:
                     task.hitl_history.append(ack_token)
                 task.hitl_history.append("continue")
@@ -1221,7 +1170,7 @@ class UiRuntime:
                     )
                     return
 
-                quality = quality or _evaluate_quality_gates(task)
+                quality = quality or app_service.evaluate_quality_gates(task)
                 task.status = "completed"
                 task.awaiting_hitl = False
                 task.checkpoint_state = "closed"
