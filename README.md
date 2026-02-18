@@ -40,7 +40,11 @@ The flow below highlights where LLM reasoning is required versus deterministic r
 flowchart TD
     A[User Query] --> B[Intent + Task Bootstrap]
     B --> C{{LLM: Intent classification and objective interpretation}}
-    C --> D{{LLM: Draft dynamic plan graph from tools + objective}}
+    C --> C1{Ambiguity requires clarification?}
+    C1 -->|Yes| C2[Open clarification HITL checkpoint]
+    C2 --> C3[Merge user clarification into objective]
+    C3 --> D{{LLM: Draft dynamic plan graph from tools + objective}}
+    C1 -->|No| D
     D --> E[Normalize + persist plan version]
     E --> F[Open initial HITL checkpoint]
     F --> G{User action}
@@ -63,12 +67,12 @@ flowchart TD
     classDef llm fill:#eef2f7,stroke:#5f6b7a,stroke-width:1.5px,color:#1f2933;
     classDef guard fill:#f3f4f6,stroke:#6b7280,stroke-width:1.5px,color:#1f2933;
     class C,D,I,J,O llm;
-    class B,E,F,H,K,L,M,N,P,Q,Z guard;
+    class B,C1,C2,C3,E,F,H,K,L,M,N,P,Q,Z guard;
 ```
 
 Legend:
-- **Blue nodes** = LLM-required reasoning/synthesis steps.
-- **Green nodes** = deterministic runtime orchestration, persistence, and guardrails.
+- **LLM nodes** = model-required reasoning/synthesis steps.
+- **Guardrail nodes** = deterministic runtime orchestration, persistence, and HITL control flow.
 
 ## Quick Start
 
