@@ -1,7 +1,6 @@
 """Runtime layer exports for execution/trace utilities."""
 
 from .execution import (
-    STEP_EVIDENCE_BACKSTOP_TOOLS,
     STEP_SCOPE_TOOLS,
     build_escalated_allowed_tools,
     build_step_allowed_tools,
@@ -31,12 +30,29 @@ from .quality_gates import (
     gate_ack_token,
     print_checkpoint_plan,
     render_quality_gate_message,
-    run_fallback_recovery,
     should_open_checkpoint,
+)
+from .tool_registry import ToolDescriptor, ToolRegistry, infer_capabilities_from_text
+from .event_orchestrator import (
+    EVENT_CHECKPOINT_APPROVED,
+    EVENT_CHECKPOINT_OPENED,
+    EVENT_CHECKPOINT_REVISED,
+    EVENT_EVIDENCE_BATCH_READY,
+    EVENT_PHASE_COMPLETED,
+    EVENT_PHASE_STARTED,
+    PHASE_EVIDENCE,
+    PHASE_RESEARCHERS,
+    PHASE_SYNTHESIS,
+    append_event,
+    checkpoint_payload_for_transition,
+    ensure_phase_state,
+    infer_phase_for_step,
+    maybe_mark_phase_completed,
+    maybe_mark_phase_started,
+    should_checkpoint_for_phase_boundary,
 )
 
 __all__ = [
-    "STEP_EVIDENCE_BACKSTOP_TOOLS",
     "STEP_SCOPE_TOOLS",
     "build_escalated_allowed_tools",
     "build_step_allowed_tools",
@@ -64,6 +80,24 @@ __all__ = [
     "gate_ack_token",
     "print_checkpoint_plan",
     "render_quality_gate_message",
-    "run_fallback_recovery",
     "should_open_checkpoint",
+    "ToolDescriptor",
+    "ToolRegistry",
+    "infer_capabilities_from_text",
+    "EVENT_CHECKPOINT_APPROVED",
+    "EVENT_CHECKPOINT_OPENED",
+    "EVENT_CHECKPOINT_REVISED",
+    "EVENT_EVIDENCE_BATCH_READY",
+    "EVENT_PHASE_COMPLETED",
+    "EVENT_PHASE_STARTED",
+    "PHASE_EVIDENCE",
+    "PHASE_RESEARCHERS",
+    "PHASE_SYNTHESIS",
+    "append_event",
+    "checkpoint_payload_for_transition",
+    "ensure_phase_state",
+    "infer_phase_for_step",
+    "maybe_mark_phase_completed",
+    "maybe_mark_phase_started",
+    "should_checkpoint_for_phase_boundary",
 ]

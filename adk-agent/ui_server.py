@@ -25,6 +25,7 @@ from google.adk.sessions import InMemorySessionService
 from pydantic import BaseModel, Field
 
 from co_scientist.app import service as app_service
+from co_scientist.runtime import event_orchestrator as runtime_events
 from report_pdf import write_markdown_pdf
 from task_state_store import TaskStateStore
 from workflow import (
@@ -42,7 +43,7 @@ def _utc_now() -> str:
 
 
 _LEGACY_REPORT_SECTION_RE = re.compile(
-    r"^##\s*(?:Query|Scope|Decomposition|Diagnostics)\b|^###\s*Why this recommendation\b|^\s*Rationale Narrative\s*:",
+    r"^##\s*(?:Query|Scope)\b|^###\s*Why this recommendation\b|^\s*Rationale Narrative\s*:",
     flags=re.IGNORECASE | re.MULTILINE,
 )
 
@@ -69,6 +70,22 @@ def _task_summary(task: WorkflowTask) -> dict:
 def _task_detail(task: WorkflowTask) -> dict:
     payload = task.to_dict()
     payload["status_text"] = render_status(task)
+    quality = app_service.evaluate_quality_gates(task)
+    payload["quality_snapshot"] = {
+        "passed": bool(quality.get("passed", False)),
+        "unresolved_gaps": list(quality.get("unresolved_gaps", []) or [])[:8],
+        "tool_call_count": int(quality.get("tool_call_count", 0) or 0),
+        "evidence_count": int(quality.get("evidence_count", 0) or 0),
+        "quality_confidence": str(quality.get("quality_confidence", "") or ""),
+        "quality_score": float(quality.get("quality_score", 0.0) or 0.0),
+    }
+    # Explicit API contract fields for agentic phase/state reporting.
+    payload["planner_mode"] = str(getattr(task, "planner_mode", "") or "")
+    payload["phase_state"] = dict(getattr(task, "phase_state", {}) or {})
+    payload["checkpoint_payload"] = dict(getattr(task, "checkpoint_payload", {}) or {})
+    payload["quality_confidence"] = str(getattr(task, "quality_confidence", "") or "")
+    payload["researcher_candidates"] = list(getattr(task, "researcher_candidates", []) or [])
+    payload["event_log"] = list(getattr(task, "event_log", []) or [])
     return payload
 
 
@@ -167,12 +184,14 @@ class UiRuntime:
         self.clarifier_runner: Runner | None = None
         self.intent_router_runner: Runner | None = None
         self.feedback_parser_runner: Runner | None = None
+        self.planner_runner: Runner | None = None
         self.title_summarizer_runner: Runner | None = None
         self.progress_summarizer_runner: Runner | None = None
         self.session_id: str | None = None
         self.clarifier_session_id: str | None = None
         self.intent_router_session_id: str | None = None
         self.feedback_parser_session_id: str | None = None
+        self.planner_session_id: str | None = None
         self.title_summarizer_session_id: str | None = None
         self.progress_summarizer_session_id: str | None = None
         self.mcp_tools = None
@@ -203,12 +222,14 @@ class UiRuntime:
             self.clarifier_runner = components.clarifier_runner
             self.intent_router_runner = components.intent_router_runner
             self.feedback_parser_runner = components.feedback_parser_runner
+            self.planner_runner = components.planner_runner
             self.title_summarizer_runner = components.title_summarizer_runner
             self.progress_summarizer_runner = components.progress_summarizer_runner
             self.session_id = components.session_id
             self.clarifier_session_id = components.clarifier_session_id
             self.intent_router_session_id = components.intent_router_session_id
             self.feedback_parser_session_id = components.feedback_parser_session_id
+            self.planner_session_id = components.planner_session_id
             self.title_summarizer_session_id = components.title_summarizer_session_id
             self.progress_summarizer_session_id = components.progress_summarizer_session_id
             self.mcp_tools = components.mcp_tools
@@ -255,6 +276,11 @@ class UiRuntime:
             "latest_plan_delta": task.latest_plan_delta.to_dict() if task.latest_plan_delta else None,
             "pending_feedback_queue_count": len(task.pending_feedback_queue) + len(runtime_pending),
             "checkpoint_reason": task.checkpoint_reason,
+            "checkpoint_payload": dict(task.checkpoint_payload or {}),
+            "phase_state": dict(task.phase_state or {}),
+            "planner_mode": str(task.planner_mode or ""),
+            "quality_confidence": str(task.quality_confidence or ""),
+            "researcher_candidates": list(task.researcher_candidates or []),
             "revisions": revisions,
             "report_markdown_path": str(report_path) if report_path.exists() else None,
             "report_markdown": report_text,
@@ -262,12 +288,12 @@ class UiRuntime:
         }
 
     def _ensure_current_report(self, task: WorkflowTask, report_text: str | None) -> str | None:
-        existing = (report_text or "").strip()
-        if existing and not _LEGACY_REPORT_SECTION_RE.search(existing):
-            return existing
         quality = app_service.evaluate_quality_gates(task)
         regenerated = render_final_report(task, quality_report=quality)
-        self.write_report_markdown(task.task_id, regenerated)
+        existing = (report_text or "").strip()
+        refreshed = regenerated.strip()
+        if existing != refreshed:
+            self.write_report_markdown(task.task_id, regenerated)
         return regenerated
 
     async def create_run(self, kind: str, *, query: str = "", task_id: str | None = None) -> RunRecord:
@@ -789,6 +815,8 @@ class UiRuntime:
                     self.state_store,
                     query,
                     intent_route=intent_route,
+                    planner_runner=self.planner_runner,
+                    planner_session_id=self.planner_session_id,
                 )
                 if not task.title:
                     task.title = title
@@ -881,6 +909,9 @@ class UiRuntime:
             return
         task.hitl_history.append(token)
 
+    def _revision_opportunity_used(self, task: WorkflowTask) -> bool:
+        return sum(1 for item in (task.hitl_history or []) if str(item).startswith("revise:")) >= 1
+
     async def _apply_feedback_replan(
         self,
         run_id: str,
@@ -889,6 +920,23 @@ class UiRuntime:
         *,
         gate_reason: str,
     ) -> None:
+        if self._revision_opportunity_used(task):
+            task.hitl_history.append("revision_limit_reached")
+            task.awaiting_hitl = True
+            task.checkpoint_state = "open"
+            task.checkpoint_reason = "feedback_replan_limit_reached"
+            task.touch()
+            await self._append_progress_event(
+                run_id,
+                phase="plan",
+                event_type="feedback.rejected",
+                status="done",
+                human_line="Revision limit reached: one plan revision is allowed per task.",
+                task_id=task.task_id,
+            )
+            await self._save_task(task, note="feedback_replan_limit_reached_ui", run_id=run_id)
+            return
+
         if not task.base_objective:
             task.base_objective = task.objective
         revision_intent = await app_service.parse_revision_intent(
@@ -914,6 +962,14 @@ class UiRuntime:
         )
         request_type = str(intent_route.get("request_type", task.request_type) or task.request_type)
         intent_tags = list(intent_route.get("intent_tags", task.intent_tags) or task.intent_tags)
+        model_plan_graph = await app_service.draft_model_plan_graph(
+            revised_objective,
+            request_type=request_type,
+            intent_tags=intent_tags,
+            planner_runner=self.planner_runner,
+            planner_session_id=self.planner_session_id,
+            user_id=self.user_id,
+        )
         plan_version, delta = replan_remaining_steps(
             task,
             revised_objective=revised_objective,
@@ -921,6 +977,7 @@ class UiRuntime:
             intent_tags=intent_tags,
             revision_intent=merged_intent,
             gate_reason=gate_reason,
+            plan_graph_override=model_plan_graph,
         )
         task.hitl_history.append(f"revise:{feedback_text}")
         task.pending_feedback_queue = []
@@ -1134,9 +1191,16 @@ class UiRuntime:
                 if ack_token and ack_token not in task.hitl_history:
                     task.hitl_history.append(ack_token)
                 task.hitl_history.append("continue")
+                runtime_events.append_event(
+                    task,
+                    runtime_events.EVENT_CHECKPOINT_APPROVED,
+                    reason=task.checkpoint_reason,
+                    payload=dict(task.checkpoint_payload or {}),
+                )
                 task.awaiting_hitl = False
                 task.checkpoint_state = "closed"
                 task.checkpoint_reason = ""
+                task.checkpoint_payload = {}
                 task.touch()
                 await self._save_task(task, note="hitl_start_ui", run_id=run_id)
                 await self._append_progress_event(
@@ -1175,6 +1239,7 @@ class UiRuntime:
                 task.awaiting_hitl = False
                 task.checkpoint_state = "closed"
                 task.checkpoint_reason = ""
+                task.checkpoint_payload = {}
                 task.touch()
                 await self._save_task(task, note="workflow_completed_ui", run_id=run_id)
 
@@ -1266,6 +1331,17 @@ class UiRuntime:
                     await self._update_run(run_id, status="failed", error=f"Task {task_id} is already completed.")
                     return
                 if not task.awaiting_hitl:
+                    if self._revision_opportunity_used(task):
+                        await self._append_progress_event(
+                            run_id,
+                            phase="plan",
+                            event_type="feedback.rejected",
+                            status="done",
+                            human_line="Revision limit reached: one plan revision is allowed per task.",
+                            task_id=task.task_id,
+                        )
+                        await self._update_run(run_id, status="completed", task_id=task.task_id)
+                        return
                     task.pending_feedback_queue.append(message)
                     task.touch()
                     await self._save_task(task, note="feedback_queued_pending_ui", run_id=run_id)

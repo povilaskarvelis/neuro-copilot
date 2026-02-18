@@ -83,19 +83,6 @@ def find_ambiguous_abbreviations(query: str) -> list[tuple[str, list[str]]]:
     return matches
 
 
-def build_deterministic_clarification_request(query: str) -> str | None:
-    matches = find_ambiguous_abbreviations(query)
-    if not matches:
-        return None
-
-    lines = ["I need a quick clarification before I run tools:"]
-    for abbr, options in matches[:3]:
-        option_text = " or ".join(options)
-        lines.append(f"- `{abbr}` could mean {option_text}. Which one do you mean?")
-    lines.append("Reply with a short clarification and I will continue.")
-    return "\n".join(lines)
-
-
 def merge_query_with_clarification(original_query: str, clarification: str) -> str:
     return (
         f"{original_query}\n"
@@ -188,9 +175,6 @@ async def build_clarification_request(
     user_id: str = "researcher",
     run_runner_turn_fn: RunRunnerTurnFn | None = None,
 ) -> str | None:
-    deterministic = build_deterministic_clarification_request(query)
-    if deterministic:
-        return deterministic
     if clarifier_runner is None or not clarifier_session_id or run_runner_turn_fn is None:
         return None
     return await build_model_clarification_request(
@@ -226,8 +210,8 @@ def default_intent_route(query: str) -> dict:
         "request_type": classify_request_type(normalized_query or query),
         "intent_tags": infer_intent_tags(normalized_query or query),
         "confidence": 0.0,
-        "reason": "Deterministic routing fallback.",
-        "source": "deterministic",
+        "reason": "Heuristic route used because model route is unavailable.",
+        "source": "heuristic",
     }
 
 
@@ -356,7 +340,6 @@ __all__ = [
     "AMBIGUOUS_ABBREVIATIONS",
     "QUERY_TYPO_REPLACEMENTS",
     "build_clarification_request",
-    "build_deterministic_clarification_request",
     "build_model_clarification_request",
     "build_model_intent_route",
     "coerce_model_intent_tags",

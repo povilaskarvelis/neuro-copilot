@@ -13,6 +13,9 @@ const server = new McpServer({
   version: "0.1.0",
 });
 
+const STRUCTURED_CONTENT_ENVELOPE_VERSION = "research_mcp_response_v1";
+const VALID_RESULT_STATUSES = new Set(["ok", "error", "not_found_or_empty", "degraded"]);
+
 const NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
 const OPEN_TARGETS_API = "https://api.platform.opentargets.org/api/v4/graphql";
 const UNIPROT_API = "https://rest.uniprot.org";
@@ -26,6 +29,188 @@ const OLS_API = "https://www.ebi.ac.uk/ols4";
 const DATA_DIR = path.resolve(__dirname, "data");
 const OPENALEX_MAILTO = process.env.OPENALEX_MAILTO || process.env.CONTACT_EMAIL || "";
 let gwasCooldownUntilMs = 0;
+
+function normalizeWhitespace(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeTextPart(part) {
+  if (typeof part === "string") {
+    const normalized = part.trim();
+    return normalized ? { type: "text", text: normalized } : null;
+  }
+  if (!part || typeof part !== "object") return null;
+  const text = typeof part.text === "string" ? part.text.trim() : "";
+  if (!text) return null;
+  return {
+    type: "text",
+    text,
+  };
+}
+
+function inferEnvelopeStatus(payload, combinedText) {
+  const text = normalizeWhitespace(combinedText).toLowerCase();
+  if (payload?.isError === true || text.startsWith("error in ") || text.startsWith("error:")) {
+    return "error";
+  }
+  if (text.includes("critical gap") || text.includes("service unavailable")) {
+    return "degraded";
+  }
+  const notFoundMarkers = [
+    "no results",
+    "no records",
+    "no data found",
+    "not found",
+    "no target data found",
+    "no clinical trials found",
+    "no diseases found",
+    "no targets found",
+  ];
+  if (notFoundMarkers.some((marker) => text.includes(marker))) {
+    return "not_found_or_empty";
+  }
+  return "ok";
+}
+
+function extractSummaryLine(text) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines[0] || "No summary available.";
+}
+
+function normalizeResultStatus(value, fallback = "ok") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (VALID_RESULT_STATUSES.has(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function buildGenericToolPayload(toolName, { status, summary, combinedText, contentPartCount, rawPayload }) {
+  const normalizedStatus = normalizeResultStatus(status, "ok");
+  const excerpt = String(combinedText || "").slice(0, 900).trim();
+  const payload = {
+    schema: `${toolName}.generic.v1`,
+    result_status: normalizedStatus,
+    tool_name: toolName,
+    summary: String(summary || "No summary available."),
+    content_part_count: Math.max(0, Math.trunc(Number(contentPartCount || 0))),
+    text_excerpt: excerpt || String(summary || "No summary available."),
+  };
+  const notes = [];
+  if (rawPayload?.isError === true) {
+    notes.push("Tool handler returned isError=true.");
+  }
+  if (notes.length > 0) {
+    payload.notes = notes;
+  }
+  if (normalizedStatus === "error") {
+    payload.error = compactErrorMessage(excerpt || summary || `Error in ${toolName}.`);
+  }
+  return payload;
+}
+
+function normalizeStructuredPayload(toolName, { status, summary, combinedText, contentPartCount, rawPayload, originalStructured }) {
+  if (!originalStructured || typeof originalStructured !== "object") {
+    return buildGenericToolPayload(toolName, {
+      status,
+      summary,
+      combinedText,
+      contentPartCount,
+      rawPayload,
+    });
+  }
+
+  const schemaValue = normalizeWhitespace(originalStructured.schema || "");
+  if (!schemaValue) {
+    return {
+      ...buildGenericToolPayload(toolName, {
+        status,
+        summary,
+        combinedText,
+        contentPartCount,
+        rawPayload,
+      }),
+      details: originalStructured,
+    };
+  }
+
+  const normalizedPayload = { ...originalStructured };
+  const payloadStatus = normalizeResultStatus(normalizedPayload.result_status, "");
+  if (!payloadStatus) {
+    normalizedPayload.result_status = normalizeResultStatus(status, "ok");
+  }
+  return normalizedPayload;
+}
+
+function normalizeToolResponseEnvelope(toolName, rawResult) {
+  const payload = rawResult && typeof rawResult === "object" ? { ...rawResult } : {};
+  const originalContent = Array.isArray(payload.content) ? payload.content : [];
+  const normalizedParts = originalContent.map(normalizeTextPart).filter(Boolean);
+  const fallbackText = typeof rawResult === "string" ? rawResult.trim() : "";
+  const fallbackParts = fallbackText ? [{ type: "text", text: fallbackText }] : [];
+  const content = normalizedParts.length > 0 ? normalizedParts : fallbackParts;
+  const safeContent =
+    content.length > 0
+      ? content
+      : [{ type: "text", text: `No response content was produced by ${toolName}.` }];
+  const combinedText = safeContent.map((part) => part.text).join("\n");
+  const status = inferEnvelopeStatus(payload, combinedText);
+  const summary = extractSummaryLine(combinedText);
+  const originalStructured =
+    payload.structuredContent && typeof payload.structuredContent === "object"
+      ? payload.structuredContent
+      : null;
+  const normalizedPayload = normalizeStructuredPayload(toolName, {
+    status,
+    summary,
+    combinedText,
+    contentPartCount: safeContent.length,
+    rawPayload: payload,
+    originalStructured,
+  });
+
+  const structuredContent = {
+    envelope_version: STRUCTURED_CONTENT_ENVELOPE_VERSION,
+    tool_name: toolName,
+    status,
+    summary,
+    text: combinedText,
+    content_part_count: safeContent.length,
+    emitted_at_utc: new Date().toISOString(),
+    payload: normalizedPayload,
+  };
+
+  const normalizedResponse = {
+    ...payload,
+    content: safeContent,
+    structuredContent,
+  };
+  return normalizedResponse;
+}
+
+function wrapToolHandler(toolName, handler) {
+  return async (...args) => {
+    try {
+      const rawResult = await handler(...args);
+      return normalizeToolResponseEnvelope(toolName, rawResult);
+    } catch (error) {
+      const message = normalizeWhitespace(error?.message || String(error));
+      return normalizeToolResponseEnvelope(toolName, {
+        isError: true,
+        content: [{ type: "text", text: `Error in ${toolName}: ${message}` }],
+      });
+    }
+  };
+}
+
+const registerTool = server.registerTool.bind(server);
+server.registerTool = (toolName, config, handler) =>
+  registerTool(toolName, config, wrapToolHandler(toolName, handler));
 
 function sanitizeXmlText(value) {
   if (!value) return "";
@@ -191,6 +376,40 @@ ${sourceLines}
 
 Limitations:
 ${limitationLines}`;
+}
+
+function normalizeDoiValue(rawDoi) {
+  const value = normalizeWhitespace(rawDoi || "");
+  if (!value) return "";
+  const stripped = value.replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "").trim();
+  return stripped.replace(/^doi:\s*/i, "").trim();
+}
+
+function buildDoiMarkdown(rawDoi) {
+  const doi = normalizeDoiValue(rawDoi);
+  if (!doi) return "";
+  return `[DOI:${doi}](https://doi.org/${encodeURIComponent(doi)})`;
+}
+
+function buildOpenAlexWorkCitation(work) {
+  const title = normalizeWhitespace(work?.display_name || "Untitled");
+  const year = toNonNegativeInt(work?.publication_year, 0);
+  const venue = normalizeWhitespace(work?.primary_location?.source?.display_name || "");
+  const firstAuthor = normalizeWhitespace(work?.authorships?.[0]?.author?.display_name || "");
+  const authorLabel = firstAuthor ? `${firstAuthor}${(work?.authorships?.length || 0) > 1 ? " et al." : ""}` : "Unknown author";
+  const doiMarkdown = buildDoiMarkdown(work?.doi || work?.ids?.doi || "");
+  const openAlexId = normalizeWhitespace(work?.id || "");
+  const openAlexLabel = openAlexId ? `[OpenAlex](${openAlexId})` : "";
+  const venuePart = venue ? ` ${venue}.` : "";
+  const yearPart = year > 0 ? year : "n.d.";
+  const links = [doiMarkdown, openAlexLabel].filter(Boolean).join(" ");
+  return `${authorLabel} (${yearPart}). ${title}.${venuePart}${links ? ` ${links}` : ""}`.trim();
+}
+
+function extractPubmedSummaryDoi(item) {
+  const articleIds = Array.isArray(item?.articleids) ? item.articleids : [];
+  const doiRecord = articleIds.find((entry) => normalizeWhitespace(entry?.idtype || "").toLowerCase() === "doi");
+  return normalizeDoiValue(doiRecord?.value || "");
 }
 
 async function queryOpenTargets(query, variables = {}) {
@@ -653,6 +872,873 @@ function dedupeArray(values) {
   return [...new Set(values.filter(Boolean))];
 }
 
+function toFiniteNumber(value, fallback = 0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function toNonNegativeInt(value, fallback = 0) {
+  return Math.max(0, Math.trunc(toFiniteNumber(value, fallback)));
+}
+
+function toNullableNumber(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function compactErrorMessage(value, maxChars = 220) {
+  const text = normalizeWhitespace(value || "");
+  if (!text) return "";
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars - 3).trim()}...`;
+}
+
+function safeBuildTypedPayload(schema, payload, schemaName) {
+  const parsed = schema.safeParse(payload);
+  if (parsed.success) {
+    return parsed.data;
+  }
+  const issues = parsed.error.issues.slice(0, 6).map((issue) => {
+    const path = issue.path.length ? issue.path.join(".") : "(root)";
+    return `${path}: ${issue.message}`;
+  });
+  return {
+    schema: `${schemaName}.invalid`,
+    result_status: "error",
+    validation_errors: issues,
+  };
+}
+
+const RankResearcherExampleWorkPayloadSchema = z.object({
+  title: z.string(),
+  year: z.number().int().nullable(),
+  cited_by: z.number().int().nonnegative(),
+});
+
+const RankResearcherPayloadSchema = z.object({
+  rank: z.number().int().positive(),
+  author_id: z.string(),
+  name: z.string(),
+  institution: z.string(),
+  activity_score: z.number(),
+  topic_works: z.number().int().nonnegative(),
+  topic_citations: z.number().int().nonnegative(),
+  recent_topic_works: z.number().int().nonnegative(),
+  leadership_works: z.number().int().nonnegative(),
+  active_years: z.number().int().nonnegative(),
+  example_works: z.array(RankResearcherExampleWorkPayloadSchema),
+});
+
+const RankResearchersPayloadSchema = z.object({
+  schema: z.literal("rank_researchers_by_activity.v1"),
+  result_status: z.enum(["ok", "not_found_or_empty", "degraded", "error"]),
+  query: z.string(),
+  from_year: z.number().int().nonnegative(),
+  limit: z.number().int().positive(),
+  scanned_works: z.number().int().nonnegative(),
+  researcher_count: z.number().int().nonnegative(),
+  researchers: z.array(RankResearcherPayloadSchema),
+  notes: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+function buildRankResearchersPayload({
+  resultStatus = "ok",
+  query = "",
+  fromYear = 0,
+  limit = 10,
+  scannedWorks = 0,
+  researchers = [],
+  notes = [],
+  errorMessage = "",
+}) {
+  return safeBuildTypedPayload(
+    RankResearchersPayloadSchema,
+    {
+      schema: "rank_researchers_by_activity.v1",
+      result_status: resultStatus,
+      query: String(query || ""),
+      from_year: toNonNegativeInt(fromYear),
+      limit: Math.max(1, toNonNegativeInt(limit, 10)),
+      scanned_works: toNonNegativeInt(scannedWorks),
+      researcher_count: researchers.length,
+      researchers,
+      notes: dedupeArray((notes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      ...(errorMessage ? { error: compactErrorMessage(errorMessage) } : {}),
+    },
+    "rank_researchers_by_activity.v1"
+  );
+}
+
+const InferDirectionCountsPayloadSchema = z.object({
+  risk_increasing: z.number().int().nonnegative(),
+  protective: z.number().int().nonnegative(),
+  neutral: z.number().int().nonnegative(),
+  unknown: z.number().int().nonnegative(),
+});
+
+const InferAssociationPayloadSchema = z.object({
+  rank: z.number().int().positive(),
+  association_id: z.string(),
+  rs_id: z.string(),
+  direction: z.string(),
+  pvalue: z.number().nullable(),
+  effect_text: z.string(),
+  risk_allele: z.string(),
+  traits: z.array(z.string()),
+});
+
+const InferGeneticPayloadSchema = z.object({
+  schema: z.literal("infer_genetic_effect_direction.v1"),
+  result_status: z.enum(["ok", "not_found_or_empty", "degraded", "error"]),
+  fallback_mode: z.enum(["none", "open_targets_proxy", "critical_gap"]),
+  gene_symbol: z.string(),
+  disease_query: z.string(),
+  pvalue_threshold: z.number().nonnegative(),
+  max_snps: z.number().int().positive(),
+  max_associations: z.number().int().positive(),
+  time_budget_sec: z.number().int().positive(),
+  snps_scanned: z.number().int().nonnegative(),
+  associations_scanned: z.number().int().nonnegative(),
+  matched_count: z.number().int().nonnegative(),
+  timed_out_early: z.boolean(),
+  has_mixed_signals: z.boolean(),
+  direction_counts: InferDirectionCountsPayloadSchema,
+  matched_associations: z.array(InferAssociationPayloadSchema),
+  notes: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+function buildInferGeneticPayload({
+  resultStatus = "ok",
+  fallbackMode = "none",
+  geneSymbol = "",
+  diseaseQuery = "",
+  pvalueThreshold = 5e-8,
+  maxSnps = 8,
+  maxAssociations = 40,
+  timeBudgetSec = 25,
+  snpsScanned = 0,
+  associationsScanned = 0,
+  matchedAssociations = [],
+  timedOutEarly = false,
+  hasMixedSignals = false,
+  directionCounts = null,
+  notes = [],
+  errorMessage = "",
+}) {
+  const normalizedDirectionCounts = {
+    risk_increasing: toNonNegativeInt(directionCounts?.risk_increasing),
+    protective: toNonNegativeInt(directionCounts?.protective),
+    neutral: toNonNegativeInt(directionCounts?.neutral),
+    unknown: toNonNegativeInt(directionCounts?.unknown),
+  };
+  return safeBuildTypedPayload(
+    InferGeneticPayloadSchema,
+    {
+      schema: "infer_genetic_effect_direction.v1",
+      result_status: resultStatus,
+      fallback_mode: fallbackMode,
+      gene_symbol: String(geneSymbol || ""),
+      disease_query: String(diseaseQuery || ""),
+      pvalue_threshold: Math.max(0, toFiniteNumber(pvalueThreshold, 5e-8)),
+      max_snps: Math.max(1, toNonNegativeInt(maxSnps, 8)),
+      max_associations: Math.max(1, toNonNegativeInt(maxAssociations, 40)),
+      time_budget_sec: Math.max(1, toNonNegativeInt(timeBudgetSec, 25)),
+      snps_scanned: toNonNegativeInt(snpsScanned),
+      associations_scanned: toNonNegativeInt(associationsScanned),
+      matched_count: matchedAssociations.length,
+      timed_out_early: Boolean(timedOutEarly),
+      has_mixed_signals: Boolean(hasMixedSignals),
+      direction_counts: normalizedDirectionCounts,
+      matched_associations: matchedAssociations,
+      notes: dedupeArray((notes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      ...(errorMessage ? { error: compactErrorMessage(errorMessage) } : {}),
+    },
+    "infer_genetic_effect_direction.v1"
+  );
+}
+
+const CompareWeightsPayloadSchema = z.object({
+  disease_association: z.number().nullable(),
+  druggability: z.number().nullable(),
+  clinical_maturity: z.number().nullable(),
+  competitive_whitespace: z.number().nullable(),
+  safety: z.number().nullable(),
+});
+
+const CompareLeadPayloadSchema = z.object({
+  target_id: z.string(),
+  symbol: z.string(),
+  composite_score: z.number(),
+  lead_margin: z.number(),
+});
+
+const CompareScoresPayloadSchema = z.object({
+  composite: z.number(),
+  disease_association: z.number(),
+  druggability: z.number(),
+  clinical_maturity: z.number(),
+  competitive_whitespace: z.number(),
+  safety: z.number(),
+});
+
+const CompareRankingPayloadSchema = z.object({
+  rank: z.number().int().positive(),
+  target_id: z.string(),
+  symbol: z.string(),
+  approved_name: z.string(),
+  scores: CompareScoresPayloadSchema,
+  max_phase: z.number(),
+  known_unique_drugs: z.number().nonnegative(),
+  withdrawn_drug_rows: z.number().int().nonnegative(),
+  positive_tractability_count: z.number().int().nonnegative(),
+  safety_rows: z.number().int().nonnegative(),
+  clinical_safety_rows: z.number().int().nonnegative(),
+});
+
+const CompareTargetsPayloadSchema = z.object({
+  schema: z.literal("compare_targets_multi_axis.v1"),
+  result_status: z.enum(["ok", "not_found_or_empty", "degraded", "error"]),
+  targets_requested: z.array(z.string()),
+  targets_resolved: z.number().int().nonnegative(),
+  targets_compared: z.number().int().nonnegative(),
+  unresolved_targets: z.array(z.string()),
+  disease_id: z.string(),
+  disease_name: z.string(),
+  strategy_requested: z.string(),
+  strategy_effective: z.string(),
+  weight_mode: z.string(),
+  goal_text: z.string(),
+  weights: CompareWeightsPayloadSchema,
+  lead_target: CompareLeadPayloadSchema.nullable(),
+  rankings: z.array(CompareRankingPayloadSchema),
+  notes: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+function buildCompareTargetsPayload({
+  resultStatus = "ok",
+  targetsRequested = [],
+  targetsResolved = 0,
+  targetsCompared = 0,
+  unresolvedTargets = [],
+  diseaseId = "unknown",
+  diseaseName = "unknown",
+  strategyRequested = "balanced",
+  strategyEffective = "balanced",
+  weightMode = "preset",
+  goalText = "",
+  weights = null,
+  leadTarget = null,
+  rankings = [],
+  notes = [],
+  errorMessage = "",
+}) {
+  const normalizedWeights = {
+    disease_association: Number.isFinite(Number(weights?.disease_association))
+      ? Number(weights.disease_association)
+      : null,
+    druggability: Number.isFinite(Number(weights?.druggability)) ? Number(weights.druggability) : null,
+    clinical_maturity: Number.isFinite(Number(weights?.clinical_maturity))
+      ? Number(weights.clinical_maturity)
+      : null,
+    competitive_whitespace: Number.isFinite(Number(weights?.competitive_whitespace))
+      ? Number(weights.competitive_whitespace)
+      : null,
+    safety: Number.isFinite(Number(weights?.safety)) ? Number(weights.safety) : null,
+  };
+  return safeBuildTypedPayload(
+    CompareTargetsPayloadSchema,
+    {
+      schema: "compare_targets_multi_axis.v1",
+      result_status: resultStatus,
+      targets_requested: (targetsRequested || []).map((item) => String(item || "").trim()).filter(Boolean),
+      targets_resolved: toNonNegativeInt(targetsResolved),
+      targets_compared: toNonNegativeInt(targetsCompared),
+      unresolved_targets: (unresolvedTargets || []).map((item) => String(item || "").trim()).filter(Boolean),
+      disease_id: String(diseaseId || "unknown"),
+      disease_name: String(diseaseName || "unknown"),
+      strategy_requested: String(strategyRequested || "balanced"),
+      strategy_effective: String(strategyEffective || "balanced"),
+      weight_mode: String(weightMode || "preset"),
+      goal_text: String(goalText || ""),
+      weights: normalizedWeights,
+      lead_target: leadTarget
+        ? {
+            target_id: String(leadTarget.target_id || ""),
+            symbol: String(leadTarget.symbol || ""),
+            composite_score: toFiniteNumber(leadTarget.composite_score, 0),
+            lead_margin: toFiniteNumber(leadTarget.lead_margin, 0),
+          }
+        : null,
+      rankings,
+      notes: dedupeArray((notes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      ...(errorMessage ? { error: compactErrorMessage(errorMessage) } : {}),
+    },
+    "compare_targets_multi_axis.v1"
+  );
+}
+
+const DiseaseTargetEvidencePayloadSchema = z.object({
+  id: z.string(),
+  score_pct: z.number().nonnegative(),
+});
+
+const DiseaseTargetRowPayloadSchema = z.object({
+  rank: z.number().int().positive(),
+  target_id: z.string(),
+  symbol: z.string(),
+  approved_name: z.string(),
+  biotype: z.string(),
+  overall_score_pct: z.number().nonnegative(),
+  evidence: z.array(DiseaseTargetEvidencePayloadSchema),
+});
+
+const SearchDiseaseTargetsPayloadSchema = z.object({
+  schema: z.literal("search_disease_targets.v1"),
+  result_status: z.enum(["ok", "not_found_or_empty", "degraded", "error"]),
+  disease_id: z.string(),
+  disease_name: z.string(),
+  requested_limit: z.number().int().positive(),
+  total_associated_targets: z.number().int().nonnegative(),
+  targets_returned: z.number().int().nonnegative(),
+  targets: z.array(DiseaseTargetRowPayloadSchema),
+  notes: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+function buildSearchDiseaseTargetsPayload({
+  resultStatus = "ok",
+  diseaseId = "",
+  diseaseName = "",
+  requestedLimit = 10,
+  totalAssociatedTargets = 0,
+  targets = [],
+  notes = [],
+  errorMessage = "",
+}) {
+  const normalizedTargets = (targets || []).map((target, idx) => ({
+    rank: Math.max(1, toNonNegativeInt(target?.rank, idx + 1)),
+    target_id: String(target?.target_id || ""),
+    symbol: String(target?.symbol || "Unknown"),
+    approved_name: String(target?.approved_name || "Unknown"),
+    biotype: String(target?.biotype || "unknown"),
+    overall_score_pct: Math.max(0, toFiniteNumber(target?.overall_score_pct, 0)),
+    evidence: (target?.evidence || []).slice(0, 8).map((item) => ({
+      id: String(item?.id || "unknown"),
+      score_pct: Math.max(0, toFiniteNumber(item?.score_pct, 0)),
+    })),
+  }));
+  return safeBuildTypedPayload(
+    SearchDiseaseTargetsPayloadSchema,
+    {
+      schema: "search_disease_targets.v1",
+      result_status: resultStatus,
+      disease_id: String(diseaseId || ""),
+      disease_name: String(diseaseName || ""),
+      requested_limit: Math.max(1, toNonNegativeInt(requestedLimit, 10)),
+      total_associated_targets: toNonNegativeInt(totalAssociatedTargets),
+      targets_returned: normalizedTargets.length,
+      targets: normalizedTargets,
+      notes: dedupeArray((notes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      ...(errorMessage ? { error: compactErrorMessage(errorMessage) } : {}),
+    },
+    "search_disease_targets.v1"
+  );
+}
+
+const ClinicalTrialsLandscapePayloadSchema = z.object({
+  schema: z.literal("summarize_clinical_trials_landscape.v1"),
+  result_status: z.enum(["ok", "not_found_or_empty", "degraded", "error"]),
+  query: z.string(),
+  status_filter: z.string(),
+  studies_analyzed: z.number().int().nonnegative(),
+  total_reported: z.number().int().nonnegative().nullable(),
+  max_studies: z.number().int().positive(),
+  max_pages: z.number().int().positive(),
+  has_more_pages: z.boolean(),
+  trials_with_posted_results: z.number().int().nonnegative(),
+  status_breakdown: z.array(z.string()),
+  phase_breakdown: z.array(z.string()),
+  top_interventions: z.array(z.string()),
+  top_conditions: z.array(z.string()),
+  top_termination_reasons: z.array(z.string()),
+  example_terminated_nct_ids: z.array(z.string()),
+  notes: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+function buildClinicalTrialsLandscapePayload({
+  resultStatus = "ok",
+  query = "",
+  statusFilter = "",
+  studiesAnalyzed = 0,
+  totalReported = null,
+  maxStudies = 60,
+  maxPages = 4,
+  hasMorePages = false,
+  trialsWithPostedResults = 0,
+  statusBreakdown = [],
+  phaseBreakdown = [],
+  topInterventions = [],
+  topConditions = [],
+  topTerminationReasons = [],
+  exampleTerminatedNctIds = [],
+  notes = [],
+  errorMessage = "",
+}) {
+  return safeBuildTypedPayload(
+    ClinicalTrialsLandscapePayloadSchema,
+    {
+      schema: "summarize_clinical_trials_landscape.v1",
+      result_status: resultStatus,
+      query: String(query || ""),
+      status_filter: String(statusFilter || ""),
+      studies_analyzed: toNonNegativeInt(studiesAnalyzed),
+      total_reported: toNullableNumber(totalReported),
+      max_studies: Math.max(1, toNonNegativeInt(maxStudies, 60)),
+      max_pages: Math.max(1, toNonNegativeInt(maxPages, 4)),
+      has_more_pages: Boolean(hasMorePages),
+      trials_with_posted_results: toNonNegativeInt(trialsWithPostedResults),
+      status_breakdown: dedupeArray((statusBreakdown || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      phase_breakdown: dedupeArray((phaseBreakdown || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      top_interventions: dedupeArray((topInterventions || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      top_conditions: dedupeArray((topConditions || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      top_termination_reasons: dedupeArray((topTerminationReasons || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      example_terminated_nct_ids: dedupeArray((exampleTerminatedNctIds || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      notes: dedupeArray((notes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      ...(errorMessage ? { error: compactErrorMessage(errorMessage) } : {}),
+    },
+    "summarize_clinical_trials_landscape.v1"
+  );
+}
+
+const ExpandedDiseaseCandidatePayloadSchema = z.object({
+  rank: z.number().int().positive(),
+  label: z.string(),
+  obo_id: z.string(),
+  short_form: z.string(),
+  description: z.string(),
+  synonyms: z.array(z.string()),
+  iri: z.string().optional(),
+});
+
+const ExpandedDiseaseTopTermPayloadSchema = z.object({
+  label: z.string(),
+  obo_id: z.string(),
+  short_form: z.string(),
+});
+
+const ExpandDiseaseContextPayloadSchema = z.object({
+  schema: z.literal("expand_disease_context.v1"),
+  result_status: z.enum(["ok", "not_found_or_empty", "degraded", "error"]),
+  query: z.string(),
+  ontology: z.string(),
+  include_hierarchy: z.boolean(),
+  candidate_count: z.number().int().nonnegative(),
+  top_term: ExpandedDiseaseTopTermPayloadSchema.nullable(),
+  candidates: z.array(ExpandedDiseaseCandidatePayloadSchema),
+  parent_concepts: z.array(z.string()),
+  notes: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+function buildExpandDiseaseContextPayload({
+  resultStatus = "ok",
+  query = "",
+  ontology = "efo",
+  includeHierarchy = true,
+  topTerm = null,
+  candidates = [],
+  parentConcepts = [],
+  notes = [],
+  errorMessage = "",
+}) {
+  const normalizedCandidates = (candidates || []).map((candidate, idx) => ({
+    rank: Math.max(1, toNonNegativeInt(candidate?.rank, idx + 1)),
+    label: String(candidate?.label || "Unknown term"),
+    obo_id: String(candidate?.obo_id || "N/A"),
+    short_form: String(candidate?.short_form || "N/A"),
+    description: String(candidate?.description || "No description"),
+    synonyms: dedupeArray((candidate?.synonyms || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+    ...(candidate?.iri ? { iri: String(candidate.iri) } : {}),
+  }));
+  return safeBuildTypedPayload(
+    ExpandDiseaseContextPayloadSchema,
+    {
+      schema: "expand_disease_context.v1",
+      result_status: resultStatus,
+      query: String(query || ""),
+      ontology: String(ontology || "efo"),
+      include_hierarchy: Boolean(includeHierarchy),
+      candidate_count: normalizedCandidates.length,
+      top_term: topTerm
+        ? {
+            label: String(topTerm?.label || "Unknown term"),
+            obo_id: String(topTerm?.obo_id || "N/A"),
+            short_form: String(topTerm?.short_form || "N/A"),
+          }
+        : null,
+      candidates: normalizedCandidates,
+      parent_concepts: dedupeArray((parentConcepts || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      notes: dedupeArray((notes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      ...(errorMessage ? { error: compactErrorMessage(errorMessage) } : {}),
+    },
+    "expand_disease_context.v1"
+  );
+}
+
+const ChemblSelectedTargetPayloadSchema = z.object({
+  target_chembl_id: z.string(),
+  pref_name: z.string(),
+  target_type: z.string(),
+  organism: z.string(),
+});
+
+const ChemblCompoundRowPayloadSchema = z.object({
+  rank: z.number().int().positive(),
+  molecule_chembl_id: z.string(),
+  name: z.string(),
+  standard_type: z.string(),
+  relation: z.string(),
+  standard_value: z.string(),
+  standard_units: z.string(),
+  standard_value_nm: z.number().nullable(),
+  pchembl: z.number().nullable(),
+  assay_chembl_id: z.string(),
+  document_chembl_id: z.string(),
+  document_year: z.string(),
+});
+
+const SearchChemblCompoundsPayloadSchema = z.object({
+  schema: z.literal("search_chembl_compounds_for_target.v1"),
+  result_status: z.enum(["ok", "not_found_or_empty", "degraded", "error"]),
+  query: z.string(),
+  organism: z.string(),
+  activity_type: z.string(),
+  min_pchembl: z.number(),
+  max_nanomolar: z.number().nullable(),
+  selected_target: ChemblSelectedTargetPayloadSchema.nullable(),
+  candidate_targets_considered: z.number().int().nonnegative(),
+  compounds_returned: z.number().int().nonnegative(),
+  compounds: z.array(ChemblCompoundRowPayloadSchema),
+  top_candidate_target_matches: z.array(z.string()),
+  notes: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+function buildSearchChemblCompoundsPayload({
+  resultStatus = "ok",
+  query = "",
+  organism = "",
+  activityType = "IC50",
+  minPchembl = 6.0,
+  maxNanomolar = null,
+  selectedTarget = null,
+  candidateTargetsConsidered = 0,
+  compounds = [],
+  topCandidateTargetMatches = [],
+  notes = [],
+  errorMessage = "",
+}) {
+  const normalizedCompounds = (compounds || []).map((compound, idx) => ({
+    rank: Math.max(1, toNonNegativeInt(compound?.rank, idx + 1)),
+    molecule_chembl_id: String(compound?.molecule_chembl_id || ""),
+    name: String(compound?.name || "Unknown"),
+    standard_type: String(compound?.standard_type || ""),
+    relation: String(compound?.relation || "="),
+    standard_value: String(compound?.standard_value || "N/A"),
+    standard_units: String(compound?.standard_units || "N/A"),
+    standard_value_nm: toNullableNumber(compound?.standard_value_nm),
+    pchembl: toNullableNumber(compound?.pchembl),
+    assay_chembl_id: String(compound?.assay_chembl_id || "N/A"),
+    document_chembl_id: String(compound?.document_chembl_id || "N/A"),
+    document_year: String(compound?.document_year || "N/A"),
+  }));
+  return safeBuildTypedPayload(
+    SearchChemblCompoundsPayloadSchema,
+    {
+      schema: "search_chembl_compounds_for_target.v1",
+      result_status: resultStatus,
+      query: String(query || ""),
+      organism: String(organism || ""),
+      activity_type: String(activityType || "IC50"),
+      min_pchembl: toFiniteNumber(minPchembl, 6.0),
+      max_nanomolar: toNullableNumber(maxNanomolar),
+      selected_target: selectedTarget
+        ? {
+            target_chembl_id: String(selectedTarget?.target_chembl_id || ""),
+            pref_name: String(selectedTarget?.pref_name || "Unknown"),
+            target_type: String(selectedTarget?.target_type || "Unknown"),
+            organism: String(selectedTarget?.organism || "Unknown"),
+          }
+        : null,
+      candidate_targets_considered: toNonNegativeInt(candidateTargetsConsidered),
+      compounds_returned: normalizedCompounds.length,
+      compounds: normalizedCompounds,
+      top_candidate_target_matches: dedupeArray((topCandidateTargetMatches || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 8),
+      notes: dedupeArray((notes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      ...(errorMessage ? { error: compactErrorMessage(errorMessage) } : {}),
+    },
+    "search_chembl_compounds_for_target.v1"
+  );
+}
+
+const ExpressionRowPayloadSchema = z.object({
+  rank: z.number().int().positive(),
+  tissue_label: z.string(),
+  anatomical_systems: z.array(z.string()),
+  organs: z.array(z.string()),
+  rna_value: z.number().nullable(),
+  rna_unit: z.string(),
+  rna_level: z.number().nullable(),
+  rna_zscore: z.number().nullable(),
+  protein_level: z.string(),
+  protein_reliable: z.boolean(),
+  top_cell_types: z.array(z.string()),
+});
+
+const TargetExpressionContextPayloadSchema = z.object({
+  schema: z.literal("summarize_target_expression_context.v1"),
+  result_status: z.enum(["ok", "not_found_or_empty", "degraded", "error"]),
+  target_id: z.string(),
+  target_symbol: z.string(),
+  target_name: z.string(),
+  anatomical_system_filter: z.string(),
+  include_cell_types: z.boolean(),
+  rows_considered: z.number().int().nonnegative(),
+  rows_returned: z.number().int().nonnegative(),
+  dominant_systems: z.array(z.string()),
+  dominant_organs: z.array(z.string()),
+  dominant_cell_types: z.array(z.string()),
+  expression_rows: z.array(ExpressionRowPayloadSchema),
+  notes: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+function buildTargetExpressionContextPayload({
+  resultStatus = "ok",
+  targetId = "",
+  targetSymbol = "",
+  targetName = "",
+  anatomicalSystemFilter = "",
+  includeCellTypes = true,
+  rowsConsidered = 0,
+  expressionRows = [],
+  dominantSystems = [],
+  dominantOrgans = [],
+  dominantCellTypes = [],
+  notes = [],
+  errorMessage = "",
+}) {
+  const normalizedRows = (expressionRows || []).map((row, idx) => ({
+    rank: Math.max(1, toNonNegativeInt(row?.rank, idx + 1)),
+    tissue_label: String(row?.tissue_label || "Unknown tissue"),
+    anatomical_systems: dedupeArray((row?.anatomical_systems || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 6),
+    organs: dedupeArray((row?.organs || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 6),
+    rna_value: toNullableNumber(row?.rna_value),
+    rna_unit: String(row?.rna_unit || ""),
+    rna_level: toNullableNumber(row?.rna_level),
+    rna_zscore: toNullableNumber(row?.rna_zscore),
+    protein_level: String(row?.protein_level || "unknown"),
+    protein_reliable: Boolean(row?.protein_reliable),
+    top_cell_types: dedupeArray((row?.top_cell_types || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 8),
+  }));
+  return safeBuildTypedPayload(
+    TargetExpressionContextPayloadSchema,
+    {
+      schema: "summarize_target_expression_context.v1",
+      result_status: resultStatus,
+      target_id: String(targetId || ""),
+      target_symbol: String(targetSymbol || ""),
+      target_name: String(targetName || ""),
+      anatomical_system_filter: String(anatomicalSystemFilter || ""),
+      include_cell_types: Boolean(includeCellTypes),
+      rows_considered: toNonNegativeInt(rowsConsidered),
+      rows_returned: normalizedRows.length,
+      dominant_systems: dedupeArray((dominantSystems || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      dominant_organs: dedupeArray((dominantOrgans || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      dominant_cell_types: dedupeArray((dominantCellTypes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      expression_rows: normalizedRows,
+      notes: dedupeArray((notes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      ...(errorMessage ? { error: compactErrorMessage(errorMessage) } : {}),
+    },
+    "summarize_target_expression_context.v1"
+  );
+}
+
+const CompetitiveLeadAssetPayloadSchema = z.object({
+  rank: z.number().int().positive(),
+  drug_name: z.string(),
+  drug_id: z.string(),
+  phase_label: z.string(),
+  phase_numeric: z.number().nullable(),
+  withdrawn: z.boolean(),
+  disease_name: z.string(),
+  mechanism: z.string(),
+});
+
+const TargetCompetitiveLandscapePayloadSchema = z.object({
+  schema: z.literal("summarize_target_competitive_landscape.v1"),
+  result_status: z.enum(["ok", "not_found_or_empty", "degraded", "error"]),
+  target_id: z.string(),
+  target_symbol: z.string(),
+  target_name: z.string(),
+  disease_filter: z.string(),
+  rows_analyzed: z.number().int().nonnegative(),
+  catalog_unique_drugs: z.number().int().nonnegative(),
+  catalog_interactions: z.number().int().nonnegative(),
+  catalog_unique_diseases: z.number().int().nonnegative(),
+  unique_drugs_in_rows: z.number().int().nonnegative(),
+  withdrawn_interactions: z.number().int().nonnegative(),
+  phase_distribution: z.array(z.string()),
+  top_diseases: z.array(z.string()),
+  top_mechanisms: z.array(z.string()),
+  modality_mix: z.array(z.string()),
+  lead_assets: z.array(CompetitiveLeadAssetPayloadSchema),
+  notes: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+function buildTargetCompetitiveLandscapePayload({
+  resultStatus = "ok",
+  targetId = "",
+  targetSymbol = "",
+  targetName = "",
+  diseaseFilter = "",
+  rowsAnalyzed = 0,
+  catalogUniqueDrugs = 0,
+  catalogInteractions = 0,
+  catalogUniqueDiseases = 0,
+  uniqueDrugsInRows = 0,
+  withdrawnInteractions = 0,
+  phaseDistribution = [],
+  topDiseases = [],
+  topMechanisms = [],
+  modalityMix = [],
+  leadAssets = [],
+  notes = [],
+  errorMessage = "",
+}) {
+  const normalizedLeadAssets = (leadAssets || []).map((asset, idx) => ({
+    rank: Math.max(1, toNonNegativeInt(asset?.rank, idx + 1)),
+    drug_name: String(asset?.drug_name || "Unknown"),
+    drug_id: String(asset?.drug_id || ""),
+    phase_label: String(asset?.phase_label || "Unknown"),
+    phase_numeric: toNullableNumber(asset?.phase_numeric),
+    withdrawn: Boolean(asset?.withdrawn),
+    disease_name: String(asset?.disease_name || "Unspecified disease"),
+    mechanism: String(asset?.mechanism || "Unknown mechanism"),
+  }));
+  return safeBuildTypedPayload(
+    TargetCompetitiveLandscapePayloadSchema,
+    {
+      schema: "summarize_target_competitive_landscape.v1",
+      result_status: resultStatus,
+      target_id: String(targetId || ""),
+      target_symbol: String(targetSymbol || ""),
+      target_name: String(targetName || ""),
+      disease_filter: String(diseaseFilter || ""),
+      rows_analyzed: toNonNegativeInt(rowsAnalyzed),
+      catalog_unique_drugs: toNonNegativeInt(catalogUniqueDrugs),
+      catalog_interactions: toNonNegativeInt(catalogInteractions),
+      catalog_unique_diseases: toNonNegativeInt(catalogUniqueDiseases),
+      unique_drugs_in_rows: toNonNegativeInt(uniqueDrugsInRows),
+      withdrawn_interactions: toNonNegativeInt(withdrawnInteractions),
+      phase_distribution: dedupeArray((phaseDistribution || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      top_diseases: dedupeArray((topDiseases || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      top_mechanisms: dedupeArray((topMechanisms || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      modality_mix: dedupeArray((modalityMix || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      lead_assets: normalizedLeadAssets,
+      notes: dedupeArray((notes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      ...(errorMessage ? { error: compactErrorMessage(errorMessage) } : {}),
+    },
+    "summarize_target_competitive_landscape.v1"
+  );
+}
+
+const SafetyEventPayloadSchema = z.object({
+  rank: z.number().int().positive(),
+  event_name: z.string(),
+  count: z.number().int().nonnegative(),
+  directions: z.array(z.string()),
+  study_types: z.array(z.string()),
+  tissues: z.array(z.string()),
+  dosing_signals: z.array(z.string()),
+  datasources: z.array(z.string()),
+});
+
+const TargetSafetyLiabilitiesPayloadSchema = z.object({
+  schema: z.literal("summarize_target_safety_liabilities.v1"),
+  result_status: z.enum(["ok", "not_found_or_empty", "degraded", "error"]),
+  target_id: z.string(),
+  target_symbol: z.string(),
+  target_name: z.string(),
+  include_clinical_only: z.boolean(),
+  event_filter: z.string(),
+  liabilities_analyzed: z.number().int().nonnegative(),
+  unique_events: z.number().int().nonnegative(),
+  direction_pattern: z.array(z.string()),
+  study_type_mix: z.array(z.string()),
+  tissue_contexts: z.array(z.string()),
+  datasource_mix: z.array(z.string()),
+  events: z.array(SafetyEventPayloadSchema),
+  notes: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+function buildTargetSafetyLiabilitiesPayload({
+  resultStatus = "ok",
+  targetId = "",
+  targetSymbol = "",
+  targetName = "",
+  includeClinicalOnly = false,
+  eventFilter = "",
+  liabilitiesAnalyzed = 0,
+  uniqueEvents = 0,
+  directionPattern = [],
+  studyTypeMix = [],
+  tissueContexts = [],
+  datasourceMix = [],
+  events = [],
+  notes = [],
+  errorMessage = "",
+}) {
+  const normalizedEvents = (events || []).map((event, idx) => ({
+    rank: Math.max(1, toNonNegativeInt(event?.rank, idx + 1)),
+    event_name: String(event?.event_name || "Unspecified event"),
+    count: toNonNegativeInt(event?.count),
+    directions: dedupeArray((event?.directions || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 6),
+    study_types: dedupeArray((event?.study_types || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 6),
+    tissues: dedupeArray((event?.tissues || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 6),
+    dosing_signals: dedupeArray((event?.dosing_signals || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 6),
+    datasources: dedupeArray((event?.datasources || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 6),
+  }));
+  return safeBuildTypedPayload(
+    TargetSafetyLiabilitiesPayloadSchema,
+    {
+      schema: "summarize_target_safety_liabilities.v1",
+      result_status: resultStatus,
+      target_id: String(targetId || ""),
+      target_symbol: String(targetSymbol || ""),
+      target_name: String(targetName || ""),
+      include_clinical_only: Boolean(includeClinicalOnly),
+      event_filter: String(eventFilter || ""),
+      liabilities_analyzed: toNonNegativeInt(liabilitiesAnalyzed),
+      unique_events: toNonNegativeInt(uniqueEvents),
+      direction_pattern: dedupeArray((directionPattern || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      study_type_mix: dedupeArray((studyTypeMix || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      tissue_contexts: dedupeArray((tissueContexts || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      datasource_mix: dedupeArray((datasourceMix || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 10),
+      events: normalizedEvents,
+      notes: dedupeArray((notes || []).map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 12),
+      ...(errorMessage ? { error: compactErrorMessage(errorMessage) } : {}),
+    },
+    "summarize_target_safety_liabilities.v1"
+  );
+}
+
 function inferDirectionLabel(association) {
   const oddsRatio = safeNumber(association?.orPerCopyNum);
   if (Number.isFinite(oddsRatio)) {
@@ -1087,74 +2173,137 @@ server.registerTool(
     },
   },
   async ({ diseaseId, limit = 10 }) => {
-    const graphqlQuery = `
-      query DiseaseTargets($diseaseId: String!, $size: Int!) {
-        disease(efoId: $diseaseId) {
-          id
-          name
-          associatedTargets(page: { size: $size, index: 0 }) {
-            count
-            rows {
-              target {
-                id
-                approvedSymbol
-                approvedName
-                biotype
-              }
-              score
-              datatypeScores {
-                id
+    try {
+      const boundedLimit = Math.max(1, Math.min(25, Math.round(limit)));
+      const graphqlQuery = `
+        query DiseaseTargets($diseaseId: String!, $size: Int!) {
+          disease(efoId: $diseaseId) {
+            id
+            name
+            associatedTargets(page: { size: $size, index: 0 }) {
+              count
+              rows {
+                target {
+                  id
+                  approvedSymbol
+                  approvedName
+                  biotype
+                }
                 score
+                datatypeScores {
+                  id
+                  score
+                }
               }
             }
           }
         }
-      }
-    `;
-    const result = await queryOpenTargets(graphqlQuery, { diseaseId, size: limit });
-    const disease = result?.data?.disease;
+      `;
+      const result = await queryOpenTargets(graphqlQuery, { diseaseId, size: boundedLimit });
+      const disease = result?.data?.disease;
 
-    if (!disease) {
+      if (!disease) {
+        const message = `Disease not found: "${diseaseId}". Use search_diseases to find valid disease IDs.`;
+        return {
+          content: [
+            {
+              type: "text",
+              text: message,
+            },
+          ],
+          structuredContent: buildSearchDiseaseTargetsPayload({
+            resultStatus: "not_found_or_empty",
+            diseaseId,
+            diseaseName: "",
+            requestedLimit: boundedLimit,
+            totalAssociatedTargets: 0,
+            targets: [],
+            notes: ["Disease ID did not resolve in Open Targets."],
+          }),
+        };
+      }
+
+      const rows = disease.associatedTargets?.rows ?? [];
+      if (rows.length === 0) {
+        return {
+          content: [{ type: "text", text: `No targets found for disease: ${disease.name}` }],
+          structuredContent: buildSearchDiseaseTargetsPayload({
+            resultStatus: "not_found_or_empty",
+            diseaseId: disease.id,
+            diseaseName: disease.name,
+            requestedLimit: boundedLimit,
+            totalAssociatedTargets: toNonNegativeInt(disease?.associatedTargets?.count),
+            targets: [],
+            notes: ["No associated targets were returned for this disease."],
+          }),
+        };
+      }
+
+      const targetPayloadRows = rows.map((row, idx) => {
+        const datatypeScores = Array.isArray(row?.datatypeScores) ? row.datatypeScores : [];
+        return {
+          rank: idx + 1,
+          target_id: String(row?.target?.id || ""),
+          symbol: String(row?.target?.approvedSymbol || "Unknown"),
+          approved_name: String(row?.target?.approvedName || "Unknown"),
+          biotype: String(row?.target?.biotype || "unknown"),
+          overall_score_pct: Math.max(0, toFiniteNumber(row?.score, 0) * 100),
+          evidence: datatypeScores
+            .filter((item) => toFiniteNumber(item?.score, 0) > 0)
+            .map((item) => ({
+              id: String(item?.id || "unknown"),
+              score_pct: Math.max(0, toFiniteNumber(item?.score, 0) * 100),
+            })),
+        };
+      });
+
+      const formatted = rows
+        .map((row, i) => {
+          const t = row.target;
+          const evidenceTypes = (Array.isArray(row?.datatypeScores) ? row.datatypeScores : [])
+            .filter((d) => toFiniteNumber(d?.score, 0) > 0)
+            .map((d) => `${d.id}: ${(toFiniteNumber(d?.score, 0) * 100).toFixed(0)}%`)
+            .join(", ");
+          return `${i + 1}. ${t.approvedSymbol} (${t.approvedName})
+   Target ID: ${t.id}
+   Overall Score: ${(toFiniteNumber(row?.score, 0) * 100).toFixed(1)}%
+   Evidence: ${evidenceTypes || "N/A"}
+   Type: ${t.biotype}`;
+        })
+        .join("\n\n");
+
       return {
         content: [
           {
             type: "text",
-            text: `Disease not found: "${diseaseId}". Use search_diseases to find valid disease IDs.`,
+            text: `Top ${rows.length} drug targets for ${disease.name} (${disease.id}):\nTotal associated targets: ${disease.associatedTargets.count}\n\n${formatted}\n\nUse get_target_info or check_druggability with the Target ID for more details.`,
           },
         ],
+        structuredContent: buildSearchDiseaseTargetsPayload({
+          resultStatus: "ok",
+          diseaseId: disease.id,
+          diseaseName: disease.name,
+          requestedLimit: boundedLimit,
+          totalAssociatedTargets: toNonNegativeInt(disease?.associatedTargets?.count),
+          targets: targetPayloadRows,
+          notes: ["Overall score and datatype evidence percentages are from Open Targets associatedTargets rows."],
+        }),
       };
-    }
-
-    const rows = disease.associatedTargets?.rows ?? [];
-    if (rows.length === 0) {
+    } catch (error) {
       return {
-        content: [{ type: "text", text: `No targets found for disease: ${disease.name}` }],
+        content: [{ type: "text", text: `Error in search_disease_targets: ${error.message}` }],
+        structuredContent: buildSearchDiseaseTargetsPayload({
+          resultStatus: "error",
+          diseaseId,
+          diseaseName: "",
+          requestedLimit: limit,
+          totalAssociatedTargets: 0,
+          targets: [],
+          notes: ["Unexpected error during disease target lookup."],
+          errorMessage: String(error?.message || "unknown error"),
+        }),
       };
     }
-
-    const formatted = rows
-      .map((row, i) => {
-        const t = row.target;
-        const evidenceTypes = row.datatypeScores
-          .filter((d) => d.score > 0)
-          .map((d) => `${d.id}: ${(d.score * 100).toFixed(0)}%`)
-          .join(", ");
-        return `${i + 1}. ${t.approvedSymbol} (${t.approvedName})
-   Target ID: ${t.id}
-   Overall Score: ${(row.score * 100).toFixed(1)}%
-   Evidence: ${evidenceTypes || "N/A"}
-   Type: ${t.biotype}`;
-      })
-      .join("\n\n");
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Top ${rows.length} drug targets for ${disease.name} (${disease.id}):\nTotal associated targets: ${disease.associatedTargets.count}\n\n${formatted}\n\nUse get_target_info or check_druggability with the Target ID for more details.`,
-        },
-      ],
-    };
   }
 );
 
@@ -1872,7 +3021,11 @@ server.registerTool(
       const keyFields = ids.map((id, idx) => {
         const item = summary?.result?.[id] || {};
         const firstAuthor = item.authors?.[0]?.name || "Unknown";
-        return `${idx + 1}. PMID ${id} | ${item.title || "Untitled"} | ${item.pubdate || "Unknown date"} | First author: ${firstAuthor}`;
+        const pubdate = normalizeWhitespace(item.pubdate || "Unknown date");
+        const title = normalizeWhitespace(item.title || "Untitled");
+        const doiMarkdown = buildDoiMarkdown(extractPubmedSummaryDoi(item));
+        const pubmedLink = `[PMID:${id}](https://pubmed.ncbi.nlm.nih.gov/${id}/)`;
+        return `${idx + 1}. ${firstAuthor}${item.authors?.length > 1 ? " et al." : ""} (${pubdate}). ${title}. ${pubmedLink}${doiMarkdown ? ` ${doiMarkdown}` : ""}`;
       });
       return {
         content: [
@@ -1912,8 +3065,18 @@ server.registerTool(
       const abstract = sanitizeXmlText(
         [...xml.matchAll(/<AbstractText[^>]*>([\s\S]*?)<\/AbstractText>/g)].map((m) => m[1]).join(" ")
       );
+      const journal = sanitizeXmlText(xml.match(/<Title>([\s\S]*?)<\/Title>/)?.[1] || "");
+      const year = sanitizeXmlText(xml.match(/<PubDate>[\s\S]*?<Year>(\d{4})<\/Year>[\s\S]*?<\/PubDate>/)?.[1] || "");
+      const doi = normalizeDoiValue(
+        xml.match(/<ELocationID[^>]*EIdType="doi"[^>]*>([\s\S]*?)<\/ELocationID>/i)?.[1] || ""
+      );
       const authors = parsePubmedAuthors(xml);
+      const firstAuthor = normalizeWhitespace(authors?.[0]?.name || "Unknown author");
+      const doiMarkdown = buildDoiMarkdown(doi);
+      const pubmedMarkdown = `[PMID:${pmid}](https://pubmed.ncbi.nlm.nih.gov/${pmid}/)`;
+      const citationLine = `${firstAuthor}${authors.length > 1 ? " et al." : ""} (${year || "n.d."}). ${title || "Untitled"}${journal ? `. ${journal}.` : "."} ${pubmedMarkdown}${doiMarkdown ? ` ${doiMarkdown}` : ""}`;
       const keyFields = [
+        `Citation: ${citationLine}`,
         `PMID: ${pmid}`,
         `Title: ${title || "Untitled"}`,
         `Author count: ${authors.length}`,
@@ -2023,8 +3186,8 @@ server.registerTool(
       const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
       const results = data?.results ?? [];
       const keyFields = results.map((w, idx) => {
-        const firstAuthor = w.authorships?.[0]?.author?.display_name || "Unknown";
-        return `${idx + 1}. ${w.display_name || "Untitled"} | ${w.publication_year || "Unknown year"} | First author: ${firstAuthor} | Cited by: ${w.cited_by_count ?? 0} | ID: ${w.id}`;
+        const citation = buildOpenAlexWorkCitation(w);
+        return `${idx + 1}. ${citation} | Cited by: ${w.cited_by_count ?? 0}`;
       });
       return {
         content: [
@@ -2191,6 +3354,15 @@ server.registerTool(
       }
 
       if (byAuthor.size === 0) {
+        const rankPayload = buildRankResearchersPayload({
+          resultStatus: "not_found_or_empty",
+          query,
+          fromYear: normalizedFromYear,
+          limit: boundedLimit,
+          scannedWorks,
+          researchers: [],
+          notes: ["No topic-matched OpenAlex works were available for ranking."],
+        });
         return {
           content: [
             {
@@ -2203,6 +3375,7 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: rankPayload,
         };
       }
 
@@ -2241,6 +3414,32 @@ server.registerTool(
           .join(" | ");
         return `${idx + 1}. ${r.name} | Activity score: ${r.score.toFixed(2)} | Topic works since ${normalizedFromYear}: ${r.topicWorks} | Topic citations: ${r.topicCitations} | Recent works (last 3y): ${r.recentTopicWorks} | Leadership (first/last): ${r.leadership} | Active years: ${r.activeYears} | Institution: ${r.institution} | ID: ${r.id}${examples ? ` | Example works: ${examples}` : ""}`;
       });
+      const researchersPayload = scored.map((r, idx) => ({
+        rank: idx + 1,
+        author_id: String(r.id || ""),
+        name: String(r.name || "Unknown"),
+        institution: String(r.institution || "Unknown institution"),
+        activity_score: toFiniteNumber(r.score, 0),
+        topic_works: toNonNegativeInt(r.topicWorks),
+        topic_citations: toNonNegativeInt(r.topicCitations),
+        recent_topic_works: toNonNegativeInt(r.recentTopicWorks),
+        leadership_works: toNonNegativeInt(r.leadership),
+        active_years: toNonNegativeInt(r.activeYears),
+        example_works: (r.exampleWorks || []).slice(0, 3).map((work) => ({
+          title: String(work?.title || "Untitled"),
+          year: Number.isFinite(Number(work?.year)) && Number(work?.year) > 0 ? Math.trunc(Number(work.year)) : null,
+          cited_by: toNonNegativeInt(work?.citedBy),
+        })),
+      }));
+      const rankPayload = buildRankResearchersPayload({
+        resultStatus: "ok",
+        query,
+        fromYear: normalizedFromYear,
+        limit: boundedLimit,
+        scannedWorks,
+        researchers: researchersPayload,
+        notes: [`Scanned up to ${maxPages} OpenAlex works pages.`],
+      });
       return {
         content: [
           {
@@ -2257,9 +3456,22 @@ server.registerTool(
             }),
           },
         ],
+        structuredContent: rankPayload,
       };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error in rank_researchers_by_activity: ${error.message}` }] };
+      return {
+        content: [{ type: "text", text: `Error in rank_researchers_by_activity: ${error.message}` }],
+        structuredContent: buildRankResearchersPayload({
+          resultStatus: "error",
+          query,
+          fromYear,
+          limit,
+          scannedWorks: 0,
+          researchers: [],
+          notes: ["Ranking execution failed before completion."],
+          errorMessage: String(error?.message || "unknown error"),
+        }),
+      };
     }
   }
 );
@@ -2706,6 +3918,24 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: buildClinicalTrialsLandscapePayload({
+            resultStatus: "not_found_or_empty",
+            query,
+            statusFilter: status || "",
+            studiesAnalyzed: 0,
+            totalReported: totalCount,
+            maxStudies: boundedStudies,
+            maxPages: boundedPages,
+            hasMorePages: false,
+            trialsWithPostedResults: 0,
+            statusBreakdown: [],
+            phaseBreakdown: [],
+            topInterventions: [],
+            topConditions: [],
+            topTerminationReasons: [],
+            exampleTerminatedNctIds: [],
+            notes: ["No studies were returned for the query/filter combination."],
+          }),
         };
       }
 
@@ -2783,6 +4013,27 @@ server.registerTool(
       if (hasMore) {
         keyFields.push("Additional studies remain beyond current page/study limits.");
       }
+      const clinicalLandscapePayload = buildClinicalTrialsLandscapePayload({
+        resultStatus: "ok",
+        query,
+        statusFilter: status || "",
+        studiesAnalyzed: analyzed,
+        totalReported: totalCount,
+        maxStudies: boundedStudies,
+        maxPages: boundedPages,
+        hasMorePages: hasMore,
+        trialsWithPostedResults: withPostedResults,
+        statusBreakdown: statusSummary,
+        phaseBreakdown: phaseSummary,
+        topInterventions: interventionSummary,
+        topConditions: conditionSummary,
+        topTerminationReasons: reasonSummary,
+        exampleTerminatedNctIds: terminatedNctIds,
+        notes: [
+          "Counts are aggregated from scanned ClinicalTrials.gov studies.",
+          hasMore ? "Additional studies remain outside scanned pages." : "All fetched pages were processed within limits.",
+        ],
+      });
 
       return {
         content: [
@@ -2799,10 +4050,30 @@ server.registerTool(
             }),
           },
         ],
+        structuredContent: clinicalLandscapePayload,
       };
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error in summarize_clinical_trials_landscape: ${error.message}` }],
+        structuredContent: buildClinicalTrialsLandscapePayload({
+          resultStatus: "error",
+          query,
+          statusFilter: status || "",
+          studiesAnalyzed: 0,
+          totalReported: null,
+          maxStudies,
+          maxPages,
+          hasMorePages: false,
+          trialsWithPostedResults: 0,
+          statusBreakdown: [],
+          phaseBreakdown: [],
+          topInterventions: [],
+          topConditions: [],
+          topTerminationReasons: [],
+          exampleTerminatedNctIds: [],
+          notes: ["Unexpected error during clinical-trial landscape aggregation."],
+          errorMessage: String(error?.message || "unknown error"),
+        }),
       };
     }
   }
@@ -2851,10 +4122,36 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: buildExpandDiseaseContextPayload({
+            resultStatus: "not_found_or_empty",
+            query,
+            ontology: normalizedOntology,
+            includeHierarchy,
+            topTerm: null,
+            candidates: [],
+            parentConcepts: [],
+            notes: ["No ontology class terms matched the query."],
+          }),
         };
       }
 
       const sources = [searchUrl];
+      const candidatePayloadRows = docs.map((doc, idx) => {
+        const synonyms = [
+          ...(doc?.exact_synonyms || []),
+          ...(doc?.narrow_synonyms || []),
+          ...(doc?.related_synonyms || []),
+        ];
+        return {
+          rank: idx + 1,
+          label: String(doc?.label || "Unknown term"),
+          obo_id: String(doc?.obo_id || doc?.short_form || "N/A"),
+          short_form: String(doc?.short_form || "N/A"),
+          description: String((doc?.description?.[0] || "No description").replace(/\s+/g, " ").slice(0, 220)),
+          synonyms: dedupeArray(synonyms.map((item) => String(item || "").trim()).filter(Boolean)).slice(0, 8),
+          iri: doc?.iri ? String(doc.iri) : undefined,
+        };
+      });
       const keyFields = docs.map((doc, idx) => {
         const synonyms = [
           ...(doc?.exact_synonyms || []),
@@ -2865,6 +4162,7 @@ server.registerTool(
         const desc = (doc?.description?.[0] || "No description").replace(/\s+/g, " ").slice(0, 220);
         return `${idx + 1}. ${doc?.label || "Unknown term"} | OBO ID: ${doc?.obo_id || doc?.short_form || "N/A"} | Synonyms: ${synonymText} | Description: ${desc}`;
       });
+      const parentConcepts = [];
 
       if (includeHierarchy && docs[0]?.iri) {
         const detailsUrl = `${OLS_API}/api/ontologies/${encodeURIComponent(normalizedOntology)}/terms?iri=${encodeURIComponent(
@@ -2882,11 +4180,19 @@ server.registerTool(
           const parents = (parentsData?._embedded?.terms || [])
             .slice(0, 6)
             .map((p) => `${p?.label || "Unknown"} (${p?.obo_id || p?.short_form || "N/A"})`);
+          parentConcepts.push(...parents);
           if (parents.length > 0) {
             keyFields.push(`Top parent concepts for ${docs[0].label}: ${parents.join(", ")}`);
           }
         }
       }
+      const topTerm = docs[0]
+        ? {
+            label: String(docs[0]?.label || "Unknown term"),
+            obo_id: String(docs[0]?.obo_id || docs[0]?.short_form || "N/A"),
+            short_form: String(docs[0]?.short_form || "N/A"),
+          }
+        : null;
 
       return {
         content: [
@@ -2903,10 +4209,34 @@ server.registerTool(
             }),
           },
         ],
+        structuredContent: buildExpandDiseaseContextPayload({
+          resultStatus: "ok",
+          query,
+          ontology: normalizedOntology,
+          includeHierarchy,
+          topTerm,
+          candidates: candidatePayloadRows,
+          parentConcepts,
+          notes: [
+            "Candidate terms are sourced from OLS ontology search.",
+            includeHierarchy ? "Hierarchy expansion used the top hit parent links when available." : "Hierarchy expansion was disabled by request.",
+          ],
+        }),
       };
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error in expand_disease_context: ${error.message}` }],
+        structuredContent: buildExpandDiseaseContextPayload({
+          resultStatus: "error",
+          query,
+          ontology,
+          includeHierarchy,
+          topTerm: null,
+          candidates: [],
+          parentConcepts: [],
+          notes: ["Unexpected error during ontology context expansion."],
+          errorMessage: String(error?.message || "unknown error"),
+        }),
       };
     }
   }
@@ -2941,6 +4271,7 @@ server.registerTool(
       const boundedLimit = Math.max(1, Math.min(20, Math.round(limit)));
       const normalizedOrganism = (organism || "").trim().toLowerCase();
       const normalizedQuery = query.trim();
+      const normalizedMaxNanomolar = toNullableNumber(maxNanomolar);
 
       const targetSearchUrl = `${CHEMBL_API}/target/search?${new URLSearchParams({
         q: normalizedQuery,
@@ -2962,6 +4293,19 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: buildSearchChemblCompoundsPayload({
+            resultStatus: "not_found_or_empty",
+            query: normalizedQuery,
+            organism,
+            activityType,
+            minPchembl,
+            maxNanomolar: normalizedMaxNanomolar,
+            selectedTarget: null,
+            candidateTargetsConsidered: 0,
+            compounds: [],
+            topCandidateTargetMatches: [],
+            notes: ["No ChEMBL target candidates matched the query."],
+          }),
         };
       }
 
@@ -2987,13 +4331,28 @@ server.registerTool(
       const selected = rankedCandidates[0]?.target;
       const targetChemblId = selected?.target_chembl_id;
       if (!targetChemblId) {
+        const message = `ChEMBL target resolution failed for "${query}" (no target_chembl_id found).`;
         return {
           content: [
             {
               type: "text",
-              text: `ChEMBL target resolution failed for "${query}" (no target_chembl_id found).`,
+              text: message,
             },
           ],
+          structuredContent: buildSearchChemblCompoundsPayload({
+            resultStatus: "degraded",
+            query: normalizedQuery,
+            organism,
+            activityType,
+            minPchembl,
+            maxNanomolar: normalizedMaxNanomolar,
+            selectedTarget: null,
+            candidateTargetsConsidered: targetCandidates.length,
+            compounds: [],
+            topCandidateTargetMatches: [],
+            notes: ["Top candidate lacked target_chembl_id and could not be queried for activity."],
+            errorMessage: message,
+          }),
         };
       }
 
@@ -3023,13 +4382,33 @@ server.registerTool(
                 keyFields: [
                   `Selected target: ${selected?.pref_name || "Unknown"} (${targetChemblId})`,
                   `Organism: ${selected?.organism || "Unknown"}`,
-                  `Filter: ${activityType}, pChEMBL >= ${minPchembl}${Number.isFinite(safeNumber(maxNanomolar)) ? `, <= ${maxNanomolar} nM` : ""}`,
+                  `Filter: ${activityType}, pChEMBL >= ${minPchembl}${normalizedMaxNanomolar !== null ? `, <= ${normalizedMaxNanomolar} nM` : ""}`,
                 ],
                 sources: [targetSearchUrl, activityUrl],
                 limitations: ["Filters may be too strict; lower pChEMBL threshold or remove nM cutoff."],
               }),
             },
           ],
+          structuredContent: buildSearchChemblCompoundsPayload({
+            resultStatus: "not_found_or_empty",
+            query: normalizedQuery,
+            organism,
+            activityType,
+            minPchembl,
+            maxNanomolar: normalizedMaxNanomolar,
+            selectedTarget: {
+              target_chembl_id: targetChemblId,
+              pref_name: String(selected?.pref_name || "Unknown"),
+              target_type: String(selected?.target_type || "Unknown"),
+              organism: String(selected?.organism || "Unknown"),
+            },
+            candidateTargetsConsidered: targetCandidates.length,
+            compounds: [],
+            topCandidateTargetMatches: rankedCandidates
+              .slice(0, 3)
+              .map((entry) => `${entry.target?.target_chembl_id || "N/A"} (${entry.target?.organism || "Unknown"})`),
+            notes: ["Target resolved but no activity rows matched requested potency filters."],
+          }),
         };
       }
 
@@ -3080,7 +4459,7 @@ server.registerTool(
         `Selected target: ${selected?.pref_name || "Unknown"} (${targetChemblId})`,
         `Target type: ${selected?.target_type || "N/A"} | Organism: ${selected?.organism || "Unknown"}`,
         `Candidate targets considered: ${targetCandidates.length}`,
-        `Activity filter: ${activityType}, pChEMBL >= ${minPchembl}${Number.isFinite(safeNumber(maxNanomolar)) ? `, <= ${maxNanomolar} nM` : ""}`,
+        `Activity filter: ${activityType}, pChEMBL >= ${minPchembl}${normalizedMaxNanomolar !== null ? `, <= ${normalizedMaxNanomolar} nM` : ""}`,
         ...rankedCompounds.map(
           (compound, idx) =>
             `${idx + 1}. ${compound.name} (${compound.moleculeId}) | ${compound.standardType} ${compound.relation} ${compound.standardValue} ${compound.standardUnits} | pChEMBL ${Number.isFinite(compound.pchembl) ? compound.pchembl.toFixed(2) : "N/A"} | Assay ${compound.assayId} | Doc ${compound.documentId} (${compound.documentYear})`
@@ -3091,6 +4470,38 @@ server.registerTool(
         .slice(0, 3)
         .map((entry) => `${entry.target?.target_chembl_id || "N/A"} (${entry.target?.organism || "Unknown"})`);
       keyFields.push(`Top candidate target matches: ${topCandidateIds.join(", ")}`);
+      const compoundsPayload = rankedCompounds.map((compound, idx) => ({
+        rank: idx + 1,
+        molecule_chembl_id: String(compound?.moleculeId || ""),
+        name: String(compound?.name || "Unknown"),
+        standard_type: String(compound?.standardType || ""),
+        relation: String(compound?.relation || "="),
+        standard_value: String(compound?.standardValue || "N/A"),
+        standard_units: String(compound?.standardUnits || "N/A"),
+        standard_value_nm: toNullableNumber(compound?.standardValueNm),
+        pchembl: toNullableNumber(compound?.pchembl),
+        assay_chembl_id: String(compound?.assayId || "N/A"),
+        document_chembl_id: String(compound?.documentId || "N/A"),
+        document_year: String(compound?.documentYear || "N/A"),
+      }));
+      const chemblPayload = buildSearchChemblCompoundsPayload({
+        resultStatus: "ok",
+        query: normalizedQuery,
+        organism,
+        activityType,
+        minPchembl,
+        maxNanomolar: normalizedMaxNanomolar,
+        selectedTarget: {
+          target_chembl_id: targetChemblId,
+          pref_name: String(selected?.pref_name || "Unknown"),
+          target_type: String(selected?.target_type || "Unknown"),
+          organism: String(selected?.organism || "Unknown"),
+        },
+        candidateTargetsConsidered: targetCandidates.length,
+        compounds: compoundsPayload,
+        topCandidateTargetMatches: topCandidateIds,
+        notes: ["Compounds are ranked by pChEMBL, with tie-break by lower standard value (nM)."],
+      });
 
       return {
         content: [
@@ -3107,10 +4518,25 @@ server.registerTool(
             }),
           },
         ],
+        structuredContent: chemblPayload,
       };
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error in search_chembl_compounds_for_target: ${error.message}` }],
+        structuredContent: buildSearchChemblCompoundsPayload({
+          resultStatus: "error",
+          query,
+          organism,
+          activityType,
+          minPchembl,
+          maxNanomolar,
+          selectedTarget: null,
+          candidateTargetsConsidered: 0,
+          compounds: [],
+          topCandidateTargetMatches: [],
+          notes: ["Unexpected error during ChEMBL compound search."],
+          errorMessage: String(error?.message || "unknown error"),
+        }),
       };
     }
   }
@@ -3145,13 +4571,29 @@ server.registerTool(
       if (!resolvedTargetId || !/^ENSG\d{11}$/i.test(resolvedTargetId)) {
         const symbolQuery = normalizedGeneSymbol || symbolFromTargetField;
         if (!symbolQuery) {
+          const message = "Provide either `targetId` (ENSG...) or `geneSymbol` to summarize expression context.";
           return {
             content: [
               {
                 type: "text",
-                text: "Provide either `targetId` (ENSG...) or `geneSymbol` to summarize expression context.",
+                text: message,
               },
             ],
+            structuredContent: buildTargetExpressionContextPayload({
+              resultStatus: "error",
+              targetId: "",
+              targetSymbol: "",
+              targetName: "",
+              anatomicalSystemFilter: anatomicalSystem || "",
+              includeCellTypes,
+              rowsConsidered: 0,
+              expressionRows: [],
+              dominantSystems: [],
+              dominantOrgans: [],
+              dominantCellTypes: [],
+              notes: ["Either targetId or geneSymbol is required."],
+              errorMessage: message,
+            }),
           };
         }
         const searchQuery = `
@@ -3183,6 +4625,20 @@ server.registerTool(
                 }),
               },
             ],
+            structuredContent: buildTargetExpressionContextPayload({
+              resultStatus: "not_found_or_empty",
+              targetId: "",
+              targetSymbol: symbolQuery,
+              targetName: "",
+              anatomicalSystemFilter: anatomicalSystem || "",
+              includeCellTypes,
+              rowsConsidered: 0,
+              expressionRows: [],
+              dominantSystems: [],
+              dominantOrgans: [],
+              dominantCellTypes: [],
+              notes: ["Target symbol could not be resolved in Open Targets search."],
+            }),
           };
         }
       }
@@ -3230,6 +4686,20 @@ server.registerTool(
               text: `No expression context found for target ID ${resolvedTargetId}.`,
             },
           ],
+          structuredContent: buildTargetExpressionContextPayload({
+            resultStatus: "not_found_or_empty",
+            targetId: resolvedTargetId,
+            targetSymbol: normalizedGeneSymbol || symbolFromTargetField,
+            targetName: "",
+            anatomicalSystemFilter: anatomicalSystem || "",
+            includeCellTypes,
+            rowsConsidered: 0,
+            expressionRows: [],
+            dominantSystems: [],
+            dominantOrgans: [],
+            dominantCellTypes: [],
+            notes: ["No expression payload was returned for the resolved target."],
+          }),
         };
       }
 
@@ -3261,6 +4731,20 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: buildTargetExpressionContextPayload({
+            resultStatus: "not_found_or_empty",
+            targetId: target.id,
+            targetSymbol: target.approvedSymbol,
+            targetName: target.approvedName,
+            anatomicalSystemFilter: anatomicalSystem || "",
+            includeCellTypes,
+            rowsConsidered: 0,
+            expressionRows: [],
+            dominantSystems: [],
+            dominantOrgans: [],
+            dominantCellTypes: [],
+            notes: ["No expression rows matched the anatomical system filter."],
+          }),
         };
       }
 
@@ -3277,6 +4761,7 @@ server.registerTool(
       const systemCounts = new Map();
       const organCounts = new Map();
       const cellTypeCounts = new Map();
+      const expressionRowsPayload = [];
       const keyFields = [
         `Target: ${target.approvedSymbol} (${target.approvedName})`,
         `Target ID: ${target.id}`,
@@ -3300,16 +4785,30 @@ server.registerTool(
 
         const proteinText = `${mapProteinLevel(protein?.level)}${protein?.reliability ? " (reliable)" : ""}`;
         let cellTypeText = "";
+        let topCellTypeLabels = [];
         if (includeCellTypes) {
-          const topCellTypes = (protein?.cellType || []).slice(0, 4).map((cell) => {
+          topCellTypeLabels = (protein?.cellType || []).slice(0, 4).map((cell) => {
             const label = `${cell?.name || "unknown"}:${mapProteinLevel(cell?.level)}`;
             incrementCount(cellTypeCounts, cell?.name || "unknown");
             return label;
           });
-          if (topCellTypes.length > 0) {
-            cellTypeText = ` | Cell types: ${topCellTypes.join(", ")}`;
+          if (topCellTypeLabels.length > 0) {
+            cellTypeText = ` | Cell types: ${topCellTypeLabels.join(", ")}`;
           }
         }
+        expressionRowsPayload.push({
+          rank: expressionRowsPayload.length + 1,
+          tissue_label: String(tissue?.label || "Unknown tissue"),
+          anatomical_systems: (tissue?.anatomicalSystems || []).map((item) => String(item || "")),
+          organs: (tissue?.organs || []).map((item) => String(item || "")),
+          rna_value: toNullableNumber(rna?.value),
+          rna_unit: String(rna?.unit || ""),
+          rna_level: toNullableNumber(rna?.level),
+          rna_zscore: toNullableNumber(rna?.zscore),
+          protein_level: mapProteinLevel(protein?.level),
+          protein_reliable: Boolean(protein?.reliability),
+          top_cell_types: topCellTypeLabels,
+        });
 
         keyFields.push(
           `${keyFields.length - (systemFilter ? 3 : 2)}. ${tissue?.label || "Unknown tissue"} | RNA: ${
@@ -3326,6 +4825,23 @@ server.registerTool(
       if (includeCellTypes && topCellTypes.length > 0) {
         keyFields.push(`Dominant cell-type context: ${topCellTypes.join(", ")}`);
       }
+      const expressionPayload = buildTargetExpressionContextPayload({
+        resultStatus: "ok",
+        targetId: target.id,
+        targetSymbol: target.approvedSymbol,
+        targetName: target.approvedName,
+        anatomicalSystemFilter: anatomicalSystem || "",
+        includeCellTypes,
+        rowsConsidered: expressions.length,
+        expressionRows: expressionRowsPayload,
+        dominantSystems: topSystems,
+        dominantOrgans: topOrgans,
+        dominantCellTypes: topCellTypes,
+        notes: [
+          "Rows are ranked by combined RNA abundance and protein-level heuristic.",
+          includeCellTypes ? "Cell-type annotations were included when available." : "Cell-type annotations were excluded by request.",
+        ],
+      });
 
       const targetUrl = `https://platform.opentargets.org/target/${target.id}`;
       sources.push(`${OPEN_TARGETS_API}#target.expressions:${target.id}`);
@@ -3346,10 +4862,26 @@ server.registerTool(
             }),
           },
         ],
+        structuredContent: expressionPayload,
       };
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error in summarize_target_expression_context: ${error.message}` }],
+        structuredContent: buildTargetExpressionContextPayload({
+          resultStatus: "error",
+          targetId: targetId || "",
+          targetSymbol: geneSymbol || "",
+          targetName: "",
+          anatomicalSystemFilter: anatomicalSystem || "",
+          includeCellTypes,
+          rowsConsidered: 0,
+          expressionRows: [],
+          dominantSystems: [],
+          dominantOrgans: [],
+          dominantCellTypes: [],
+          notes: ["Unexpected error during target expression-context summarization."],
+          errorMessage: String(error?.message || "unknown error"),
+        }),
       };
     }
   }
@@ -3394,6 +4926,23 @@ server.registerTool(
       const sources = [snpSearchUrl];
 
       if (snps.length === 0) {
+        const geneticPayload = buildInferGeneticPayload({
+          resultStatus: "not_found_or_empty",
+          fallbackMode: "none",
+          geneSymbol,
+          diseaseQuery,
+          pvalueThreshold: boundedThreshold,
+          maxSnps: boundedSnps,
+          maxAssociations: boundedAssociations,
+          timeBudgetSec: boundedBudgetSec,
+          snpsScanned: 0,
+          associationsScanned: 0,
+          matchedAssociations: [],
+          timedOutEarly,
+          hasMixedSignals: false,
+          directionCounts: null,
+          notes: ["No GWAS SNP mappings found for the requested gene."],
+        });
         return {
           content: [
             {
@@ -3406,6 +4955,7 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: geneticPayload,
         };
       }
 
@@ -3495,6 +5045,28 @@ server.registerTool(
       }
 
       if (matched.length === 0) {
+        const geneticPayload = buildInferGeneticPayload({
+          resultStatus: "not_found_or_empty",
+          fallbackMode: "none",
+          geneSymbol,
+          diseaseQuery,
+          pvalueThreshold: boundedThreshold,
+          maxSnps: boundedSnps,
+          maxAssociations: boundedAssociations,
+          timeBudgetSec: boundedBudgetSec,
+          snpsScanned: snps.length,
+          associationsScanned: scannedAssociations,
+          matchedAssociations: [],
+          timedOutEarly,
+          hasMixedSignals: false,
+          directionCounts: {
+            risk_increasing: directionCounts.get("risk_increasing") || 0,
+            protective: directionCounts.get("protective") || 0,
+            neutral: directionCounts.get("neutral") || 0,
+            unknown: directionCounts.get("unknown") || 0,
+          },
+          notes: ["No disease-matched GWAS associations passed filtering criteria."],
+        });
         return {
           content: [
             {
@@ -3519,6 +5091,7 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: geneticPayload,
         };
       }
 
@@ -3548,6 +5121,38 @@ server.registerTool(
       if (hasMixedSignals) {
         keyFields.push("Mixed protective and risk-increasing signals detected; context-specific interpretation is required.");
       }
+      const matchedAssociationsPayload = matched.slice(0, 40).map((row, idx) => ({
+        rank: idx + 1,
+        association_id: String(row.associationId || "N/A"),
+        rs_id: String(row.rsId || ""),
+        direction: String(row.direction || "unknown"),
+        pvalue: Number.isFinite(Number(row.pvalue)) ? Number(row.pvalue) : null,
+        effect_text: String(row.effectText || "effect=N/A"),
+        risk_allele: String(row.riskAllele || "N/A"),
+        traits: (row.traits || []).map((trait) => String(trait || "").trim()).filter(Boolean),
+      }));
+      const geneticPayload = buildInferGeneticPayload({
+        resultStatus: "ok",
+        fallbackMode: "none",
+        geneSymbol,
+        diseaseQuery,
+        pvalueThreshold: boundedThreshold,
+        maxSnps: boundedSnps,
+        maxAssociations: boundedAssociations,
+        timeBudgetSec: boundedBudgetSec,
+        snpsScanned: snps.length,
+        associationsScanned: scannedAssociations,
+        matchedAssociations: matchedAssociationsPayload,
+        timedOutEarly,
+        hasMixedSignals,
+        directionCounts: {
+          risk_increasing: directionCounts.get("risk_increasing") || 0,
+          protective: directionCounts.get("protective") || 0,
+          neutral: directionCounts.get("neutral") || 0,
+          unknown: directionCounts.get("unknown") || 0,
+        },
+        notes: ["Direction inference is association-sign based and non-causal."],
+      });
 
       return {
         content: [
@@ -3568,6 +5173,7 @@ server.registerTool(
             }),
           },
         ],
+        structuredContent: geneticPayload,
       };
     } catch (error) {
       if (isLikelyTransientUpstreamError(error) || isGwasEndpointError(error) || isGwasCooldownActive()) {
@@ -3577,6 +5183,24 @@ server.registerTool(
           8
         );
         if (fallback) {
+          const fallbackPayload = buildInferGeneticPayload({
+            resultStatus: "degraded",
+            fallbackMode: "open_targets_proxy",
+            geneSymbol,
+            diseaseQuery,
+            pvalueThreshold,
+            maxSnps,
+            maxAssociations,
+            timeBudgetSec,
+            snpsScanned: 0,
+            associationsScanned: 0,
+            matchedAssociations: [],
+            timedOutEarly: false,
+            hasMixedSignals: false,
+            directionCounts: null,
+            notes: ["Returned Open Targets genetics proxy because GWAS endpoint was unavailable."],
+            errorMessage: String(error?.message || "unknown error"),
+          });
           return {
             content: [
               {
@@ -3592,8 +5216,27 @@ server.registerTool(
                 }),
               },
             ],
+            structuredContent: fallbackPayload,
           };
         }
+        const degradedPayload = buildInferGeneticPayload({
+          resultStatus: "degraded",
+          fallbackMode: "critical_gap",
+          geneSymbol,
+          diseaseQuery,
+          pvalueThreshold,
+          maxSnps,
+          maxAssociations,
+          timeBudgetSec,
+          snpsScanned: 0,
+          associationsScanned: 0,
+          matchedAssociations: [],
+          timedOutEarly: false,
+          hasMixedSignals: false,
+          directionCounts: null,
+          notes: ["GWAS endpoint unavailable and no Open Targets fallback was available."],
+          errorMessage: String(error?.message || "unknown error"),
+        });
         return {
           content: [
             {
@@ -3609,10 +5252,29 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: degradedPayload,
         };
       }
       return {
         content: [{ type: "text", text: `Error in infer_genetic_effect_direction: ${error.message}` }],
+        structuredContent: buildInferGeneticPayload({
+          resultStatus: "error",
+          fallbackMode: "none",
+          geneSymbol,
+          diseaseQuery,
+          pvalueThreshold,
+          maxSnps,
+          maxAssociations,
+          timeBudgetSec,
+          snpsScanned: 0,
+          associationsScanned: 0,
+          matchedAssociations: [],
+          timedOutEarly: false,
+          hasMixedSignals: false,
+          directionCounts: null,
+          notes: ["Unexpected error during genetic direction inference."],
+          errorMessage: String(error?.message || "unknown error"),
+        }),
       };
     }
   }
@@ -3644,6 +5306,26 @@ server.registerTool(
       if (resolved?.error) {
         return {
           content: [{ type: "text", text: resolved.error }],
+          structuredContent: buildTargetCompetitiveLandscapePayload({
+            resultStatus: "error",
+            targetId: String(targetId || ""),
+            targetSymbol: String(geneSymbol || ""),
+            targetName: "",
+            diseaseFilter: String(diseaseFilter || ""),
+            rowsAnalyzed: 0,
+            catalogUniqueDrugs: 0,
+            catalogInteractions: 0,
+            catalogUniqueDiseases: 0,
+            uniqueDrugsInRows: 0,
+            withdrawnInteractions: 0,
+            phaseDistribution: [],
+            topDiseases: [],
+            topMechanisms: [],
+            modalityMix: [],
+            leadAssets: [],
+            notes: ["Target resolution failed before competitive landscape summarization."],
+            errorMessage: String(resolved.error || "target resolution failed"),
+          }),
         };
       }
 
@@ -3689,6 +5371,25 @@ server.registerTool(
       if (!target) {
         return {
           content: [{ type: "text", text: `No target data found for ID ${resolved.targetId}.` }],
+          structuredContent: buildTargetCompetitiveLandscapePayload({
+            resultStatus: "not_found_or_empty",
+            targetId: resolved.targetId,
+            targetSymbol: resolved.searchHint || "",
+            targetName: "",
+            diseaseFilter: String(diseaseFilter || ""),
+            rowsAnalyzed: 0,
+            catalogUniqueDrugs: 0,
+            catalogInteractions: 0,
+            catalogUniqueDiseases: 0,
+            uniqueDrugsInRows: 0,
+            withdrawnInteractions: 0,
+            phaseDistribution: [],
+            topDiseases: [],
+            topMechanisms: [],
+            modalityMix: [],
+            leadAssets: [],
+            notes: ["Target snapshot returned no known-drugs payload."],
+          }),
         };
       }
 
@@ -3731,6 +5432,25 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: buildTargetCompetitiveLandscapePayload({
+            resultStatus: "not_found_or_empty",
+            targetId: target.id,
+            targetSymbol: target.approvedSymbol,
+            targetName: target.approvedName,
+            diseaseFilter: String(diseaseFilter || ""),
+            rowsAnalyzed: 0,
+            catalogUniqueDrugs: toNonNegativeInt(target?.knownDrugs?.uniqueDrugs),
+            catalogInteractions: toNonNegativeInt(target?.knownDrugs?.count),
+            catalogUniqueDiseases: toNonNegativeInt(target?.knownDrugs?.uniqueDiseases),
+            uniqueDrugsInRows: 0,
+            withdrawnInteractions: 0,
+            phaseDistribution: [],
+            topDiseases: [],
+            topMechanisms: [],
+            modalityMix: [],
+            leadAssets: [],
+            notes: ["No known-drug rows matched the disease filter."],
+          }),
         };
       }
 
@@ -3782,6 +5502,38 @@ server.registerTool(
       const modalitySummary = summarizeTopCounts(modalityCounts, 5);
       const uniqueDrugsInRows = bestByDrug.size;
       const approvedOrLatePhase = leadAssets.filter((asset) => asset.phaseNumeric >= 3).length;
+      const leadAssetsPayload = leadAssets.map((asset, idx) => ({
+        rank: idx + 1,
+        drug_name: String(asset?.drugName || "Unknown"),
+        drug_id: String(asset?.drugId || ""),
+        phase_label: String(asset?.phaseLabel || "Unknown"),
+        phase_numeric: toNullableNumber(asset?.phaseNumeric),
+        withdrawn: Boolean(asset?.withdrawn),
+        disease_name: String(asset?.diseaseName || "Unspecified disease"),
+        mechanism: String(asset?.mechanism || "Unknown mechanism"),
+      }));
+      const competitivePayload = buildTargetCompetitiveLandscapePayload({
+        resultStatus: "ok",
+        targetId: target.id,
+        targetSymbol: target.approvedSymbol,
+        targetName: target.approvedName,
+        diseaseFilter: String(diseaseFilter || ""),
+        rowsAnalyzed: rows.length,
+        catalogUniqueDrugs: toNonNegativeInt(target?.knownDrugs?.uniqueDrugs),
+        catalogInteractions: toNonNegativeInt(target?.knownDrugs?.count),
+        catalogUniqueDiseases: toNonNegativeInt(target?.knownDrugs?.uniqueDiseases),
+        uniqueDrugsInRows,
+        withdrawnInteractions,
+        phaseDistribution: phaseSummary,
+        topDiseases: topDiseaseSummary,
+        topMechanisms: topMechanismSummary,
+        modalityMix: modalitySummary,
+        leadAssets: leadAssetsPayload,
+        notes: [
+          "Known-drug rows are aggregated from Open Targets target.knownDrugs links.",
+          normalizedFilter ? "Disease filter was applied to disease and mechanism text." : "No disease filter was applied.",
+        ],
+      });
 
       const keyFields = [
         `Target: ${target.approvedSymbol} (${target.approvedName})`,
@@ -3821,10 +5573,31 @@ server.registerTool(
             }),
           },
         ],
+        structuredContent: competitivePayload,
       };
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error in summarize_target_competitive_landscape: ${error.message}` }],
+        structuredContent: buildTargetCompetitiveLandscapePayload({
+          resultStatus: "error",
+          targetId: String(targetId || ""),
+          targetSymbol: String(geneSymbol || ""),
+          targetName: "",
+          diseaseFilter: String(diseaseFilter || ""),
+          rowsAnalyzed: 0,
+          catalogUniqueDrugs: 0,
+          catalogInteractions: 0,
+          catalogUniqueDiseases: 0,
+          uniqueDrugsInRows: 0,
+          withdrawnInteractions: 0,
+          phaseDistribution: [],
+          topDiseases: [],
+          topMechanisms: [],
+          modalityMix: [],
+          leadAssets: [],
+          notes: ["Unexpected error during competitive landscape summarization."],
+          errorMessage: String(error?.message || "unknown error"),
+        }),
       };
     }
   }
@@ -3853,6 +5626,23 @@ server.registerTool(
       if (resolved?.error) {
         return {
           content: [{ type: "text", text: resolved.error }],
+          structuredContent: buildTargetSafetyLiabilitiesPayload({
+            resultStatus: "error",
+            targetId: String(targetId || ""),
+            targetSymbol: String(geneSymbol || ""),
+            targetName: "",
+            includeClinicalOnly,
+            eventFilter: String(eventFilter || ""),
+            liabilitiesAnalyzed: 0,
+            uniqueEvents: 0,
+            directionPattern: [],
+            studyTypeMix: [],
+            tissueContexts: [],
+            datasourceMix: [],
+            events: [],
+            notes: ["Target resolution failed before safety-liability summarization."],
+            errorMessage: String(resolved.error || "target resolution failed"),
+          }),
         };
       }
 
@@ -3893,6 +5683,22 @@ server.registerTool(
       if (!target) {
         return {
           content: [{ type: "text", text: `No target data found for ID ${resolved.targetId}.` }],
+          structuredContent: buildTargetSafetyLiabilitiesPayload({
+            resultStatus: "not_found_or_empty",
+            targetId: resolved.targetId,
+            targetSymbol: resolved.searchHint || "",
+            targetName: "",
+            includeClinicalOnly,
+            eventFilter: String(eventFilter || ""),
+            liabilitiesAnalyzed: 0,
+            uniqueEvents: 0,
+            directionPattern: [],
+            studyTypeMix: [],
+            tissueContexts: [],
+            datasourceMix: [],
+            events: [],
+            notes: ["Target snapshot returned no safety-liabilities payload."],
+          }),
         };
       }
 
@@ -3936,6 +5742,22 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: buildTargetSafetyLiabilitiesPayload({
+            resultStatus: "not_found_or_empty",
+            targetId: target.id,
+            targetSymbol: target.approvedSymbol,
+            targetName: target.approvedName,
+            includeClinicalOnly,
+            eventFilter: String(eventFilter || ""),
+            liabilitiesAnalyzed: 0,
+            uniqueEvents: 0,
+            directionPattern: [],
+            studyTypeMix: [],
+            tissueContexts: [],
+            datasourceMix: [],
+            events: [],
+            notes: ["No safety liability rows matched current filters."],
+          }),
         };
       }
 
@@ -3999,6 +5821,35 @@ server.registerTool(
       const studyTypeSummary = summarizeTopCounts(studyTypeCounts, 6);
       const datasourceSummary = summarizeTopCounts(datasourceCounts, 6);
       const dedupedEventSources = dedupeArray(eventSourceLinks).slice(0, 12);
+      const rankedEventsPayload = rankedEvents.map(([eventName, data], idx) => ({
+        rank: idx + 1,
+        event_name: String(eventName || "Unspecified event"),
+        count: toNonNegativeInt(data?.count),
+        directions: Array.from(data?.directions || []).map((item) => String(item || "").trim()),
+        study_types: Array.from(data?.studyTypes || []).map((item) => String(item || "").trim()),
+        tissues: Array.from(data?.tissues || []).map((item) => String(item || "").trim()),
+        dosing_signals: Array.from(data?.dosingSignals || []).map((item) => String(item || "").trim()),
+        datasources: Array.from(data?.datasources || []).map((item) => String(item || "").trim()),
+      }));
+      const safetyPayload = buildTargetSafetyLiabilitiesPayload({
+        resultStatus: "ok",
+        targetId: target.id,
+        targetSymbol: target.approvedSymbol,
+        targetName: target.approvedName,
+        includeClinicalOnly,
+        eventFilter: String(eventFilter || ""),
+        liabilitiesAnalyzed: liabilities.length,
+        uniqueEvents: eventMap.size,
+        directionPattern: directionSummary,
+        studyTypeMix: studyTypeSummary,
+        tissueContexts: tissueSummary,
+        datasourceMix: datasourceSummary,
+        events: rankedEventsPayload,
+        notes: [
+          "Safety entries are heterogeneous literature and study-derived liabilities.",
+          includeClinicalOnly ? "Liabilities were restricted to rows with at least one clinical study." : "Clinical and preclinical rows were included.",
+        ],
+      });
 
       const keyFields = [
         `Target: ${target.approvedSymbol} (${target.approvedName})`,
@@ -4035,10 +5886,28 @@ server.registerTool(
             }),
           },
         ],
+        structuredContent: safetyPayload,
       };
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error in summarize_target_safety_liabilities: ${error.message}` }],
+        structuredContent: buildTargetSafetyLiabilitiesPayload({
+          resultStatus: "error",
+          targetId: String(targetId || ""),
+          targetSymbol: String(geneSymbol || ""),
+          targetName: "",
+          includeClinicalOnly,
+          eventFilter: String(eventFilter || ""),
+          liabilitiesAnalyzed: 0,
+          uniqueEvents: 0,
+          directionPattern: [],
+          studyTypeMix: [],
+          tissueContexts: [],
+          datasourceMix: [],
+          events: [],
+          notes: ["Unexpected error during safety-liability summarization."],
+          errorMessage: String(error?.message || "unknown error"),
+        }),
       };
     }
   }
@@ -4105,6 +5974,21 @@ server.registerTool(
       if (boundedTargets.length < 2) {
         return {
           content: [{ type: "text", text: "Provide at least two distinct targets to compare." }],
+          structuredContent: buildCompareTargetsPayload({
+            resultStatus: "error",
+            targetsRequested: boundedTargets,
+            targetsResolved: 0,
+            targetsCompared: 0,
+            unresolvedTargets: [],
+            diseaseId: String(diseaseId || "unknown"),
+            diseaseName: String(diseaseQuery || "unknown"),
+            strategyRequested: String(strategy || "balanced").trim().toLowerCase(),
+            strategyEffective: String(strategy || "balanced").trim().toLowerCase(),
+            weightMode: "preset",
+            goalText: String(goal || ""),
+            notes: ["At least two distinct targets are required for comparison."],
+            errorMessage: "Provide at least two distinct targets to compare.",
+          }),
         };
       }
 
@@ -4112,6 +5996,21 @@ server.registerTool(
       if (resolvedDisease?.error) {
         return {
           content: [{ type: "text", text: resolvedDisease.error }],
+          structuredContent: buildCompareTargetsPayload({
+            resultStatus: "error",
+            targetsRequested: boundedTargets,
+            targetsResolved: 0,
+            targetsCompared: 0,
+            unresolvedTargets: [String(resolvedDisease.error || "Disease resolution failed.")],
+            diseaseId: String(diseaseId || "unknown"),
+            diseaseName: String(diseaseQuery || "unknown"),
+            strategyRequested: String(strategy || "balanced").trim().toLowerCase(),
+            strategyEffective: String(strategy || "balanced").trim().toLowerCase(),
+            weightMode: "preset",
+            goalText: String(goal || ""),
+            notes: ["Disease context resolution failed before ranking."],
+            errorMessage: String(resolvedDisease.error || "Disease resolution failed."),
+          }),
         };
       }
 
@@ -4154,6 +6053,20 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: buildCompareTargetsPayload({
+            resultStatus: "not_found_or_empty",
+            targetsRequested: boundedTargets,
+            targetsResolved: uniqueTargets.length,
+            targetsCompared: 0,
+            unresolvedTargets,
+            diseaseId: String(resolvedDisease?.diseaseId || diseaseId || "unknown"),
+            diseaseName: String(resolvedDisease?.diseaseName || diseaseQuery || "unknown"),
+            strategyRequested: String(strategy || "balanced").trim().toLowerCase(),
+            strategyEffective: String(strategy || "balanced").trim().toLowerCase(),
+            weightMode: "preset",
+            goalText: String(goal || ""),
+            notes: ["Insufficient distinct target resolution for ranking."],
+          }),
         };
       }
 
@@ -4184,6 +6097,21 @@ server.registerTool(
       if (!disease?.id) {
         return {
           content: [{ type: "text", text: `Could not load disease context for ${resolvedDisease.diseaseId}.` }],
+          structuredContent: buildCompareTargetsPayload({
+            resultStatus: "degraded",
+            targetsRequested: boundedTargets,
+            targetsResolved: uniqueTargets.length,
+            targetsCompared: 0,
+            unresolvedTargets,
+            diseaseId: String(resolvedDisease?.diseaseId || "unknown"),
+            diseaseName: String(resolvedDisease?.diseaseName || diseaseQuery || "unknown"),
+            strategyRequested: String(strategy || "balanced").trim().toLowerCase(),
+            strategyEffective: String(strategy || "balanced").trim().toLowerCase(),
+            weightMode: "preset",
+            goalText: String(goal || ""),
+            notes: ["Disease context load failed in Open Targets query."],
+            errorMessage: `Could not load disease context for ${resolvedDisease.diseaseId}.`,
+          }),
         };
       }
       sources.push(`${OPEN_TARGETS_API}#disease.associatedTargets:${disease.id}`);
@@ -4320,6 +6248,20 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: buildCompareTargetsPayload({
+            resultStatus: "not_found_or_empty",
+            targetsRequested: boundedTargets,
+            targetsResolved: uniqueTargets.length,
+            targetsCompared: targetProfiles.length,
+            unresolvedTargets,
+            diseaseId: String(disease?.id || resolvedDisease?.diseaseId || "unknown"),
+            diseaseName: String(disease?.name || resolvedDisease?.diseaseName || diseaseQuery || "unknown"),
+            strategyRequested: String(strategy || "balanced").trim().toLowerCase(),
+            strategyEffective: String(strategy || "balanced").trim().toLowerCase(),
+            weightMode: "preset",
+            goalText: String(goal || ""),
+            notes: ["Insufficient target snapshots were available for scoring."],
+          }),
         };
       }
 
@@ -4358,6 +6300,21 @@ server.registerTool(
               }),
             },
           ],
+          structuredContent: buildCompareTargetsPayload({
+            resultStatus: "degraded",
+            targetsRequested: boundedTargets,
+            targetsResolved: uniqueTargets.length,
+            targetsCompared: targetProfiles.length,
+            unresolvedTargets,
+            diseaseId: String(disease?.id || resolvedDisease?.diseaseId || "unknown"),
+            diseaseName: String(disease?.name || resolvedDisease?.diseaseName || diseaseQuery || "unknown"),
+            strategyRequested: requestedStrategy,
+            strategyEffective: requestedStrategy,
+            weightMode: "clarification_required",
+            goalText,
+            notes: [String(inferredFromGoal.reason || "Clarification required for goal prioritization.")],
+            errorMessage: String(inferredFromGoal.clarificationQuestion || "Clarification required for ranking strategy."),
+          }),
         };
       }
 
@@ -4435,6 +6392,51 @@ server.registerTool(
       if (unresolvedTargets.length > 0) {
         keyFields.push(`Unresolved targets: ${unresolvedTargets.join(" | ")}`);
       }
+      const rankingsPayload = weightedProfiles.map((profile, idx) => ({
+        rank: idx + 1,
+        target_id: String(profile.targetId || ""),
+        symbol: String(profile.approvedSymbol || "Unknown"),
+        approved_name: String(profile.approvedName || "Unknown target"),
+        scores: {
+          composite: toFiniteNumber(profile.compositeScore, 0),
+          disease_association: toFiniteNumber(profile.diseaseAssociationScore, 0),
+          druggability: toFiniteNumber(profile.druggabilityScore, 0),
+          clinical_maturity: toFiniteNumber(profile.clinicalMaturityScore, 0),
+          competitive_whitespace: toFiniteNumber(profile.competitiveWhitespaceScore, 0),
+          safety: toFiniteNumber(profile.safetyScore, 0),
+        },
+        max_phase: toFiniteNumber(profile.maxPhase, 0),
+        known_unique_drugs: Math.max(0, toFiniteNumber(profile.knownUniqueDrugs, 0)),
+        withdrawn_drug_rows: toNonNegativeInt(profile.withdrawnDrugRows),
+        positive_tractability_count: toNonNegativeInt(profile.positiveTractabilityCount),
+        safety_rows: toNonNegativeInt(profile.safetyRows),
+        clinical_safety_rows: toNonNegativeInt(profile.clinicalSafetyRows),
+      }));
+      const comparePayload = buildCompareTargetsPayload({
+        resultStatus: "ok",
+        targetsRequested: boundedTargets,
+        targetsResolved: uniqueTargets.length,
+        targetsCompared: weightedProfiles.length,
+        unresolvedTargets,
+        diseaseId: String(disease?.id || resolvedDisease?.diseaseId || "unknown"),
+        diseaseName: String(disease?.name || resolvedDisease?.diseaseName || diseaseQuery || "unknown"),
+        strategyRequested: requestedStrategy,
+        strategyEffective: strategyLabel,
+        weightMode,
+        goalText,
+        weights,
+        leadTarget: {
+          target_id: String(lead?.targetId || ""),
+          symbol: String(lead?.approvedSymbol || "Unknown"),
+          composite_score: toFiniteNumber(lead?.compositeScore, 0),
+          lead_margin: toFiniteNumber(leadMargin, 0),
+        },
+        rankings: rankingsPayload,
+        notes: [
+          "Composite scores are heuristic and intended for decision support.",
+          includeBreakdown ? "Axis breakdown details were included in text output." : "Axis breakdown was suppressed.",
+        ],
+      });
 
       return {
         content: [
@@ -4452,10 +6454,26 @@ server.registerTool(
             }),
           },
         ],
+        structuredContent: comparePayload,
       };
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error in compare_targets_multi_axis: ${error.message}` }],
+        structuredContent: buildCompareTargetsPayload({
+          resultStatus: "error",
+          targetsRequested: (targets || []).map((item) => String(item || "").trim()).filter(Boolean).slice(0, 6),
+          targetsResolved: 0,
+          targetsCompared: 0,
+          unresolvedTargets: [],
+          diseaseId: String(diseaseId || "unknown"),
+          diseaseName: String(diseaseQuery || "unknown"),
+          strategyRequested: String(strategy || "balanced").trim().toLowerCase(),
+          strategyEffective: String(strategy || "balanced").trim().toLowerCase(),
+          weightMode: "preset",
+          goalText: String(goal || ""),
+          notes: ["Unexpected error during multi-axis comparison."],
+          errorMessage: String(error?.message || "unknown error"),
+        }),
       };
     }
   }

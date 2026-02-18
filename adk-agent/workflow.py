@@ -106,15 +106,12 @@ def _extract_primary_query(objective: str) -> str:
 # Planning/revision compatibility exports now delegate to co_scientist.planning.workflow_planning.
 VALID_REQUEST_TYPES = _planning.VALID_REQUEST_TYPES
 VALID_INTENT_TAGS = _planning.VALID_INTENT_TAGS
-RECOGNIZED_TOOL_NAMES = _planning.RECOGNIZED_TOOL_NAMES
-TOOL_CAPABILITIES = _planning.TOOL_CAPABILITIES
 CAPABILITY_PATTERNS = _planning.CAPABILITY_PATTERNS
 
 classify_request_type = _planning.classify_request_type
 sanitize_request_type = _planning.sanitize_request_type
 sanitize_intent_tags = _planning.sanitize_intent_tags
 infer_intent_tags = _planning.infer_intent_tags
-tool_bundle_for_intent = _planning.tool_bundle_for_intent
 build_success_criteria = _planning.build_success_criteria
 build_plan_steps = _planning.build_plan_steps
 create_task = _planning.create_task
@@ -273,7 +270,6 @@ def _humanize_internal_tool_mentions(text: str) -> str:
 def _detect_source_families(task: WorkflowTask) -> list[str]:
     families: set[str] = set()
     all_entries = [entry for step in task.steps for entry in step.tool_trace]
-    all_entries.extend(task.fallback_tool_trace or [])
     for entry in all_entries:
         source = _source_for_tool_name(str(entry.get("tool_name", "")))
         if source:
@@ -290,10 +286,6 @@ def _render_scope_snapshot(task: WorkflowTask) -> list[str]:
     if revision:
         lines.append(f"- Revision applied: {revision}")
     lines.append(f"- Timeframe considered: {timeframe}")
-    if "researcher_discovery" in task.intent_tags:
-        lines.append(
-            "- Definition of \"top\" researchers: topic-specific activity score from publication volume, citations, recency, and authorship leadership."
-        )
     if source_families:
         lines.append(f"- Primary evidence sources: {', '.join(source_families)}")
     return lines
@@ -353,35 +345,16 @@ def _extract_decomposition_from_text(text: str) -> list[str]:
 
 
 def _default_decomposition(task: WorkflowTask) -> list[str]:
-    if "researcher_discovery" in task.intent_tags:
-        return [
-            "Query disease/topic context and lock timeframe constraints.",
-            "Identify topic-matched publications from OpenAlex/PubMed.",
-            "Find candidate authors and affiliation signals from publication data.",
-            "Assess author activity/prominence and produce a ranked shortlist.",
-        ]
-    target_tags = {
-        "target_comparison",
-        "clinical_landscape",
-        "chemistry_evidence",
-        "safety_assessment",
-        "genetics_direction",
-        "expression_context",
-        "competitive_landscape",
-        "variant_check",
-        "pathway_context",
-    }
-    if any(tag in target_tags for tag in task.intent_tags):
-        return [
-            "Normalize target/disease entities and decision criteria.",
-            "Collect cross-source evidence (genetics, druggability, clinical, literature).",
-            "Resolve contradictions and produce recommendation with limitations.",
-        ]
-    return [
-        "Extract concrete scope, entities, and success criteria.",
-        "Gather evidence from relevant tools and document fallback pivots.",
-        "Synthesize findings into a direct answer with caveats and next actions.",
+    subtasks: list[str] = [
+        "Define scope, entities, constraints, and success criteria.",
     ]
+    evidence_steps = [step.title for step in task.steps[1:-1] if step.recommended_tools or step.fallback_tools]
+    for title in evidence_steps[:3]:
+        subtasks.append(
+            f"Execute the '{title}' stage and capture traceable citations plus unresolved gaps."
+        )
+    subtasks.append("Synthesize evidence into a recommendation with limitations and next actions.")
+    return subtasks
 
 
 def _decomposition_status(task: WorkflowTask, subtask: str) -> str:
@@ -390,7 +363,6 @@ def _decomposition_status(task: WorkflowTask, subtask: str) -> str:
         for step in task.steps
         for entry in step.tool_trace
     }
-    tool_names.update(str(entry.get("tool_name", "")) for entry in task.fallback_tool_trace)
     combined_output = "\n".join(step.output for step in task.steps if step.output).lower()
     lower = subtask.lower()
 
@@ -524,9 +496,6 @@ def _render_methodology(task: WorkflowTask) -> list[str]:
     all_tool_names = sorted({str(entry.get("tool_name", "unknown_tool")) for entry in all_trace_entries})
     lines.extend(["", "### Actions", f"- Tools involved: {', '.join(all_tool_names) if all_tool_names else 'none'}"])
     lines.extend(_render_tool_trace(all_trace_entries))
-    if task.fallback_tool_trace:
-        fallback_tools = sorted({str(entry.get("tool_name", "unknown_tool")) for entry in task.fallback_tool_trace})
-        lines.append(f"- Fallback tools involved: {', '.join(fallback_tools) if fallback_tools else 'none'}")
     lines.append("")
 
     observation_points: list[str] = []
@@ -542,58 +511,6 @@ def _render_methodology(task: WorkflowTask) -> list[str]:
     else:
         lines.append("- No observations captured.")
     return lines
-
-
-def _humanize_fallback_label(label: str) -> str:
-    mapping = {
-        "selected_tools": "Selected Tools",
-        "why_chosen": "Rationale",
-        "key_results": "Key Results",
-        "remaining_gaps": "Remaining Gaps",
-    }
-    normalized = re.sub(r"\s+", "_", (label or "").strip().lower())
-    return mapping.get(normalized, normalized.replace("_", " ").title())
-
-
-def _split_answer_and_fallback(answer_text: str) -> tuple[str, str | None]:
-    if not answer_text:
-        return "No answer generated.", None
-    match = re.search(r"\nFallback recovery notes:\s*", answer_text, flags=re.IGNORECASE)
-    if not match:
-        return answer_text.strip(), None
-    main = answer_text[: match.start()].strip()
-    fallback = answer_text[match.end() :].strip()
-    return main or "No answer generated.", (fallback or None)
-
-
-def _format_fallback_notes(fallback_text: str) -> list[str]:
-    if not fallback_text:
-        return ["- No fallback notes were captured."]
-
-    lines: list[str] = []
-    seen_sections: set[str] = set()
-    for raw in fallback_text.splitlines():
-        stripped = raw.strip()
-        if not stripped:
-            if lines and lines[-1] != "":
-                lines.append("")
-            continue
-        key_match = re.match(r"^\*{0,2}\s*([a-zA-Z_ ]+)\s*:\s*\*{0,2}$", stripped)
-        if key_match:
-            label = key_match.group(1).strip().lower().replace(" ", "_")
-            if label in {"selected_tools", "why_chosen", "key_results", "remaining_gaps"}:
-                if label in seen_sections:
-                    continue
-                seen_sections.add(label)
-                lines.append(f"### {_humanize_fallback_label(label)}")
-                continue
-        lines.append(raw.rstrip())
-
-    while lines and lines[0] == "":
-        lines.pop(0)
-    while lines and lines[-1] == "":
-        lines.pop()
-    return lines or ["- No fallback notes were captured."]
 
 
 def _build_evidence_context(task: WorkflowTask, refs: list[str], max_items: int = 8) -> list[str]:
@@ -613,12 +530,99 @@ def _build_evidence_context(task: WorkflowTask, refs: list[str], max_items: int 
 
     lines: list[str] = []
     for ref in refs[:max_items]:
-        detail = context_by_ref.get(ref, "Referenced in synthesis; see Answer section for interpretation.")
+        detail = context_by_ref.get(ref, "Referenced in synthesis; see final recommendation and rationale for interpretation.")
         lines.append(f"- {ref}: {detail}")
     remaining = len(refs) - max_items
     if remaining > 0:
         lines.append(f"- ... {remaining} additional references omitted for brevity.")
     return lines
+
+
+def _requested_paper_count(objective: str) -> int | None:
+    text = str(objective or "")
+    match = re.search(r"\b(\d{1,2})\s+(?:recent\s+)?papers?\b", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        count = int(match.group(1))
+    except ValueError:
+        return None
+    return count if count > 0 else None
+
+
+def _looks_like_placeholder_summary(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized:
+        return True
+    if normalized.startswith("(doi:") or normalized.startswith("doi:"):
+        return True
+    placeholders = (
+        "the available evidence supports the recommendation below",
+        "the recommendation is based on the strongest available evidence",
+        "no answer generated",
+    )
+    return any(marker in normalized for marker in placeholders)
+
+
+def _strip_leading_citation_tokens(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return value
+    cleaned = re.sub(
+        r"^(?:\(?\s*(?:DOI|PMID|OpenAlex)\s*:\s*[^)\s]+(?:\s*\)?|\s+))+",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip(" -:,.")
+    return cleaned or value
+
+
+def _collect_formatted_references(task: WorkflowTask) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+
+    def _append(citation: str, doi: str = "") -> None:
+        text = re.sub(r"\s+", " ", str(citation or "")).strip()
+        if not text:
+            return
+        text = re.sub(r"^\s*Citation:\s*", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"\s*\|\s*Cited by:\s*\d+\s*$", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"\s*OpenAlex\s*$", "", text, flags=re.IGNORECASE).strip()
+        normalized_doi = str(doi or "").strip().lower()
+        if not normalized_doi:
+            doi_match = re.search(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", text, flags=re.IGNORECASE)
+            normalized_doi = doi_match.group(0).lower() if doi_match else ""
+        if normalized_doi:
+            text = re.sub(r"\bDOI:\s*10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", "", text, flags=re.IGNORECASE).strip()
+            if f"https://doi.org/{normalized_doi}" not in text.lower():
+                text += f" [DOI:{normalized_doi}](https://doi.org/{normalized_doi})"
+        text = re.sub(r"\s+", " ", text).strip()
+        key = normalized_doi or re.sub(r"\s+", " ", text).strip().lower()
+        if key in seen:
+            return
+        seen.add(key)
+        refs.append(text)
+
+    for step in task.steps:
+        for entry in (step.tool_trace or []):
+            for bib in (entry.get("bibliography") or []):
+                if not isinstance(bib, dict):
+                    continue
+                _append(str(bib.get("citation", "")), str(bib.get("doi", "")))
+
+    if refs:
+        return refs
+
+    # Fallback: at least expose clickable DOI links when full citations are unavailable.
+    doi_refs = [
+        ref for ref in extract_evidence_refs("\n".join(step.output for step in task.steps if step.output))
+        if str(ref).upper().startswith("DOI:")
+    ]
+    for doi_ref in doi_refs:
+        doi = str(doi_ref).split(":", 1)[1].strip().lower()
+        if doi:
+            _append(f"DOI only metadata available: {doi}", doi)
+    return refs
 
 
 def _normalize_paragraph_key(text: str) -> str:
@@ -662,7 +666,6 @@ def _strip_legacy_report_sections(text: str) -> str:
         "reasoning",
         "actions",
         "observations",
-        "fallback recovery notes",
         "tool activity",
     }
 
@@ -776,6 +779,12 @@ def _compact_rationale_body(answer_body: str, recommendation: str | None, confid
     if confidence:
         escaped_conf = re.escape(confidence.strip())
         body = re.sub(rf"^\s*{escaped_conf}\s*$", "", body, flags=re.MULTILINE)
+    body = re.split(
+        r"\n\s*(?:#{1,3}\s*)?(?:methodology|limitations|references|next actions?)\s*:?\s*\n",
+        body,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
 
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", body) if part.strip()]
     filtered: list[str] = []
@@ -791,6 +800,9 @@ def _compact_rationale_body(answer_body: str, recommendation: str | None, confid
         "actions",
         "observations",
         "next actions",
+        "references",
+        "methodology:",
+        "limitations:",
     )
     for paragraph in paragraphs:
         normalized = re.sub(r"^[#\s]+", "", paragraph).strip().lower()
@@ -829,7 +841,6 @@ def _build_structured_output_contract(
     refs: list[str],
     unverified_refs: list[str],
     gaps: list[str],
-    fallback_used: bool,
     quality_report: dict | None = None,
 ) -> dict:
     quality_passed = quality_report.get("passed") if quality_report else None
@@ -869,7 +880,6 @@ def _build_structured_output_contract(
         "evidence_ref_count": diagnostics_evidence_count,
         "tool_call_count": diagnostics_tool_calls,
         "source_families": source_families,
-        "fallback_used": fallback_used,
         "mcp_response_contracts": {
             "valid_count": max(contract_ok, 0),
             "expected_count": max(contract_expected, 0),
@@ -887,24 +897,32 @@ def _build_structured_output_contract(
 
 
 def _methodology_strategy_sentence(task: WorkflowTask) -> str:
-    if "researcher_discovery" in task.intent_tags:
+    focus_map = {
+        "genetics_direction": "human genetics direction-of-effect",
+        "variant_check": "variant-level evidence",
+        "clinical_landscape": "clinical outcome patterns",
+        "safety_assessment": "safety liabilities",
+        "chemistry_evidence": "chemical and tractability evidence",
+        "competitive_landscape": "development landscape signals",
+        "pathway_context": "pathway/network context",
+        "expression_context": "tissue and cell-context evidence",
+        "researcher_discovery": "research-ecosystem signals",
+    }
+    focus = [label for tag, label in focus_map.items() if tag in task.intent_tags]
+    if focus:
+        if len(focus) == 1:
+            focus_text = focus[0]
+        elif len(focus) == 2:
+            focus_text = f"{focus[0]} and {focus[1]}"
+        else:
+            focus_text = f"{', '.join(focus[:-1])}, and {focus[-1]}"
         return (
-            "Because this was a researcher-discovery request, the workflow prioritized publication and authorship "
-            "signals first, then synthesized affiliation and activity evidence."
-        )
-    if "safety_assessment" in task.intent_tags or "clinical_landscape" in task.intent_tags:
-        return (
-            "Because risk and safety were central to the question, the workflow emphasized safety and clinical "
-            "outcome evidence before final recommendation synthesis."
-        )
-    if "target_comparison" in task.intent_tags:
-        return (
-            "Because this required target prioritization, the workflow gathered multi-axis evidence and then "
-            "integrated trade-offs into a single recommendation."
+            "The workflow was composed around the detected request scope and prioritized "
+            f"{focus_text} before final synthesis."
         )
     return (
-        "The workflow first scoped the objective, then gathered cross-source evidence, and finally synthesized "
-        "findings into a decision-oriented recommendation."
+        "The workflow first scoped the objective, then assembled evidence modules aligned to the request, "
+        "and finally synthesized findings into a decision-oriented recommendation."
     )
 
 
@@ -985,7 +1003,6 @@ def _render_methodology_brief(task: WorkflowTask) -> list[str]:
     lines = ["## Methodology"]
     executed_steps = [step.title for step in task.steps if step.status != "pending"]
     trace_entries = [entry for step in task.steps for entry in step.tool_trace]
-    trace_entries.extend(task.fallback_tool_trace or [])
     source_families = _detect_source_families(task)
 
     lines.append(_methodology_strategy_sentence(task))
@@ -1017,18 +1034,6 @@ def _render_methodology_brief(task: WorkflowTask) -> list[str]:
         lines.append("No executable workflow stages were completed.")
         return lines
 
-    if task.fallback_tool_trace:
-        fallback_tools = [
-            str(entry.get("tool_name", "")).strip()
-            for entry in task.fallback_tool_trace
-            if str(entry.get("tool_name", "")).strip()
-        ]
-        if fallback_tools:
-            fallback_actions = _summarize_tool_actions_for_step(fallback_tools)
-            lines.append(
-                f"- Fallback pass: {fallback_actions} to close unresolved evidence gaps before final synthesis."
-            )
-
     if not trace_entries:
         lines.append("No tool-based evidence calls were recorded in this run.")
         return lines
@@ -1058,54 +1063,66 @@ def _render_methodology_brief(task: WorkflowTask) -> list[str]:
     return lines
 
 
-def render_final_report(task: WorkflowTask, quality_report: dict | None = None) -> str:
+def _build_agentic_structured_summary(task: WorkflowTask, quality_report: dict | None = None) -> dict:
     raw_answer_text = task.steps[-1].output if task.steps else "No answer generated."
     answer_text = raw_answer_text.strip() if raw_answer_text else "No answer generated."
-    fallback_text = task.fallback_recovery_notes.strip() or None
-    if not fallback_text:
-        # Backward compatibility for legacy tasks where fallback notes were appended to step output.
-        answer_text, fallback_text = _split_answer_and_fallback(raw_answer_text)
     answer_text = _strip_legacy_report_sections(answer_text)
     answer_text = _sanitize_markdown_artifacts(answer_text)
     answer_text = _dedupe_answer_paragraphs(answer_text)
     answer_body, extracted_actions = _extract_next_actions(answer_text)
+
     recommendation = _extract_answer_line(answer_body, "Recommendation")
     confidence = _extract_answer_line(answer_body, "Confidence Level") or _extract_answer_line(answer_body, "Confidence")
     narrative_open = _extract_first_narrative_paragraph(answer_body) or "The available evidence supports the recommendation below."
-    source_families = _detect_source_families(task)
 
     answer_summary = recommendation or narrative_open
     if confidence:
         answer_summary = f"{answer_summary} Confidence: {confidence}."
     answer_summary = _humanize_internal_tool_mentions(answer_summary)
     answer_summary = _summarize_step_output(answer_summary, max_chars=440)
+    if _looks_like_placeholder_summary(answer_summary):
+        fallback_summary = _humanize_internal_tool_mentions(
+            _summarize_step_output(_extract_first_narrative_paragraph(answer_body) or narrative_open, max_chars=440)
+        )
+        if not _looks_like_placeholder_summary(fallback_summary):
+            answer_summary = fallback_summary
+    answer_summary = re.sub(r"^\s*Recommendation:\s*", "", answer_summary, flags=re.IGNORECASE).strip()
+    answer_summary = _strip_leading_citation_tokens(answer_summary)
 
-    lines: list[str] = []
-    lines.extend(["## Answer", answer_summary])
-    if source_families:
-        lines.append(f"Main sources informing this answer: {', '.join(source_families)}.")
+    formatted_references = _collect_formatted_references(task)
+    requested_papers = _requested_paper_count(task.objective)
+    source_families = _detect_source_families(task)
+    selected_references = formatted_references[:requested_papers] if requested_papers else formatted_references[:8]
 
-    lines.extend(["", "## Rationale"])
-    rationale_body = _compact_rationale_body(answer_body, recommendation, confidence)
-    rationale_body = _humanize_internal_tool_mentions(rationale_body)
-    if rationale_body:
-        lines.append(rationale_body)
-    else:
-        lines.append("The recommendation is based on the strongest available evidence captured in this run.")
+    data_retrieved: list[dict[str, str]] = []
+    for source in source_families:
+        data_retrieved.append({"source": source, "summary": f"Evidence retrieved from {source} during workflow execution."})
+    for reference in selected_references:
+        data_retrieved.append({"source": "reference", "summary": reference})
+    if not data_retrieved:
+        data_retrieved.append(
+            {"source": "workflow", "summary": "No tool-validated references were captured in this run; synthesis is based on model output only."}
+        )
 
-    lines.extend([""])
-    lines.extend(_render_methodology_brief(task))
+    executed_steps = [step for step in task.steps if step.status != "pending"]
+    steps_taken: list[str] = []
+    for idx, step in enumerate(executed_steps, start=1):
+        step_tool_names = [
+            str(entry.get("tool_name", "")).strip()
+            for entry in (step.tool_trace or [])
+            if str(entry.get("tool_name", "")).strip()
+        ]
+        action_summary = _summarize_tool_actions_for_step(step_tool_names)
+        reason = _methodology_reason_for_step(step)
+        steps_taken.append(f"Step {idx} ({step.title}): {action_summary}. Why: {reason}")
+    if not steps_taken:
+        steps_taken.append("No executable workflow stages were completed.")
 
-    lines.extend(["", "## Limitations"])
     gaps = quality_report.get("unresolved_gaps", []) if quality_report else []
-    if gaps:
-        lines.extend([f"- {_humanize_internal_tool_mentions(gap)}" for gap in gaps[:8]])
-    elif fallback_text:
-        lines.append("- Fallback recovery was used; validate high-stakes claims before external use.")
-    else:
-        lines.append("- No critical unresolved gaps were detected by current quality checks.")
+    limitations = [_humanize_internal_tool_mentions(str(gap)) for gap in gaps[:8] if str(gap).strip()]
+    if not limitations:
+        limitations = ["No critical unresolved gaps were detected by current quality checks."]
 
-    lines.extend(["", "## Next Actions"])
     next_actions = extracted_actions[:5]
     if not next_actions and gaps:
         next_actions = [f"Resolve: {gap}" for gap in gaps[:3]]
@@ -1116,11 +1133,75 @@ def render_final_report(task: WorkflowTask, quality_report: dict | None = None) 
             "Convert findings into an execution plan with owners and milestones.",
         ]
     next_actions = [_humanize_internal_tool_mentions(item) for item in next_actions]
-    lines.extend([f"- {item}" for item in next_actions])
 
-    lines.extend([""])
-    lines.extend(_render_decomposition(task))
-    return "\n".join(lines)
+    return {
+        "objective": _extract_primary_query(task.objective),
+        "answer": answer_summary,
+        "data_retrieved": data_retrieved[:20],
+        "steps_taken": steps_taken[:12],
+        "limitations": limitations,
+        "next_actions": next_actions,
+        "confidence": confidence or "unspecified",
+    }
+
+
+def _render_agentic_structured_summary_markdown(summary: dict) -> str:
+    lines: list[str] = []
+    objective = str(summary.get("objective", "")).strip()
+    if objective:
+        lines.extend(["## Objective", objective, ""])
+
+    lines.extend(["## Structured Summary", str(summary.get("answer", "")).strip() or "No answer generated.", ""])
+    lines.append(f"- Confidence: {str(summary.get('confidence', 'unspecified')).strip() or 'unspecified'}")
+
+    data_retrieved = summary.get("data_retrieved", [])
+    lines.extend(["", "## Data Retrieved"])
+    if isinstance(data_retrieved, list) and data_retrieved:
+        for item in data_retrieved:
+            if isinstance(item, dict):
+                source = str(item.get("source", "source")).strip() or "source"
+                text = str(item.get("summary", "")).strip()
+                if text:
+                    lines.append(f"- {source}: {text}")
+            else:
+                text = str(item).strip()
+                if text:
+                    lines.append(f"- {text}")
+    else:
+        lines.append("- No data retrieval details were captured.")
+
+    steps_taken = summary.get("steps_taken", [])
+    lines.extend(["", "## Steps Taken"])
+    if isinstance(steps_taken, list) and steps_taken:
+        lines.extend([f"- {str(step).strip()}" for step in steps_taken if str(step).strip()])
+    else:
+        lines.append("- No workflow execution steps were recorded.")
+
+    limitations = summary.get("limitations", [])
+    lines.extend(["", "## Limitations"])
+    if isinstance(limitations, list) and limitations:
+        lines.extend([f"- {str(item).strip()}" for item in limitations if str(item).strip()])
+    else:
+        lines.append("- No limitations reported.")
+
+    next_actions = summary.get("next_actions", [])
+    lines.extend(["", "## Next Actions"])
+    if isinstance(next_actions, list) and next_actions:
+        lines.extend([f"- {str(item).strip()}" for item in next_actions if str(item).strip()])
+    else:
+        lines.append("- No immediate next actions were provided.")
+
+    return "\n".join(lines).strip()
+
+
+def render_final_report(task: WorkflowTask, quality_report: dict | None = None) -> str:
+    raw = task.steps[-1].output if task.steps else ""
+    text = (raw or "").strip()
+    if not text:
+        return "No answer generated."
+    text = _sanitize_markdown_artifacts(text)
+    text = _humanize_internal_tool_mentions(text)
+    return text
 
 
 def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
@@ -1135,17 +1216,13 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
             "- Apply these directives even when they change tool choice, sequence, or output shape.\n"
             "- If any directive cannot be fully satisfied, explain the blocker and fallback explicitly.\n"
         )
-    researcher_ranking_guardrail = ""
-    if step.step_id == "step_2" and "researcher_discovery" in task.intent_tags:
-        researcher_ranking_guardrail = (
-            "\nResearcher ranking requirements:\n"
-            "- Treat requests using terms like top/most active/prominent as quantitative ranking tasks.\n"
-            "- Prioritize `rank_researchers_by_activity` with topic query and an explicit fromYear.\n"
-            "- Cross-check shortlisted names with `search_openalex_works` before final ranking.\n"
-            "- Do not build the final ranking from only a few first-authors of review/case papers.\n"
-            "- If ranking tools time out or return errors, pivot to publication-based tools (`search_openalex_works`, `search_pubmed_advanced`, `get_pubmed_author_profile`) in the same step.\n"
-            "- Do not switch to a clinical-trials-only fallback for top researcher ranking unless the user explicitly asks for trial investigators.\n"
-            "- If ranking tools fail, report blocked status with exact error evidence instead of presenting a confident top list.\n"
+    prioritization_guardrail = ""
+    if task.request_type in {"prioritization", "comparison"} and step.recommended_tools:
+        prioritization_guardrail = (
+            "\nPrioritization/comparison requirements:\n"
+            "- Use explicit criteria or scoring dimensions whenever ranking/comparing candidates.\n"
+            "- If a high-priority evidence axis is missing, mark conclusions provisional and call out the gap.\n"
+            "- Avoid presenting confident rank order when primary tools return degraded or empty outputs.\n"
         )
     step_freshness_guardrail = (
         "\nExecution integrity requirements:\n"
@@ -1157,11 +1234,6 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
             "- Output must include `decomposition_subtasks` as a numbered list (3-5 concrete sub-tasks).\n"
             "- Each sub-task must be executable and reflect intended tool/data operations.\n"
         )
-        if "researcher_discovery" in task.intent_tags:
-            step_freshness_guardrail += (
-                "- For researcher discovery, include these operations in order: "
-                "query disease/topic context -> identify publications -> find authors -> assess activity.\n"
-            )
         if revision:
             step_freshness_guardrail += (
                 f"- Explicitly acknowledge this revision and apply it: {revision}\n"
@@ -1179,15 +1251,45 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
         step_freshness_guardrail += (
             "- Final output format: Recommendation first, then Rationale narrative, then Methodology, then Next Actions.\n"
             "- The first recommendation sentence must include at least one inline citation ID (PMID/NCT/DOI/OpenAlex) from executed evidence.\n"
+            "- When citing papers, provide full formatted citations (author(s), year, title, source) rather than only IDs.\n"
+            "- Include DOI as a clickable markdown link when available (for example, [DOI:10.xxxx/xxxx](https://doi.org/10.xxxx/xxxx)).\n"
+            "- Add a final `References` section with numbered APA-style citations for papers used in the answer.\n"
+            "- Recommendation must state a concrete decision (e.g., choose/prioritize/deprioritize/go-no-go/rank) tied to the user objective.\n"
+            "- Do not use placeholder language such as 'The available evidence supports the recommendation below.'\n"
             "- Keep the narrative concise and avoid repeating full evidence lists already stated in prior steps.\n"
             "- Limit Next Actions to 3 concrete items.\n"
         )
-        if "researcher_discovery" in task.intent_tags:
-            step_freshness_guardrail += (
-                "- Include at least one PMID citation in the final synthesis when PubMed evidence is available.\n"
-            )
+    role_directive = "executor"
+    if step.step_id == "step_1" or step.subgoal_id == "sg_scope":
+        role_directive = "planner"
+    elif step.subgoal_id == "sg_critique":
+        role_directive = "critic"
+    elif task.steps and step.step_id == task.steps[-1].step_id:
+        role_directive = "report_synthesizer"
+
+    tool_shortlist_context = ""
+    if step.allowed_tools:
+        preview = ", ".join(step.allowed_tools[:10])
+        detail_lines = [line for line in step.observations if str(line).strip().startswith("- ")]
+        details = "\n".join(detail_lines[:6]) if detail_lines else ""
+        tool_shortlist_context = (
+            "\nDynamic tool shortlist for this step:\n"
+            f"- {preview}\n"
+            f"{details}\n"
+            "- Use this shortlist as the primary search space unless escalation is explicitly justified.\n"
+        )
+
+    evidence_requirements = [str(item).strip() for item in step.evidence_requirements if str(item).strip()]
+    evidence_requirements_block = ""
+    if evidence_requirements:
+        evidence_requirements_block = (
+            "\nEvidence requirements for this subgoal:\n"
+            f"- {', '.join(evidence_requirements)}\n"
+        )
+
     return (
         "You are executing a co-investigator workflow.\n"
+        f"Active role: {role_directive}\n"
         f"Task objective: {task.objective}\n"
         f"Current step: {step.title}\n"
         f"Step instruction: {step.instruction}\n\n"
@@ -1205,8 +1307,11 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
         "If tools are insufficient, state a fallback strategy instead of blocking.\n"
         "Do not introduce factual claims from background/domain memory when they are not supported by captured tool output in this step.\n"
         "If high-priority evidence is missing due to tool failures, mark conclusions as provisional and carry the gap forward explicitly.\n"
+        "When citing literature, use full citations and include DOI markdown links when available; avoid citation IDs alone.\n"
         "Use source citations whenever possible (PMID, NCT IDs).\n"
+        f"{tool_shortlist_context}"
+        f"{evidence_requirements_block}"
         f"{revision_directive_block}"
         f"{step_freshness_guardrail}"
-        f"{researcher_ranking_guardrail}"
+        f"{prioritization_guardrail}"
     )

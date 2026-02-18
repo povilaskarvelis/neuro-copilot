@@ -1,6 +1,6 @@
 # AI Co-Scientist
 
-An AI-powered co-investigator for preclinical drug target discovery.
+An agentic AI co-investigator for scientific discovery and target evaluation.
 
 ## What It Does
 
@@ -9,16 +9,16 @@ The AI Co-Scientist helps researchers:
 - **Evaluate druggability** of potential targets
 - **Find clinical trial evidence** from ClinicalTrials.gov
 - **Search scientific literature** via PubMed
-- **Run explicit multi-step workflows** (plan -> execute -> checkpoint -> synthesize)
-- **Track workflow state** in terminal sessions with resumable task IDs
-- **Synthesize findings** with citations and actionable recommendations
+- **Generate dynamic, query-specific plans** from model reasoning + available tools
+- **Run stateful workflows** with resumable task IDs and HITL checkpoints
+- **Synthesize final reports** directly from final-step model output
 
 ## Architecture
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │                AI Co-Scientist Orchestrator                   │
-│                (Google ADK + Gemini + Planner)                │
+│           (Google ADK + Gemini + dynamic planner)             │
 └──────────────────────────┬────────────────────────────────────┘
                            │ Step execution + HITL checkpoint
 ┌──────────────────────────▼────────────────────────────────────┐
@@ -28,9 +28,47 @@ The AI Co-Scientist helps researchers:
                            │ MCP Protocol
 ┌──────────────────────────▼────────────────────────────────────┐
 │                    Research MCP Server                         │
-│  33 Tools: disease/target, trials, literature, omics, pathways │
+│   Domain tools for targets, trials, literature, genomics, etc. │
 └───────────────────────────────────────────────────────────────┘
 ```
+
+## Dynamic Workflow (Detailed)
+
+The flow below highlights where LLM reasoning is required versus deterministic runtime guardrails.
+
+```mermaid
+flowchart TD
+    A[User Query] --> B[Intent + Task Bootstrap]
+    B --> C{{LLM: Intent classification and objective interpretation}}
+    C --> D{{LLM: Draft dynamic plan graph from tools + objective}}
+    D --> E[Normalize + persist plan version]
+    E --> F[Open initial HITL checkpoint]
+    F --> G{User action}
+    G -->|Start/Continue| H[Execute next planned step]
+    G -->|Revise once| I{{LLM: Parse revision intent + replan remaining steps}}
+    I --> E
+    G -->|Stop| Z[Task paused/blocked]
+
+    H --> J{{LLM: Step reasoning + tool-call decisions}}
+    J --> K[MCP tool execution + trace capture]
+    K --> L[Quality signals update]
+    L --> M{Adaptive checkpoint needed?}
+    M -->|Yes| F
+    M -->|No| N{More steps remain?}
+    N -->|Yes| H
+    N -->|No| O{{LLM: Final synthesis/report step output}}
+    O --> P[Persist canonical report markdown + PDF]
+    P --> Q[UI/CLI render same report content]
+
+    classDef llm fill:#e6f7ff,stroke:#1890ff,stroke-width:2px;
+    classDef guard fill:#f6ffed,stroke:#52c41a,stroke-width:1px;
+    class C,D,I,J,O llm;
+    class B,E,F,H,K,L,M,N,P,Q,Z guard;
+```
+
+Legend:
+- **Blue nodes** = LLM-required reasoning/synthesis steps.
+- **Green nodes** = deterministic runtime orchestration, persistence, and guardrails.
 
 ## Quick Start
 
@@ -81,25 +119,19 @@ Then ask questions like:
 - *"What clinical trials exist for Alzheimer's treatments?"*
 
 In co-investigator mode, each request now:
-1. prints a 2-3 step plan,
-2. executes step 1,
-3. pauses at a human-in-the-loop checkpoint (`continue`, `revise <scope>`, `stop`),
-4. then produces a structured final report.
+1. builds a dynamic plan for the specific objective,
+2. executes evidence steps with adaptive checkpointing,
+3. supports one revision opportunity after initial plan creation,
+4. runs straight through to synthesis/reporting (no forced checkpoint right before synthesis),
 5. saves report artifacts to `adk-agent/reports/<task_id>.md` and `adk-agent/reports/<task_id>.pdf`.
 
 PDF rendering behavior:
 - Uses a high-fidelity HTML/CSS pipeline via headless Chrome/Chromium when available.
 - Falls back to internal ReportLab rendering when Chrome/Chromium is unavailable.
 
-General response contract used for broad request coverage:
-- `Request Understanding`
-- `Plan`
-- `Execution Log`
-- `Checkpoint History`
-- `Findings`
-- `Evidence`
-- `Limitations & Risks`
-- `Next Actions`
+Final report behavior:
+- UI and terminal both use the same canonical report source.
+- Final report is the model's final-step report markdown (rendered in UI, plain in terminal).
 
 Terminal commands:
 - `status`: show current or latest workflow status
@@ -112,16 +144,17 @@ Terminal commands:
 
 ```
 ├── adk-agent/              # AI Co-Scientist Agent (Python)
-│   ├── agent.py            # Main agent with Gemini
-│   ├── workflow.py         # Planner/task model/report rendering
-│   ├── task_state_store.py # Lightweight JSON persistence for workflows
-│   ├── co_scientist/       # Agent module for evaluation
-│   ├── evals/              # ADK evaluation test cases
-│   ├── test_accuracy.py    # Data validation tests
-│   └── README.md           # Agent documentation
+│   ├── agent.py            # Runtime orchestration + execution loop
+│   ├── workflow.py         # Task model, planning helpers, report rendering
+│   ├── ui_server.py        # FastAPI server for web UI
+│   ├── ui/                 # Frontend app
+│   ├── task_state_store.py # JSON persistence for workflow state
+│   ├── co_scientist/       # Runtime/planning/domain modules
+│   ├── reports/            # Runtime-generated report artifacts (safe to clear)
+│   └── test_*.py           # Lean core regression suite
 │
 ├── research-mcp/           # Research Tools Server (Node.js)
-│   ├── server.js           # MCP server with 30 tools
+│   ├── server.js           # MCP tool server
 │   ├── data/               # Local datasets
 │   └── README.md           # Tools documentation
 │
@@ -149,48 +182,22 @@ Terminal commands:
 
 ## Testing
 
+Core regression tests (recommended default):
+
 ```bash
 cd adk-agent
-
-# Test data accuracy (API responses)
-python test_accuracy.py
-
-# Test MCP connection
-python test_mcp.py
-
-# Run agent evaluations
-pytest test_agent_eval.py -v
-
-# Run co-investigator workflow evaluation
-pytest test_agent_eval.py::test_co_investigator_workflow -v
-
-# Run generalized co-investigator contract evaluation
-pytest test_agent_eval.py::test_co_investigator_general_contract -v
-
-# Run researcher discovery workflow evaluation
-pytest test_agent_eval.py::test_researcher_discovery -v
-
-# Run variant + pathway workflow evaluation
-pytest test_agent_eval.py::test_variant_pathway -v
-
-# Run toolbox expansion evaluation (trial landscape + chemistry + ontology)
-pytest test_agent_eval.py::test_toolbox_expansion -v
-
-# Run Sprint 2 evaluation (expression/cell context + direction-of-effect)
-pytest test_agent_eval.py::test_sprint2_context_direction -v
-
-# Run Sprint 3 evaluation (competition + safety liabilities)
-pytest test_agent_eval.py::test_sprint3_competition_safety -v
-
-# Run Sprint 4 evaluation (multi-axis target ranking)
-pytest test_agent_eval.py::test_sprint4_target_ranking -v
-
-# Run Sprint 5 evaluation (custom ranking weights)
-pytest test_agent_eval.py::test_sprint5_custom_weights -v
-
-# Run Sprint 6 evaluation (auto mode selection + minimal clarification)
-pytest test_agent_eval.py::test_sprint6_auto_mode_clarification -v
+pytest test_agentic_phase_flow.py test_ui_server_hitl.py test_agentic_workflow_eval.py test_agentic_invariants.py test_task_state_store.py test_report_pdf.py -q
 ```
+
+This suite covers:
+- agentic phase transitions and checkpoint behavior
+- UI runtime/HITL flow and report availability
+- dynamic planner/workflow invariants
+- task state persistence and report PDF generation
+
+Notes:
+- External network/eval harness tests were removed from the default suite to keep CI/dev runs deterministic and fast.
+- Generated artifacts in `adk-agent/reports/` are runtime outputs and can be safely deleted.
 
 One-command acceptance demo (fixed challenge scenarios + deterministic scoreboard):
 

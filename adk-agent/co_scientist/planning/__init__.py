@@ -4,7 +4,6 @@ from .intent import (
     AMBIGUOUS_ABBREVIATIONS,
     QUERY_TYPO_REPLACEMENTS,
     build_clarification_request,
-    build_deterministic_clarification_request,
     build_model_clarification_request,
     build_model_intent_route,
     coerce_model_intent_tags,
@@ -18,7 +17,6 @@ from .intent import (
     route_query_intent,
 )
 from .revision import (
-    build_deterministic_revision_intent,
     coerce_str_list,
     dedupe_compact,
     extract_primary_objective_text,
@@ -33,8 +31,6 @@ from .revision import (
 )
 from .workflow_planning import (
     CAPABILITY_PATTERNS,
-    RECOGNIZED_TOOL_NAMES,
-    TOOL_CAPABILITIES,
     VALID_INTENT_TAGS,
     VALID_REQUEST_TYPES,
     active_plan_version,
@@ -50,21 +46,16 @@ from .workflow_planning import (
     replan_remaining_steps,
     sanitize_intent_tags,
     sanitize_request_type,
-    tool_bundle_for_intent,
 )
 
 __all__ = [
     "AMBIGUOUS_ABBREVIATIONS",
     "QUERY_TYPO_REPLACEMENTS",
     "CAPABILITY_PATTERNS",
-    "RECOGNIZED_TOOL_NAMES",
-    "TOOL_CAPABILITIES",
     "VALID_INTENT_TAGS",
     "VALID_REQUEST_TYPES",
     "active_plan_version",
     "build_clarification_request",
-    "build_deterministic_clarification_request",
-    "build_deterministic_revision_intent",
     "build_model_clarification_request",
     "build_model_intent_route",
     "build_plan_delta",
@@ -99,5 +90,4 @@ __all__ = [
     "route_query_intent",
     "sanitize_intent_tags",
     "sanitize_request_type",
-    "tool_bundle_for_intent",
 ]

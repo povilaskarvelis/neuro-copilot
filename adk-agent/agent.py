@@ -37,16 +37,21 @@ from report_pdf import write_markdown_pdf
 from task_state_store import TaskStateStore
 from co_scientist.planning import intent as _planning_intent
 from co_scientist.planning import revision as _planning_revision
+from co_scientist.planning import workflow_planning as _workflow_planning
 from co_scientist.presentation import cli_output as _presentation_cli
 from co_scientist.presentation import hitl_summary as _presentation_hitl
 from co_scientist.runtime import execution as _runtime_exec
+from co_scientist.runtime import event_orchestrator as _runtime_events
 from co_scientist.runtime import quality_gates as _runtime_quality
+from co_scientist.runtime.tool_registry import ToolRegistry
 from workflow import (
     RevisionIntent,
     WorkflowTask,
     active_plan_version,
+    classify_request_type,
     create_task,
     extract_evidence_refs,
+    infer_intent_tags,
     initialize_plan_version,
     replan_remaining_steps,
     render_final_report,
@@ -54,150 +59,62 @@ from workflow import (
     sanitize_intent_tags,
     sanitize_request_type,
     step_prompt,
-    tool_bundle_for_intent,
 )
 
 # Path to the MCP server
 MCP_SERVER_DIR = Path(__file__).parent.parent / "research-mcp"
 REPORT_ARTIFACTS_DIR = Path(__file__).resolve().parent / "reports"
 STEP_TURN_TIMEOUT_SECONDS = float(os.getenv("ADK_STEP_TURN_TIMEOUT_SECONDS", "150"))
+DYNAMIC_TOOL_REGISTRY_ENABLED = os.getenv("ADK_DYNAMIC_TOOL_REGISTRY", "1").strip().lower() not in {"0", "false", "no"}
+DYNAMIC_PLANNER_GRAPH_ENABLED = os.getenv("ADK_DYNAMIC_PLANNER_GRAPH", "1").strip().lower() not in {"0", "false", "no"}
+DYNAMIC_TOOL_RETRIEVAL_ENABLED = os.getenv("ADK_DYNAMIC_TOOL_RETRIEVAL", "1").strip().lower() not in {"0", "false", "no"}
+CRITIC_LOOP_QUALITY_MODEL_ENABLED = os.getenv("ADK_CRITIC_LOOP_QUALITY_MODEL", "1").strip().lower() not in {"0", "false", "no"}
 
 
-AGENT_INSTRUCTION = """You are an AI co-scientist specializing in preclinical drug target discovery.
-Your goal is to help researchers explore biomedical data, generate hypotheses, and evaluate drug targets.
+AGENT_INSTRUCTION = """You are an agentic AI research assistant operating like a high-level research intern.
+Think in iterative Plan-Act-Reflect cycles.
+Use tools to gather evidence, keep provenance, and state uncertainty explicitly.
+After each major phase, pause and ask the user for confirmation before continuing.
+Always end with a decision-ready final report grounded in captured evidence."""
 
-## Available Tools
-You have access to 33 tools through the MCP server:
+PLANNER_PROMPT = """You are the planning role for an agentic scientific workflow.
+Generate query-specific subgoals, dependencies, and evidence requirements.
+Avoid rigid templates when a custom decomposition is better."""
 
-**Disease & Target Discovery:**
-- search_diseases: Find diseases by name, get their IDs
-- search_disease_targets: Find drug targets associated with a disease
-- get_target_info: Get detailed information about a target
-- search_targets: Search for targets by gene symbol
+PLANNER_GRAPH_SCHEMA_PROMPT = """Return strict JSON only with this schema:
+{
+  "subgoals": [
+    {
+      "subgoal_id": string,
+      "title": string,
+      "objective": string,
+      "dependencies": [string],
+      "evidence_requirements": [string],
+      "done_criteria": [string],
+      "max_calls": number,
+      "phase": "evidence_discovery" | "researcher_scouting" | "synthesis_reporting"
+    }
+  ]
+}
 
-**Druggability Assessment:**
-- check_druggability: Assess if a target can be targeted by drugs
-- get_target_drugs: Find existing drugs for a target
-
-**Clinical Evidence:**
-- search_clinical_trials: Search ClinicalTrials.gov
-- get_clinical_trial: Get detailed trial info including results
-- summarize_clinical_trials_landscape: Aggregate status/phase patterns and common termination reasons
-
-**Chemistry Evidence:**
-- search_chembl_compounds_for_target: Find target-linked compounds with potency evidence from ChEMBL
-
-**Literature:**
-- search_pubmed: Search PubMed for papers
-- get_pubmed_abstract: Get full abstract for a paper
-- search_pubmed_advanced: Advanced PubMed search with filters
-- get_pubmed_paper_details: PubMed details including authors/affiliations
-- get_pubmed_author_profile: Aggregate author publication profile
-
-**Researcher Discovery:**
-- search_openalex_works: Search literature with OpenAlex metadata
-- search_openalex_authors: Find author entities and institutions
-- rank_researchers_by_activity: Rank researchers with transparent activity score
-- get_researcher_contact_candidates: Candidate public contact/profile signals
-
-**Gene Information:**
-- get_gene_info: Get gene details from NCBI
-
-**Variants, Genomics, and Pathways:**
-- search_clinvar_variants: Search ClinVar records
-- get_clinvar_variant_details: Detailed ClinVar record metadata
-- search_gwas_associations: GWAS trait/gene/rsID associations
-- search_reactome_pathways: Pathway lookup in Reactome
-- get_string_interactions: Protein interaction network lookup (STRING)
-
-**Ontology Context:**
-- expand_disease_context: Expand disease terms into IDs/synonyms/hierarchy for better retrieval coverage
-
-**Expression & Cell Context:**
-- summarize_target_expression_context: Summarize target tissue/cell expression context from Open Targets
-
-**Genetic Direction-of-Effect:**
-- infer_genetic_effect_direction: Infer risk-increasing vs protective genetic signals from GWAS for gene+disease
-
-**Competitive & Safety Intelligence:**
-- summarize_target_competitive_landscape: Summarize phase/disease/mechanism competition density for a target
-- summarize_target_safety_liabilities: Summarize adverse liability signals, directions, and tissue contexts
-
-**Comparative Prioritization:**
-- compare_targets_multi_axis: Rank multiple targets with transparent weighted scores across evidence axes (supports user-defined custom weights and auto mode selection from goal text)
-
-**Local Data:**
-- list_local_datasets: List available local data files
-- read_local_dataset: Read a local CSV/TSV file
-
-## Workflow for Drug Target Discovery
-
-1. **Understand the Disease**
-   - Use search_diseases to find the disease and get its ID
-   - Use expand_disease_context to broaden disease synonyms and ontology context
-   - Note related diseases that might share targets
-
-2. **Identify Candidate Targets**
-   - Use search_disease_targets to get targets ranked by evidence
-   - Note the association scores and evidence types
-
-3. **Evaluate Top Candidates**
-   For each promising target:
-   - Use get_target_info for biological function and pathways
-   - Use check_druggability to assess if it can be targeted by drugs
-   - Use get_target_drugs to see existing drug landscape
-   - Use search_chembl_compounds_for_target to assess preclinical chemical matter and potency signals
-   - Use summarize_target_expression_context to assess tissue/cell specificity context
-   - Use infer_genetic_effect_direction to assess risk/protective genetic directionality in disease context
-   - Use summarize_target_competitive_landscape to assess how crowded the indication/mechanism space is
-   - Use summarize_target_safety_liabilities to identify likely modality-specific safety risks
-   - Use compare_targets_multi_axis when comparing or ranking multiple targets for prioritization
-
-4. **Check Clinical Evidence**
-   - Use search_clinical_trials to find relevant trials
-   - Use summarize_clinical_trials_landscape to identify phase/status patterns and failure signals
-   - Use get_clinical_trial for trials that have results
-   - Pay special attention to TERMINATED trials - understand WHY they failed
-
-5. **Gather Literature Support**
-   - Use search_pubmed for recent research
-   - Use get_pubmed_abstract for key papers
-
-6. **Synthesize Recommendation**
-   Provide a clear recommendation with:
-   - Top target(s) ranked by potential
-   - Evidence strength (cite PMIDs, NCT IDs)
-   - Druggability assessment
-   - Risks (failed trials, competition, safety concerns)
-   - Suggested next steps
-
-## Important Guidelines
-- Always cite your sources with PMIDs or NCT IDs
-- Acknowledge uncertainty when evidence is limited
-- Highlight both opportunities AND risks
-- Consider failed clinical trials as valuable negative evidence
-- If a target has failed in trials, explain why it might still be worth pursuing (or not)
-
-## Response Style
-- Be thorough but concise
-- Use structured formatting (headers, bullet points)
-- Quantify when possible (e.g., "87% association score", "6 drugs in development")
-- End with actionable recommendations
-
-## Co-Investigator Workflow Requirements
-- When asked to work on a complex request, think and act in explicit steps.
-- Cite evidence with PMIDs and NCT IDs whenever possible.
-- Be transparent about uncertainty and data gaps.
-- Use this general response contract:
-  1) Request Understanding
-  2) Plan
-  3) Execution Log
-  4) Checkpoint Note
-  5) Findings
-  6) Evidence
-  7) Limitations & Risks
-  8) Next Actions
+Rules:
+- Build a custom plan for this specific query; do not use generic template naming.
+- Keep 2-6 subgoals.
+- Dependencies must reference earlier subgoal_id values only.
+- Avoid including a final-report step; final synthesis is added by runtime guardrail.
+- Use concise, actionable objectives with explicit evidence intent.
 """
+
+EXECUTOR_PROMPT = """You are the execution role for an agentic scientific workflow.
+Use only currently allowed tools, gather evidence efficiently, and report residual uncertainty."""
+
+CRITIC_PROMPT = """You are the critic/verifier role for an agentic scientific workflow.
+Assess evidence sufficiency, contradictions, and confidence calibration before final recommendation."""
+
+REPORT_SYNTHESIZER_PROMPT = """You are the reporting role for an agentic scientific workflow.
+Produce a decision-ready final report with explicit recommendation, rationale, limitations, and next actions."""
+
+_TOOL_REGISTRY = ToolRegistry()
 
 CLARIFIER_INSTRUCTION = """You are an ambiguity and typo triage assistant for biomedical queries.
 Your only job is to decide if clarification is needed BEFORE any research tools run.
@@ -305,10 +222,6 @@ def _find_ambiguous_abbreviations(query: str) -> list[tuple[str, list[str]]]:
     return _planning_intent.find_ambiguous_abbreviations(query)
 
 
-def _build_deterministic_clarification_request(query: str) -> str | None:
-    return _planning_intent.build_deterministic_clarification_request(query)
-
-
 def _merge_query_with_clarification(original_query: str, clarification: str) -> str:
     return _planning_intent.merge_query_with_clarification(original_query, clarification)
 
@@ -408,10 +321,6 @@ def _coerce_str_list(value) -> list[str]:
     return _planning_revision.coerce_str_list(value)
 
 
-def _build_deterministic_revision_intent(feedback: str) -> RevisionIntent:
-    return _planning_revision.build_deterministic_revision_intent(feedback)
-
-
 async def _parse_revision_intent(
     feedback: str,
     *,
@@ -488,6 +397,53 @@ async def _route_query_intent(
     )
 
 
+async def _draft_model_plan_graph(
+    objective: str,
+    *,
+    request_type: str,
+    intent_tags: list[str],
+    planner_runner=None,
+    planner_session_id: str | None = None,
+    user_id: str = "researcher",
+) -> list[dict] | None:
+    if planner_runner is None or not planner_session_id:
+        return None
+    tool_summary = _TOOL_REGISTRY.summary(max_tools=80)
+    tool_lines = []
+    for item in tool_summary[:50]:
+        name = str(item.get("name", "")).strip()
+        caps = ", ".join(str(cap).strip() for cap in item.get("capabilities", [])[:5] if str(cap).strip())
+        if not name:
+            continue
+        tool_lines.append(f"- {name} ({caps or 'uncategorized'})")
+    prompt = (
+        f"{PLANNER_PROMPT}\n\n"
+        f"{PLANNER_GRAPH_SCHEMA_PROMPT}\n\n"
+        f"Objective: {objective}\n"
+        f"Request type: {request_type}\n"
+        f"Intent tags: {', '.join(intent_tags) if intent_tags else 'none'}\n"
+        "Available tools (name + inferred capabilities):\n"
+        f"{chr(10).join(tool_lines) if tool_lines else '- none'}\n"
+    )
+    try:
+        raw = await _run_runner_turn(planner_runner, planner_session_id, user_id, prompt)
+    except Exception:
+        return None
+    payload = _extract_json_payload(raw)
+    if not isinstance(payload, dict):
+        return None
+    raw_subgoals = payload.get("subgoals")
+    if not isinstance(raw_subgoals, list):
+        return None
+    normalized = _workflow_planning.normalize_plan_graph(
+        raw_subgoals,
+        objective=objective,
+        intent_tags=intent_tags,
+        request_type=request_type,
+    )
+    return normalized or None
+
+
 def create_clarifier_agent():
     """Create a no-tool clarification agent for ambiguity/typo triage."""
     return Agent(
@@ -538,6 +494,26 @@ def create_progress_summarizer_agent():
     )
 
 
+def create_planner_agent():
+    """Create a no-tool planner for dynamic graph drafting."""
+    return Agent(
+        name="planner",
+        model="gemini-2.5-flash",
+        instruction=PLANNER_PROMPT,
+        tools=[],
+    )
+
+
+def create_critic_agent():
+    """Create a no-tool critic/verifier for quality reflection."""
+    return Agent(
+        name="critic",
+        model="gemini-2.5-flash",
+        instruction=CRITIC_PROMPT,
+        tools=[],
+    )
+
+
 def create_agent(tool_filter: list[str] | None = None):
     """Create the ADK agent with MCP tools."""
     # Configure MCP server connection
@@ -566,7 +542,7 @@ def create_agent(tool_filter: list[str] | None = None):
     agent = Agent(
         name="co_scientist",
         model="gemini-2.5-flash",
-        instruction=f"{AGENT_INSTRUCTION}{_runtime_tool_constraint_suffix(tool_filter)}",
+        instruction=f"{EXECUTOR_PROMPT}\n\n{AGENT_INSTRUCTION}{_runtime_tool_constraint_suffix(tool_filter)}",
         tools=agent_tools,
     )
 
@@ -574,7 +550,12 @@ def create_agent(tool_filter: list[str] | None = None):
 
 
 STEP_SCOPE_TOOLS = _runtime_exec.STEP_SCOPE_TOOLS
-STEP_EVIDENCE_BACKSTOP_TOOLS = _runtime_exec.STEP_EVIDENCE_BACKSTOP_TOOLS
+
+
+async def _refresh_tool_registry(mcp_tools) -> int:
+    if not DYNAMIC_TOOL_REGISTRY_ENABLED:
+        return 0
+    return await _TOOL_REGISTRY.refresh_from_mcp_toolset(mcp_tools, merge=True)
 
 
 def _is_reasoning_only_step(task: WorkflowTask, step_idx: int) -> bool:
@@ -582,7 +563,8 @@ def _is_reasoning_only_step(task: WorkflowTask, step_idx: int) -> bool:
 
 
 def _build_step_allowed_tools(task: WorkflowTask, step_idx: int) -> list[str]:
-    return _runtime_exec.build_step_allowed_tools(task, step_idx, tool_bundle_for_intent)
+    registry = _TOOL_REGISTRY if DYNAMIC_TOOL_RETRIEVAL_ENABLED else None
+    return _runtime_exec.build_step_allowed_tools(task, step_idx, tool_registry=registry)
 
 
 def _should_escalate_allowlist(step, trace_entries: list[dict], output: str) -> bool:
@@ -590,7 +572,8 @@ def _should_escalate_allowlist(step, trace_entries: list[dict], output: str) -> 
 
 
 def _build_escalated_allowed_tools(task: WorkflowTask, step_idx: int) -> list[str]:
-    return _runtime_exec.build_escalated_allowed_tools(task, step_idx, tool_bundle_for_intent)
+    registry = _TOOL_REGISTRY if DYNAMIC_TOOL_RETRIEVAL_ENABLED else None
+    return _runtime_exec.build_escalated_allowed_tools(task, step_idx, tool_registry=registry)
 
 
 def _create_step_runner(base_runner, allowed_tools: list[str]):
@@ -745,22 +728,6 @@ def _render_quality_gate_message(report: dict) -> str:
     return _runtime_quality.render_quality_gate_message(report)
 
 
-def _clean_recovery_text(text: str) -> str:
-    return _runtime_quality.clean_recovery_text(text)
-
-
-async def _run_fallback_recovery(runner, session_id: str, user_id: str, task: WorkflowTask) -> tuple[str, list[dict]]:
-    return await _runtime_quality.run_fallback_recovery(
-        runner,
-        session_id,
-        user_id,
-        task,
-        run_runner_turn_with_trace_fn=_run_runner_turn_with_trace,
-        format_step_execution_error_fn=_format_step_execution_error,
-        clean_recovery_text_fn=_clean_recovery_text,
-    )
-
-
 async def _complete_remaining_steps(runner, session_id: str, user_id: str, task: WorkflowTask, state_store: TaskStateStore) -> dict:
     return await _runtime_quality.complete_remaining_steps(
         runner,
@@ -771,9 +738,12 @@ async def _complete_remaining_steps(runner, session_id: str, user_id: str, task:
         execute_step_fn=_execute_step,
         evaluate_quality_gates_fn=_evaluate_quality_gates,
         render_quality_gate_message_fn=_render_quality_gate_message,
-        run_fallback_recovery_fn=_run_fallback_recovery,
         print_fn=print,
     )
+
+
+def _revision_opportunity_used(task: WorkflowTask) -> bool:
+    return sum(1 for item in (task.hitl_history or []) if str(item).startswith("revise:")) >= 1
 
 
 def _format_checkpoint_reason(reason: str) -> str:
@@ -799,10 +769,22 @@ async def _apply_feedback_replan_cli(
     *,
     intent_router_runner=None,
     intent_router_session_id: str | None = None,
+    planner_runner=None,
+    planner_session_id: str | None = None,
     feedback_parser_runner=None,
     feedback_parser_session_id: str | None = None,
     gate_reason: str = "feedback_replan",
 ) -> WorkflowTask:
+    if _revision_opportunity_used(task):
+        print("\nRevision already used for this task. Continuing with current plan.")
+        task.hitl_history.append("revision_limit_reached")
+        task.awaiting_hitl = True
+        task.checkpoint_state = "open"
+        task.checkpoint_reason = "feedback_replan_limit_reached"
+        task.touch()
+        state_store.save_task(task, note="feedback_replan_limit_reached")
+        return task
+
     if not task.base_objective:
         task.base_objective = task.objective
 
@@ -827,6 +809,14 @@ async def _apply_feedback_replan_cli(
     )
     request_type = str(intent_route.get("request_type", task.request_type) or task.request_type)
     intent_tags = list(intent_route.get("intent_tags", task.intent_tags) or task.intent_tags)
+    model_plan_graph = await _draft_model_plan_graph(
+        revised_objective,
+        request_type=request_type,
+        intent_tags=intent_tags,
+        planner_runner=planner_runner,
+        planner_session_id=planner_session_id,
+        user_id=user_id,
+    )
 
     replan_remaining_steps(
         task,
@@ -835,8 +825,17 @@ async def _apply_feedback_replan_cli(
         intent_tags=intent_tags,
         revision_intent=merged_intent,
         gate_reason=gate_reason,
+        use_dynamic_planner=DYNAMIC_PLANNER_GRAPH_ENABLED,
+        tool_registry_summary=_TOOL_REGISTRY.summary(max_tools=120),
+        plan_graph_override=model_plan_graph,
     )
     task.hitl_history.append(f"revise:{feedback_text}")
+    _runtime_events.append_event(
+        task,
+        _runtime_events.EVENT_CHECKPOINT_REVISED,
+        reason=gate_reason,
+        feedback=feedback_text,
+    )
     task.pending_feedback_queue = []
     task.awaiting_hitl = True
     task.checkpoint_state = "open"
@@ -898,12 +897,6 @@ async def _execute_until_next_gate_or_completion_cli(
 
     quality = _evaluate_quality_gates(task)
     print("\n" + _render_quality_gate_message(quality))
-    if not quality["passed"]:
-        print("\nRunning one fallback recovery pass...")
-        recovery, recovery_trace = await _run_fallback_recovery(runner, session_id, user_id, task)
-        task.fallback_tool_trace = recovery_trace
-        task.fallback_recovery_notes = recovery or ""
-        quality = _evaluate_quality_gates(task)
     return "completed", quality
 
 
@@ -978,6 +971,8 @@ async def _start_new_workflow_task(
     state_store: TaskStateStore,
     objective: str,
     intent_route: dict | None = None,
+    planner_runner=None,
+    planner_session_id: str | None = None,
     task_id_override: str | None = None,
     created_at_override: str | None = None,
     hitl_history_seed: list[str] | None = None,
@@ -989,6 +984,14 @@ async def _start_new_workflow_task(
         routed_objective = _merge_objective_with_revision(routed_objective, original_revision_directive)
     routed_request_type = sanitize_request_type(str(route.get("request_type", "")).strip())
     routed_intent_tags = sanitize_intent_tags(route.get("intent_tags"))
+    model_plan_graph = await _draft_model_plan_graph(
+        routed_objective,
+        request_type=routed_request_type or classify_request_type(routed_objective),
+        intent_tags=routed_intent_tags or infer_intent_tags(routed_objective),
+        planner_runner=planner_runner,
+        planner_session_id=planner_session_id,
+        user_id=user_id,
+    )
     revision_directive = _extract_revision_directive_from_objective(routed_objective)
     revision_timeframe = _extract_timeframe_hint(revision_directive or "")
     if revision_directive:
@@ -1003,6 +1006,9 @@ async def _start_new_workflow_task(
         routed_objective,
         request_type_override=routed_request_type,
         intent_tags_override=routed_intent_tags,
+        use_dynamic_planner=DYNAMIC_PLANNER_GRAPH_ENABLED,
+        tool_registry_summary=_TOOL_REGISTRY.summary(max_tools=120),
+        plan_graph_override=model_plan_graph,
     )
     task.base_objective = _extract_primary_objective_text(routed_objective) or routed_objective
     if task_id_override and task_id_override.strip():
@@ -1018,6 +1024,12 @@ async def _start_new_workflow_task(
     task.awaiting_hitl = True
     task.checkpoint_state = "open"
     task.checkpoint_reason = "pre_evidence_execution"
+    _runtime_events.append_event(
+        task,
+        _runtime_events.EVENT_CHECKPOINT_OPENED,
+        reason=task.checkpoint_reason,
+        payload=task.checkpoint_payload or {},
+    )
     initialize_plan_version(task, gate_reason=task.checkpoint_reason)
     task.touch()
     state_store.save_task(task, note="hitl_checkpoint_opened")
@@ -1065,6 +1077,7 @@ async def run_interactive_async():
     try:
         tools = await mcp_tools.get_tools()
         print(f"✓ Connected to MCP server ({len(tools)} tools available)")
+        await _refresh_tool_registry(mcp_tools)
     except Exception as e:
         print(f"\n❌ MCP connection failed: {e}")
         await mcp_tools.close()
@@ -1087,6 +1100,21 @@ async def run_interactive_async():
         app_name="co_scientist_intent_router",
         session_service=session_service,
     )
+    planner_runner = Runner(
+        agent=create_planner_agent(),
+        app_name="co_scientist_planner",
+        session_service=session_service,
+    )
+    planner_runner = Runner(
+        agent=create_planner_agent(),
+        app_name="co_scientist_planner",
+        session_service=session_service,
+    )
+    planner_runner = Runner(
+        agent=create_planner_agent(),
+        app_name="co_scientist_planner",
+        session_service=session_service,
+    )
     feedback_parser_runner = Runner(
         agent=create_feedback_parser_agent(),
         app_name="co_scientist_feedback_parser",
@@ -1104,6 +1132,18 @@ async def run_interactive_async():
     )
     intent_router_session = await session_service.create_session(
         app_name="co_scientist_intent_router",
+        user_id="researcher",
+    )
+    planner_session = await session_service.create_session(
+        app_name="co_scientist_planner",
+        user_id="researcher",
+    )
+    planner_session = await session_service.create_session(
+        app_name="co_scientist_planner",
+        user_id="researcher",
+    )
+    planner_session = await session_service.create_session(
+        app_name="co_scientist_planner",
         user_id="researcher",
     )
     feedback_parser_session = await session_service.create_session(
@@ -1236,6 +1276,8 @@ async def run_interactive_async():
                         state_store,
                         clarified_query,
                         intent_route=intent_route,
+                        planner_runner=planner_runner,
+                        planner_session_id=planner_session.id,
                     )
                     continue
 
@@ -1345,6 +1387,8 @@ async def run_interactive_async():
                             feedback_text=feedback_text,
                             intent_router_runner=intent_router_runner,
                             intent_router_session_id=intent_router_session.id,
+                            planner_runner=planner_runner,
+                            planner_session_id=planner_session.id,
                             feedback_parser_runner=feedback_parser_runner,
                             feedback_parser_session_id=feedback_parser_session.id,
                             gate_reason="feedback_replan",
@@ -1384,6 +1428,8 @@ async def run_interactive_async():
                     state_store,
                     user_input,
                     intent_route=intent_route,
+                    planner_runner=planner_runner,
+                    planner_session_id=planner_session.id,
                 )
                 
             except KeyboardInterrupt:
@@ -1418,12 +1464,21 @@ async def run_single_query_async(query: str, *, state_store_path: Path | None = 
         app_name="co_scientist_intent_router",
         session_service=session_service,
     )
+    planner_runner = Runner(
+        agent=create_planner_agent(),
+        app_name="co_scientist_planner",
+        session_service=session_service,
+    )
     clarifier_session = await session_service.create_session(
         app_name="co_scientist_clarifier",
         user_id="researcher",
     )
     intent_router_session = await session_service.create_session(
         app_name="co_scientist_intent_router",
+        user_id="researcher",
+    )
+    planner_session = await session_service.create_session(
+        app_name="co_scientist_planner",
         user_id="researcher",
     )
     clarification_msg = await _build_clarification_request(
@@ -1443,6 +1498,7 @@ async def run_single_query_async(query: str, *, state_store_path: Path | None = 
         )
 
     agent, mcp_tools = create_agent()
+    await _refresh_tool_registry(mcp_tools)
 
     runner = Runner(
         agent=agent,
@@ -1464,10 +1520,22 @@ async def run_single_query_async(query: str, *, state_store_path: Path | None = 
         user_id="researcher",
     )
     routed_query = str(intent_route.get("normalized_query") or query).strip() or query
+    request_type = sanitize_request_type(str(intent_route.get("request_type", "")).strip()) or classify_request_type(routed_query)
+    intent_tags = sanitize_intent_tags(intent_route.get("intent_tags")) or infer_intent_tags(routed_query)
+    model_plan_graph = await _draft_model_plan_graph(
+        routed_query,
+        request_type=request_type,
+        intent_tags=intent_tags,
+        planner_runner=planner_runner,
+        planner_session_id=planner_session.id,
+        user_id="researcher",
+    )
     task = create_task(
         routed_query,
-        request_type_override=sanitize_request_type(str(intent_route.get("request_type", "")).strip()),
-        intent_tags_override=sanitize_intent_tags(intent_route.get("intent_tags")),
+        request_type_override=request_type,
+        intent_tags_override=intent_tags,
+        tool_registry_summary=_TOOL_REGISTRY.summary(max_tools=120),
+        plan_graph_override=model_plan_graph,
     )
     state_store.save_task(task, note="task_created_single_query")
 
@@ -1476,13 +1544,6 @@ async def run_single_query_async(query: str, *, state_store_path: Path | None = 
         state_store.save_task(task, note=f"step_{idx + 1}_completed_single_query")
 
     quality = _evaluate_quality_gates(task)
-    task.fallback_recovery_notes = ""
-    task.fallback_tool_trace = []
-    if not quality["passed"]:
-        recovery, recovery_trace = await _run_fallback_recovery(runner, session.id, "researcher", task)
-        task.fallback_tool_trace = recovery_trace
-        task.fallback_recovery_notes = recovery or ""
-        quality = _evaluate_quality_gates(task)
 
     task.status = "completed"
     task.touch()

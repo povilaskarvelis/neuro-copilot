@@ -40,15 +40,16 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--bg-elev);
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  margin-bottom: 20px;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--line);
+  border-radius: 0;
+  margin-bottom: 0;
 }
 
 .sidebar-head {
   padding: 14px;
-  border-bottom: 1px solid var(--line);
+  border-bottom: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -349,7 +350,7 @@ body.expanded .landing-hero {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 14px;
+  padding: 14px 14px 14px 18px;
   flex-direction: column;
   gap: 10px;
 }
@@ -594,13 +595,28 @@ body.expanded .messages {
 
 .markdown-body li {
   margin: 0.2em 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.markdown-body li::marker {
+  color: inherit;
+  font-weight: 400;
+}
+
+.checkpoint-message .markdown-body h3 {
+  margin-top: 0.65em;
+  margin-bottom: 0.3em;
+  padding-left: 0;
+  border-left: none;
+  color: #ebf2ff;
 }
 
 /* In activity logs, visually nest bullet details under numbered workflow steps. */
 .activity-details ol + ul {
   margin-left: 0.95rem;
   padding-left: 1.35em;
-  border-left: 1px solid rgba(103, 154, 210, 0.25);
+  border-left: none;
 }
 
 .markdown-body blockquote {
@@ -693,6 +709,16 @@ body.expanded .messages {
 .report-content.markdown-body pre {
   margin: 0.95em 0;
   padding: 0.85em 0.95em;
+}
+
+.report-plain-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font: inherit;
+  line-height: inherit;
+  color: inherit;
 }
 
 .composer {

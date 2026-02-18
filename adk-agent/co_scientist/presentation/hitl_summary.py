@@ -69,18 +69,37 @@ def extract_decomposition_subtasks(text: str) -> list[str]:
 
 
 def default_hitl_subtasks(task: WorkflowTask) -> list[str]:
-    if "researcher_discovery" in task.intent_tags:
-        return [
-            "Query disease/topic context and confirm timeframe.",
-            "Identify topic-matched publications.",
-            "Extract authors and affiliations.",
-            "Rank researchers by activity and impact.",
-        ]
-    return [
-        "Confirm scope and concrete entities.",
-        "Gather evidence from primary sources.",
-        "Synthesize findings into a direct answer.",
-    ]
+    # Build fallback subtasks from the current dynamic plan state instead of intent hardcoding.
+    steps = [step for step in task.steps if step.status != "completed" and step.subgoal_id != "sg_final_report"]
+    if not steps:
+        steps = [step for step in task.steps if step.subgoal_id != "sg_final_report"]
+
+    subtasks: list[str] = []
+    for step in steps:
+        source = clean_model_text(step.instruction or step.title)
+        if not source:
+            continue
+        first_sentence = re.split(r"(?<=[.!?])\s+", source, maxsplit=1)[0].strip()
+        if len(first_sentence) < 20:
+            first_sentence = clean_model_text(step.title)
+        if first_sentence and first_sentence not in subtasks:
+            subtasks.append(first_sentence.rstrip(".") + ".")
+        if len(subtasks) >= 5:
+            break
+
+    if subtasks:
+        return subtasks
+
+    # Final fallback: derive simple action list from objective clauses.
+    objective = clean_model_text(task.objective or "")
+    clauses = [part.strip(" .") for part in re.split(r"[.;]\s+|\bthen\b|\band then\b", objective, flags=re.IGNORECASE)]
+    for clause in clauses:
+        if len(clause) < 12:
+            continue
+        subtasks.append(clause.rstrip(".") + ".")
+        if len(subtasks) >= 3:
+            break
+    return subtasks or ["Review request scope.", "Gather supporting evidence.", "Prepare a recommendation."]
 
 
 def extract_focus_from_step_output(step_output: str) -> str | None:
@@ -98,15 +117,11 @@ def render_hitl_scope_summary(task: WorkflowTask, step_output: str) -> str:
     if len(subtasks) < 2:
         subtasks = default_hitl_subtasks(task)
 
-    if "researcher_discovery" in task.intent_tags:
-        focus = extract_focus_from_step_output(step_output)
-        lead = (
-            f"To find the top researchers in {focus}, I will:"
-            if focus
-            else "To find the top researchers for your query, I will:"
-        )
+    focus = extract_focus_from_step_output(step_output)
+    if focus:
+        lead = f"Planned next steps for {focus}:"
     else:
-        lead = "To answer your request, I will:"
+        lead = "Planned next steps:"
 
     lines = [lead]
     for idx, subtask in enumerate(subtasks[:5], start=1):

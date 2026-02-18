@@ -19,6 +19,7 @@ MAIN_APP_NAME = "co_scientist_ui"
 CLARIFIER_APP_NAME = "co_scientist_clarifier_ui"
 INTENT_ROUTER_APP_NAME = "co_scientist_intent_router_ui"
 FEEDBACK_PARSER_APP_NAME = "co_scientist_feedback_parser_ui"
+PLANNER_APP_NAME = "co_scientist_planner_ui"
 TITLE_SUMMARIZER_APP_NAME = "co_scientist_title_summarizer_ui"
 PROGRESS_SUMMARIZER_APP_NAME = "co_scientist_progress_summarizer_ui"
 
@@ -29,12 +30,14 @@ class AppRuntimeComponents:
     clarifier_runner: Runner
     intent_router_runner: Runner
     feedback_parser_runner: Runner
+    planner_runner: Runner
     title_summarizer_runner: Runner
     progress_summarizer_runner: Runner
     session_id: str
     clarifier_session_id: str
     intent_router_session_id: str
     feedback_parser_session_id: str
+    planner_session_id: str
     title_summarizer_session_id: str
     progress_summarizer_session_id: str
     mcp_tools: Any | None
@@ -46,6 +49,8 @@ async def create_runtime_components(
     user_id: str,
 ) -> AppRuntimeComponents:
     agent, mcp_tools = _agent.create_agent()
+    if mcp_tools is not None:
+        await _agent._refresh_tool_registry(mcp_tools)
     runner = Runner(
         agent=agent,
         app_name=MAIN_APP_NAME,
@@ -66,6 +71,11 @@ async def create_runtime_components(
         app_name=FEEDBACK_PARSER_APP_NAME,
         session_service=session_service,
     )
+    planner_runner = Runner(
+        agent=_agent.create_planner_agent(),
+        app_name=PLANNER_APP_NAME,
+        session_service=session_service,
+    )
     title_summarizer_runner = Runner(
         agent=_agent.create_title_summarizer_agent(),
         app_name=TITLE_SUMMARIZER_APP_NAME,
@@ -82,6 +92,7 @@ async def create_runtime_components(
         clarifier_session,
         intent_router_session,
         feedback_parser_session,
+        planner_session,
         title_summarizer_session,
         progress_summarizer_session,
     ) = await asyncio.gather(
@@ -89,6 +100,7 @@ async def create_runtime_components(
         session_service.create_session(app_name=CLARIFIER_APP_NAME, user_id=user_id),
         session_service.create_session(app_name=INTENT_ROUTER_APP_NAME, user_id=user_id),
         session_service.create_session(app_name=FEEDBACK_PARSER_APP_NAME, user_id=user_id),
+        session_service.create_session(app_name=PLANNER_APP_NAME, user_id=user_id),
         session_service.create_session(app_name=TITLE_SUMMARIZER_APP_NAME, user_id=user_id),
         session_service.create_session(app_name=PROGRESS_SUMMARIZER_APP_NAME, user_id=user_id),
     )
@@ -98,12 +110,14 @@ async def create_runtime_components(
         clarifier_runner=clarifier_runner,
         intent_router_runner=intent_router_runner,
         feedback_parser_runner=feedback_parser_runner,
+        planner_runner=planner_runner,
         title_summarizer_runner=title_summarizer_runner,
         progress_summarizer_runner=progress_summarizer_runner,
         session_id=main_session.id,
         clarifier_session_id=clarifier_session.id,
         intent_router_session_id=intent_router_session.id,
         feedback_parser_session_id=feedback_parser_session.id,
+        planner_session_id=planner_session.id,
         title_summarizer_session_id=title_summarizer_session.id,
         progress_summarizer_session_id=progress_summarizer_session.id,
         mcp_tools=mcp_tools,
@@ -153,6 +167,8 @@ async def start_new_workflow_task(
     state_store: TaskStateStore,
     objective: str,
     intent_route: dict | None = None,
+    planner_runner=None,
+    planner_session_id: str | None = None,
     task_id_override: str | None = None,
     created_at_override: str | None = None,
     hitl_history_seed: list[str] | None = None,
@@ -164,9 +180,30 @@ async def start_new_workflow_task(
         state_store,
         objective,
         intent_route=intent_route,
+        planner_runner=planner_runner,
+        planner_session_id=planner_session_id,
         task_id_override=task_id_override,
         created_at_override=created_at_override,
         hitl_history_seed=hitl_history_seed,
+    )
+
+
+async def draft_model_plan_graph(
+    objective: str,
+    *,
+    request_type: str,
+    intent_tags: list[str],
+    planner_runner=None,
+    planner_session_id: str | None = None,
+    user_id: str = "researcher",
+) -> list[dict] | None:
+    return await _agent._draft_model_plan_graph(
+        objective,
+        request_type=request_type,
+        intent_tags=intent_tags,
+        planner_runner=planner_runner,
+        planner_session_id=planner_session_id,
+        user_id=user_id,
     )
 
 
@@ -229,12 +266,14 @@ __all__ = [
     "CLARIFIER_APP_NAME",
     "INTENT_ROUTER_APP_NAME",
     "FEEDBACK_PARSER_APP_NAME",
+    "PLANNER_APP_NAME",
     "TITLE_SUMMARIZER_APP_NAME",
     "PROGRESS_SUMMARIZER_APP_NAME",
     "build_clarification_request",
     "create_runtime_components",
     "evaluate_quality_gates",
     "execute_step",
+    "draft_model_plan_graph",
     "gate_ack_token",
     "merge_objective_with_revision_intent",
     "merge_revision_intents",

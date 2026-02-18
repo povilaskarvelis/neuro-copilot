@@ -167,16 +167,22 @@ async def test_export_report_pdf_endpoint_maps_generation_error_to_503(monkeypat
     assert "PDF export failed" in str(exc.value.detail)
 
 
-def test_get_task_detail_regenerates_legacy_report_format(monkeypatch, tmp_path):
+def test_get_task_detail_report_matches_final_step_output(monkeypatch, tmp_path):
+    """The UI report must be the LLM's final step output — no rewriting."""
     task = create_task("Compare LRRK2 vs GBA1")
     for step in task.steps:
         step.status = "completed"
         step.output = "Step output."
-    task.steps[-1].output = (
-        "Recommendation: Prioritize GBA1.\n"
-        "Confidence Level: High\n\n"
-        "GBA1 shows stronger clinical de-risking than LRRK2."
+    final_output = (
+        "## Final Report: LRRK2 vs GBA1\n\n"
+        "### Recommendation\n"
+        "Prioritize GBA1 based on clinical de-risking.\n\n"
+        "### Rationale\n"
+        "GBA1 shows stronger clinical de-risking than LRRK2.\n\n"
+        "### Limitations\n"
+        "Data coverage is limited to public sources."
     )
+    task.steps[-1].output = final_output
     task.status = "completed"
 
     class DummyStore:
@@ -191,7 +197,7 @@ def test_get_task_detail_regenerates_legacy_report_format(monkeypatch, tmp_path)
     runtime.state_store = DummyStore()
 
     markdown_path = tmp_path / f"{task.task_id}.md"
-    markdown_path.write_text("## Query\nlegacy\n\n## Scope\nlegacy\n", encoding="utf-8")
+    markdown_path.write_text("stale content from old run", encoding="utf-8")
     pdf_path = tmp_path / f"{task.task_id}.pdf"
     monkeypatch.setattr(runtime, "_report_markdown_path", lambda _task_id: markdown_path)
     monkeypatch.setattr(runtime, "_report_pdf_path", lambda _task_id: pdf_path)
@@ -200,51 +206,10 @@ def test_get_task_detail_regenerates_legacy_report_format(monkeypatch, tmp_path)
 
     assert detail is not None
     report_markdown = str(detail["report_markdown"] or "")
-    assert report_markdown.startswith("## Answer")
-    assert "## Answer" in report_markdown
-    assert "## Query" not in report_markdown
-    assert "## Scope" not in report_markdown
-    assert "## Decomposition" in report_markdown
-    assert "## Diagnostics" not in report_markdown
-
-
-def test_get_task_detail_regenerates_reports_with_redundant_rationale_headings(monkeypatch, tmp_path):
-    task = create_task("Compare LRRK2 vs GBA1")
-    for step in task.steps:
-        step.status = "completed"
-        step.output = "Step output."
-    task.steps[-1].output = (
-        "Recommendation: Prioritize GBA1.\n\n"
-        "Rationale Narrative: GBA1 has stronger clinical de-risking."
-    )
-    task.status = "completed"
-
-    class DummyStore:
-        def get_task(self, task_id: str):
-            return task if task_id == task.task_id else None
-
-        def list_revisions(self, _task_id: str, limit: int = 24):
-            del limit
-            return []
-
-    runtime = ui_server.UiRuntime(tmp_path / "state.json")
-    runtime.state_store = DummyStore()
-
-    markdown_path = tmp_path / f"{task.task_id}.md"
-    markdown_path.write_text(
-        "## Answer\nlegacy\n\n## Rationale\n### Why this recommendation\nRationale Narrative:\nlegacy",
-        encoding="utf-8",
-    )
-    pdf_path = tmp_path / f"{task.task_id}.pdf"
-    monkeypatch.setattr(runtime, "_report_markdown_path", lambda _task_id: markdown_path)
-    monkeypatch.setattr(runtime, "_report_pdf_path", lambda _task_id: pdf_path)
-
-    detail = runtime.get_task_detail(task.task_id)
-
-    assert detail is not None
-    report_markdown = str(detail["report_markdown"] or "")
-    assert "### Why this recommendation" not in report_markdown
-    assert "Rationale Narrative:" not in report_markdown
+    assert "Prioritize GBA1" in report_markdown
+    assert "### Recommendation" in report_markdown
+    assert "### Rationale" in report_markdown
+    assert "### Limitations" in report_markdown
 
 
 def test_append_checkpoint_event_preserves_temporal_sequence(tmp_path):

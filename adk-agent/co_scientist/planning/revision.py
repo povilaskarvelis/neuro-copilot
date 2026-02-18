@@ -163,47 +163,6 @@ def coerce_str_list(value) -> list[str]:
     return dedupe_compact(raw_items)
 
 
-def build_deterministic_revision_intent(feedback: str) -> RevisionIntent:
-    parts = extract_revision_directives(feedback)
-    constraints: list[str] = []
-    priorities: list[str] = []
-    exclusions: list[str] = []
-    evidence_prefs: list[str] = []
-    output_prefs: list[str] = []
-    objective_adjustments: list[str] = []
-
-    for item in parts:
-        lowered = item.lower()
-        if any(token in lowered for token in ("do not", "don't", "exclude", "avoid", "without")):
-            exclusions.append(item)
-            continue
-        if any(token in lowered for token in ("must", "need to", "required", "should")):
-            constraints.append(item)
-            continue
-        if any(token in lowered for token in ("prioritize", "focus", "first", "before")):
-            priorities.append(item)
-            continue
-        if any(token in lowered for token in ("evidence", "citation", "pmid", "nct", "source")):
-            evidence_prefs.append(item)
-            continue
-        if any(token in lowered for token in ("format", "table", "output", "report", "summary")):
-            output_prefs.append(item)
-            continue
-        objective_adjustments.append(item)
-
-    return RevisionIntent(
-        raw_feedback=feedback.strip(),
-        objective_adjustments=dedupe_compact(objective_adjustments),
-        constraints=dedupe_compact(constraints),
-        priorities=dedupe_compact(priorities),
-        exclusions=dedupe_compact(exclusions),
-        evidence_preferences=dedupe_compact(evidence_prefs),
-        output_preferences=dedupe_compact(output_prefs),
-        confidence=0.45,
-        parser_source="fallback",
-    )
-
-
 async def parse_revision_intent(
     feedback: str,
     *,
@@ -212,9 +171,19 @@ async def parse_revision_intent(
     user_id: str = "researcher",
     run_runner_turn_fn: RunRunnerTurnFn | None = None,
 ) -> RevisionIntent:
-    deterministic = build_deterministic_revision_intent(feedback)
+    heuristic = RevisionIntent(
+        raw_feedback=feedback.strip(),
+        objective_adjustments=extract_revision_directives(feedback),
+        constraints=[],
+        priorities=[],
+        exclusions=[],
+        evidence_preferences=[],
+        output_preferences=[],
+        confidence=0.35,
+        parser_source="heuristic",
+    )
     if feedback_parser_runner is None or not feedback_parser_session_id or run_runner_turn_fn is None:
-        return deterministic
+        return heuristic
 
     prompt = (
         "Parse this checkpoint feedback into structured intent updates.\n"
@@ -227,7 +196,7 @@ async def parse_revision_intent(
     except Exception:
         payload = None
     if not payload:
-        return deterministic
+        return heuristic
 
     try:
         confidence = float(payload.get("confidence", 0.0) or 0.0)
@@ -258,7 +227,7 @@ async def parse_revision_intent(
         )
     )
     if not has_signal:
-        return deterministic
+        return heuristic
     return parsed
 
 
@@ -353,7 +322,6 @@ def merge_revision_intents(previous: RevisionIntent | None, incoming: RevisionIn
 
 
 __all__ = [
-    "build_deterministic_revision_intent",
     "coerce_str_list",
     "dedupe_compact",
     "extract_json_payload",

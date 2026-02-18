@@ -67,6 +67,13 @@ class WorkflowStep:
     reasoning_summary: str = ""
     actions: list[str] = field(default_factory=list)
     observations: list[str] = field(default_factory=list)
+    subgoal_id: str = ""
+    evidence_requirements: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    max_tool_calls: int = 0
+    done_criteria: list[str] = field(default_factory=list)
+    critic_verdict: str = ""
+    confidence_label: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +92,13 @@ class WorkflowStep:
             "reasoning_summary": self.reasoning_summary,
             "actions": self.actions,
             "observations": self.observations,
+            "subgoal_id": self.subgoal_id,
+            "evidence_requirements": self.evidence_requirements,
+            "dependencies": self.dependencies,
+            "max_tool_calls": self.max_tool_calls,
+            "done_criteria": self.done_criteria,
+            "critic_verdict": self.critic_verdict,
+            "confidence_label": self.confidence_label,
         }
 
     @classmethod
@@ -105,6 +119,13 @@ class WorkflowStep:
             reasoning_summary=payload.get("reasoning_summary", ""),
             actions=list(payload.get("actions", [])),
             observations=list(payload.get("observations", [])),
+            subgoal_id=str(payload.get("subgoal_id", "")).strip(),
+            evidence_requirements=[str(x).strip() for x in payload.get("evidence_requirements", []) if str(x).strip()],
+            dependencies=[str(x).strip() for x in payload.get("dependencies", []) if str(x).strip()],
+            max_tool_calls=int(payload.get("max_tool_calls", 0) or 0),
+            done_criteria=[str(x).strip() for x in payload.get("done_criteria", []) if str(x).strip()],
+            critic_verdict=str(payload.get("critic_verdict", "")).strip(),
+            confidence_label=str(payload.get("confidence_label", "")).strip(),
         )
 
 
@@ -240,8 +261,6 @@ class WorkflowTask:
     current_step_index: int = -1
     awaiting_hitl: bool = False
     hitl_history: list[str] = field(default_factory=list)
-    fallback_recovery_notes: str = ""
-    fallback_tool_trace: list[dict] = field(default_factory=list)
     base_objective: str = ""
     plan_versions: list[PlanVersion] = field(default_factory=list)
     active_plan_version_id: str | None = None
@@ -251,6 +270,13 @@ class WorkflowTask:
     checkpoint_reason: str = ""
     progress_events: list[dict] = field(default_factory=list)
     progress_summaries: list[dict] = field(default_factory=list)
+    planner_graph: list[dict] = field(default_factory=list)
+    planner_mode: str = "deterministic"
+    quality_confidence: str = ""
+    phase_state: dict[str, str] = field(default_factory=dict)
+    event_log: list[dict] = field(default_factory=list)
+    checkpoint_payload: dict = field(default_factory=dict)
+    researcher_candidates: list[dict] = field(default_factory=list)
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
 
@@ -271,8 +297,6 @@ class WorkflowTask:
             "current_step_index": self.current_step_index,
             "awaiting_hitl": self.awaiting_hitl,
             "hitl_history": self.hitl_history,
-            "fallback_recovery_notes": self.fallback_recovery_notes,
-            "fallback_tool_trace": self.fallback_tool_trace,
             "base_objective": self.base_objective or self.objective,
             "plan_versions": [version.to_dict() for version in self.plan_versions],
             "active_plan_version_id": self.active_plan_version_id,
@@ -282,6 +306,13 @@ class WorkflowTask:
             "checkpoint_reason": self.checkpoint_reason,
             "progress_events": list(self.progress_events),
             "progress_summaries": list(self.progress_summaries),
+            "planner_graph": list(self.planner_graph),
+            "planner_mode": self.planner_mode,
+            "quality_confidence": self.quality_confidence,
+            "phase_state": dict(self.phase_state),
+            "event_log": list(self.event_log),
+            "checkpoint_payload": dict(self.checkpoint_payload),
+            "researcher_candidates": list(self.researcher_candidates),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -304,8 +335,6 @@ class WorkflowTask:
             current_step_index=payload.get("current_step_index", -1),
             awaiting_hitl=bool(payload.get("awaiting_hitl", False)),
             hitl_history=list(payload.get("hitl_history", [])),
-            fallback_recovery_notes=payload.get("fallback_recovery_notes", ""),
-            fallback_tool_trace=list(payload.get("fallback_tool_trace", [])),
             base_objective=payload.get("base_objective", "") or payload.get("objective", ""),
             plan_versions=[
                 version
@@ -319,6 +348,17 @@ class WorkflowTask:
             checkpoint_reason=str(payload.get("checkpoint_reason", "")),
             progress_events=[item for item in payload.get("progress_events", []) if isinstance(item, dict)],
             progress_summaries=[item for item in payload.get("progress_summaries", []) if isinstance(item, dict)],
+            planner_graph=[item for item in payload.get("planner_graph", []) if isinstance(item, dict)],
+            planner_mode=str(payload.get("planner_mode", "deterministic") or "deterministic"),
+            quality_confidence=str(payload.get("quality_confidence", "")).strip(),
+            phase_state={
+                str(k).strip(): str(v).strip()
+                for k, v in (payload.get("phase_state", {}) or {}).items()
+                if str(k).strip()
+            },
+            event_log=[item for item in payload.get("event_log", []) if isinstance(item, dict)],
+            checkpoint_payload=dict(payload.get("checkpoint_payload", {}) or {}),
+            researcher_candidates=[item for item in payload.get("researcher_candidates", []) if isinstance(item, dict)],
             created_at=payload.get("created_at", _utc_now()),
             updated_at=payload.get("updated_at", _utc_now()),
         )

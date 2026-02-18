@@ -75,6 +75,7 @@ function escapeHtml(text) {
 function inlineMarkdown(text) {
   let value = escapeHtml(text);
   value = value.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  value = value.replace(/(^|[\s(])((?:https?:\/\/)[^\s<)]+)(?=$|[\s).,;:!?])/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
   value = value.replace(/`([^`]+)`/g, "<code>$1</code>");
   value = value.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   value = value.replace(/\*([^*]+)\*/g, "<em>$1</em>");
@@ -286,8 +287,7 @@ function compactInstruction(text) {
   const base = /^Prioritize user-requested tools:/i.test(firstSentence) && secondSentence
     ? `${firstSentence} ${secondSentence}`
     : firstSentence;
-  const compact = base.replace(/^Use tools to\s+/i, "Gather ").replace(/^Produce /i, "Deliver ");
-  return compact.length > 140 ? `${compact.slice(0, 137).trimEnd()}...` : compact;
+  return base.replace(/^Use tools to\s+/i, "Gather ").replace(/^Produce /i, "Deliver ");
 }
 
 function inlinePlanDetail(detail) {
@@ -371,6 +371,9 @@ function formatPlanText(task, version, { delta = null, reason = "" } = {}) {
   const planSteps = steps.length ? steps : fallbackPlanSteps(task);
   const lines = [];
 
+  lines.push("Here's a proposed plan to answer your query:");
+  lines.push("");
+
   if (delta) {
     const summary = normalizePlanLine(String(delta?.summary || ""));
     if (summary) lines.push(`Updated from your feedback: ${summary}.`);
@@ -386,7 +389,7 @@ function formatPlanText(task, version, { delta = null, reason = "" } = {}) {
   planSteps.forEach((step, idx) => {
     const title = step.title || `Step ${idx + 1}`;
     const detail = compactInstruction(step.instruction) || "Execute this step with the defined constraints.";
-    lines.push(`${idx + 1}. ${title}`);
+    lines.push(`### ${idx + 1}. ${title}`);
     lines.push(`- ${detail}`);
 
     const primaryTool = selectPrimaryToolForPlanStep(step, idx, planSteps.length);
@@ -394,17 +397,15 @@ function formatPlanText(task, version, { delta = null, reason = "" } = {}) {
       const source = displayToolSourceName(primaryTool);
       const action = toolUsageAction(primaryTool, {});
       lines.push(`- Primary tool/source: ${source} (used to ${action})`);
-    } else {
-      lines.push("- Primary method: structured synthesis to produce the final report-ready output");
     }
+    lines.push("");
   });
 
   if (reason) {
-    lines.push("");
     lines.push(`Gate reason: ${reason}`);
   }
 
-  return lines.join("\n");
+  return lines.join("\n").trim();
 }
 
 function extractSubtasks(scopeText) {
@@ -445,21 +446,53 @@ function formatGateReason(reason) {
 
 function inspectLatestPauseContext(task) {
   const steps = Array.isArray(task?.steps) ? task.steps : [];
+  const qualityGaps = Array.isArray(task?.quality_snapshot?.unresolved_gaps)
+    ? task.quality_snapshot.unresolved_gaps.map((item) => normalizePlanLine(String(item || ""))).filter(Boolean)
+    : [];
   if (!steps.length) {
     return {
       stepTitle: "",
       failure: null,
       criticalLine: "",
       highPriorityCriterion: false,
+      qualityGap: qualityGaps[0] || "",
     };
   }
 
   let candidate = null;
+  let failureStep = null;
+  let failureInfo = null;
   for (let idx = steps.length - 1; idx >= 0; idx -= 1) {
     const step = steps[idx];
     if (String(step?.status || "") !== "completed") continue;
-    candidate = step;
-    break;
+    if (!candidate) candidate = step;
+    const trace = Array.isArray(step.tool_trace) ? step.tool_trace : [];
+    let bestFailure = null;
+    let bestScore = -1;
+    for (const entry of trace) {
+      const outcome = String(entry?.outcome || "").trim().toLowerCase();
+      if (!["error", "not_found_or_empty", "no_response", "degraded"].includes(outcome)) continue;
+      const tool = String(entry?.tool_name || "a tool").trim();
+      const detailRaw = normalizePlanLine(String(entry?.detail || ""));
+      const detail = detailRaw ? detailRaw.slice(0, 180) : "";
+      const detailLower = detail.toLowerCase();
+      let score = 1;
+      if (detailLower.includes("gwas")) score += 4;
+      if (detailLower.includes("rate limit") || detailLower.includes("429")) score += 4;
+      if (detailLower.includes("service unavailable") || detailLower.includes("unavailable")) score += 3;
+      if (detailLower.includes("timed out") || detailLower.includes("timeout")) score += 3;
+      if (outcome === "error") score += 2;
+      if (outcome === "degraded") score += 1;
+      if (score > bestScore) {
+        bestScore = score;
+        bestFailure = { tool, outcome, detail };
+      }
+    }
+    if (bestFailure) {
+      failureStep = step;
+      failureInfo = bestFailure;
+      break;
+    }
   }
   if (!candidate) {
     return {
@@ -467,52 +500,34 @@ function inspectLatestPauseContext(task) {
       failure: null,
       criticalLine: "",
       highPriorityCriterion: false,
+      qualityGap: qualityGaps[0] || "",
     };
   }
 
-  const title = String(candidate.title || "").trim() || "latest step";
+  const targetStep = failureStep || candidate;
+  const title = String(targetStep.title || "").trim() || "latest step";
   const titleLower = title.toLowerCase();
   const highPriorityCriterion = /(human genetics|genetic|safety liabilities|safety|risk signals|weighted criteria)/i.test(
     titleLower
   );
-  const trace = Array.isArray(candidate.tool_trace) ? candidate.tool_trace : [];
-  let bestFailure = null;
-  let bestScore = -1;
-  for (const entry of trace) {
-    const outcome = String(entry?.outcome || "").trim().toLowerCase();
-    if (!["error", "not_found_or_empty", "no_response", "degraded"].includes(outcome)) continue;
-    const tool = String(entry?.tool_name || "a tool").trim();
-    const detailRaw = normalizePlanLine(String(entry?.detail || ""));
-    const detail = detailRaw ? detailRaw.slice(0, 180) : "";
-    const detailLower = detail.toLowerCase();
-    let score = 1;
-    if (detailLower.includes("gwas")) score += 4;
-    if (detailLower.includes("rate limit") || detailLower.includes("429")) score += 4;
-    if (detailLower.includes("service unavailable") || detailLower.includes("unavailable")) score += 3;
-    if (detailLower.includes("timed out") || detailLower.includes("timeout")) score += 3;
-    if (outcome === "error") score += 2;
-    if (outcome === "degraded") score += 1;
-    if (score > bestScore) {
-      bestScore = score;
-      bestFailure = { tool, outcome, detail };
-    }
-  }
-  if (bestFailure) {
+  if (failureInfo) {
     return {
       stepTitle: title,
-      failure: bestFailure,
+      failure: failureInfo,
       criticalLine: "",
       highPriorityCriterion,
+      qualityGap: qualityGaps[0] || "",
     };
   }
 
-  const output = String(candidate.output || "");
+  const output = String(targetStep.output || "");
   if (!output.trim()) {
     return {
       stepTitle: title,
       failure: null,
       criticalLine: "",
       highPriorityCriterion,
+      qualityGap: qualityGaps[0] || "",
     };
   }
   const lines = output
@@ -521,12 +536,14 @@ function inspectLatestPauseContext(task) {
     .filter(Boolean);
   const marker =
     /(critical gap|service unavailable|failed|unable to retrieve|unresolved|limitation|contradict|error|aborted|timed out|timeout|rate limit|429)/i;
-  const hit = lines.find((line) => marker.test(line));
+  const noisyHeading = /^(limitations?|methodology|reasoning|actions|observations|diagnostics)\s*:?\s*$/i;
+  const hit = lines.find((line) => marker.test(line) && !noisyHeading.test(line));
   return {
     stepTitle: title,
     failure: null,
     criticalLine: hit ? hit.slice(0, 190) : "",
     highPriorityCriterion,
+    qualityGap: qualityGaps[0] || "",
   };
 }
 
@@ -571,6 +588,7 @@ function _buildEvidencePauseMessage(context, continueLabel) {
   const stepLabel = String(context?.stepTitle || "The latest evidence step");
   const failure = context?.failure || null;
   const criticalLine = String(context?.criticalLine || "").trim();
+  const qualityGap = String(context?.qualityGap || "").trim();
   const highPriority = Boolean(context?.highPriorityCriterion);
 
   let lead = "";
@@ -579,6 +597,8 @@ function _buildEvidencePauseMessage(context, continueLabel) {
     lead = `${stepLabel} could not be fully completed because ${reason}.`;
   } else if (criticalLine) {
     lead = `${stepLabel} surfaced a critical evidence gap: ${criticalLine}.`;
+  } else if (qualityGap) {
+    lead = `${stepLabel} is blocked by an unresolved quality gap: ${qualityGap}.`;
   } else {
     lead = `${stepLabel} has an unresolved evidence gap.`;
   }
@@ -586,28 +606,21 @@ function _buildEvidencePauseMessage(context, continueLabel) {
   const importance = highPriority
     ? "This affects a high-priority criterion in the current decision."
     : "This affects one of the planned evidence paths."
-  const continueImplication = `${continueLabel} will finish the report using available fallback evidence and clearly mark this part as provisional.`;
-  const feedbackOption = "If you want a stricter evidence requirement or a different evidence path, send feedback before continuing.";
-  return `${lead} ${importance} ${continueImplication} ${feedbackOption}`;
+  const continueImplication = `${continueLabel} will finish with fallback evidence and mark this conclusion as provisional.`;
+  const whatFailed = failure
+    ? `What failed: ${String(failure.tool || "tool")} (${String(failure.outcome || "issue")})${failure.detail ? ` — ${failure.detail}` : ""}.`
+    : qualityGap
+      ? `Primary gap: ${qualityGap}.`
+      : "";
+  const feedbackOption =
+    "To redirect, send specific feedback like: `prioritize PubMed evidence`, `skip GWAS and focus clinical trials`, or `require >=2 PMID citations before final recommendation`.";
+  return [lead, importance, whatFailed, continueImplication, feedbackOption].filter(Boolean).join(" ");
 }
 
 function checkpointPauseMessage(reason, task, continueLabel = "Continue") {
   const value = String(reason || "").trim().toLowerCase();
-  const context = inspectLatestPauseContext(task);
   if (!value || value === "pre_evidence_execution" || value === "feedback_replan") return "";
-  if (value === "quality_gap_spike" || value === "uncertainty_spike") {
-    return _buildEvidencePauseMessage(context, continueLabel);
-  }
-  if (value === "repeated_tool_failures") {
-    return _buildEvidencePauseMessage(context, continueLabel);
-  }
-  if (value === "pre_final_after_intent_change") {
-    return `Your feedback changed the plan right before final synthesis. ${continueLabel} will finalize using the updated plan, or you can send one more refinement now.`;
-  }
-  if (value === "queued_feedback_pending") {
-    return `Queued feedback is ready to apply at this checkpoint. You can send more feedback now, or use ${continueLabel} to proceed.`;
-  }
-  return `Checkpoint reason: ${formatGateReason(value)}. ${continueLabel} will proceed with the current evidence and keep any remaining gaps explicit, or you can send feedback to revise the plan.`;
+  return "";
 }
 
 function shouldRenderCheckpointAction(reason) {
@@ -1526,6 +1539,37 @@ function renderMessages() {
 
   const task = detail.task;
   const parts = [messageHtml("user", "", primaryObjectiveText(task.objective) || "(empty objective)")];
+  const plannerMode = String(task.planner_mode || "").trim();
+  const graphNodes = Array.isArray(task.planner_graph) ? task.planner_graph : [];
+  const phaseState = task && typeof task.phase_state === "object" ? task.phase_state : {};
+  const checkpointPayload = task && typeof task.checkpoint_payload === "object" ? task.checkpoint_payload : {};
+  const showPlannerDebugState = window.localStorage.getItem("co_scientist_show_planner_debug") === "1";
+  if (showPlannerDebugState && (plannerMode || graphNodes.length)) {
+    const subgoals = (Array.isArray(task.steps) ? task.steps : [])
+      .filter((step) => String(step?.subgoal_id || "").trim() && String(step?.subgoal_id || "") !== "sg_final_report")
+      .map((step) => {
+        const label = String(step.subgoal_id || "").trim();
+        const status = String(step.status || "pending").trim();
+        return `- ${label}: ${status}`;
+      })
+      .slice(0, 8);
+    const confidence = String(task.quality_confidence || "").trim();
+    const lines = [
+      "Dynamic planning state:",
+      `- Planner mode: ${plannerMode || "deterministic"}`,
+      `- Subgoal nodes: ${graphNodes.length || subgoals.length || 0}`,
+    ];
+    const phasePairs = Object.entries(phaseState || {});
+    if (phasePairs.length) {
+      for (const [phase, status] of phasePairs) lines.push(`- ${String(phase)}: ${String(status)}`);
+    }
+    if (confidence) lines.push(`- Current quality confidence: ${confidence}`);
+    if (subgoals.length) lines.push(...subgoals);
+    parts.push(messageHtml("assistant", "", lines.join("\n")));
+  }
+  if (checkpointPayload && checkpointPayload.question) {
+    parts.push(messageHtml("assistant", "", String(checkpointPayload.question)));
+  }
   const persistedReportMarkdown = String(detail?.report_markdown || "").trim();
   const latestRunReport =
     state.latestRun?.task_id === task.task_id ? String(state.latestRun?.final_report || "").trim() : "";

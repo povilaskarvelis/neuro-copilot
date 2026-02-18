@@ -5,6 +5,15 @@ from __future__ import annotations
 
 import re
 
+from .event_orchestrator import (
+    EVENT_CHECKPOINT_OPENED,
+    PHASE_SYNTHESIS,
+    append_event,
+    checkpoint_payload_for_transition,
+    ensure_phase_state,
+    infer_phase_for_step,
+    should_checkpoint_for_phase_boundary,
+)
 
 _ASSERTIVE_CLAIM_RE = re.compile(
     r"\b("
@@ -26,6 +35,13 @@ _HEDGED_CLAIM_RE = re.compile(
     r"provisional|tentative"
     r")\b",
     flags=re.IGNORECASE,
+)
+
+_GENERIC_RECOMMENDATION_PATTERNS = (
+    "the available evidence supports the recommendation below",
+    "the recommendation is based on the strongest available evidence",
+    "no answer generated",
+    "recommendation pending",
 )
 
 
@@ -250,7 +266,6 @@ def _extract_evidence_refs(text: str) -> set[str]:
 
 def _collect_trace_entries(task) -> list[dict]:
     entries = [entry for step in task.steps for entry in (step.tool_trace or []) if isinstance(entry, dict)]
-    entries.extend(entry for entry in (task.fallback_tool_trace or []) if isinstance(entry, dict))
     return entries
 
 
@@ -258,7 +273,6 @@ def _collect_output_evidence_refs(task) -> set[str]:
     refs: set[str] = set()
     for step in task.steps:
         refs.update(_extract_evidence_refs(step.output or ""))
-    refs.update(_extract_evidence_refs(task.fallback_recovery_notes or ""))
     return refs
 
 
@@ -341,21 +355,14 @@ def _collect_uncited_assertive_claims(task, tool_evidence_refs: set[str]) -> tup
         return 0, []
 
     final_output = str(task.steps[-1].output or "").strip()
-    fallback_text = str(task.fallback_recovery_notes or "").strip()
     synthesis_blocks: list[str] = []
-
-    fallback_recommendations = _extract_recommendation_sections(fallback_text)
-    if fallback_recommendations:
-        # If fallback includes recommendation-specific sections, only score those sections.
-        synthesis_blocks.extend(fallback_recommendations)
+    final_recommendations = _extract_recommendation_sections(final_output)
+    if final_recommendations:
+        synthesis_blocks.extend(final_recommendations)
     else:
-        final_recommendations = _extract_recommendation_sections(final_output)
-        if final_recommendations:
-            synthesis_blocks.extend(final_recommendations)
-        else:
-            primary_paragraph = _extract_primary_narrative_paragraph(final_output)
-            if primary_paragraph:
-                synthesis_blocks.append(primary_paragraph)
+        primary_paragraph = _extract_primary_narrative_paragraph(final_output)
+        if primary_paragraph:
+            synthesis_blocks.append(primary_paragraph)
     synthesis_text = "\n\n".join(part for part in synthesis_blocks if part)
     if not synthesis_text:
         return 0, []
@@ -380,6 +387,56 @@ def _collect_uncited_assertive_claims(task, tool_evidence_refs: set[str]) -> tup
     return assertive_claim_count, uncited_claims
 
 
+def _requested_paper_count(objective: str) -> int | None:
+    match = re.search(r"\b(\d{1,2})\s+(?:recent\s+)?papers?\b", str(objective or ""), flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _count_literature_citations_in_text(text: str) -> int:
+    raw_refs = _extract_evidence_refs(text or "")
+    keys: set[str] = set()
+    for ref in raw_refs:
+        value = str(ref).strip()
+        upper = value.upper()
+        if upper.startswith("DOI:"):
+            keys.add(f"DOI:{value.split(':', 1)[1].strip().lower()}")
+        elif upper.startswith("PMID:"):
+            keys.add(f"PMID:{value.split(':', 1)[1].strip()}")
+        elif upper.startswith("OPENALEX:"):
+            keys.add(f"OPENALEX:{value.split(':', 1)[1].strip().upper()}")
+        elif upper.startswith("HTTP://OPENALEX.ORG/") or upper.startswith("HTTPS://OPENALEX.ORG/"):
+            keys.add(value.upper())
+    return len(keys)
+
+
+def _selected_recommendation_text(task) -> str:
+    if not task.steps:
+        return ""
+    final_output = str(task.steps[-1].output or "").strip()
+    final_recommendations = _extract_recommendation_sections(final_output)
+    if final_recommendations:
+        return " ".join(final_recommendations).strip()
+    return _extract_primary_narrative_paragraph(final_output).strip()
+
+
+def _looks_placeholder_recommendation(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized:
+        return True
+    if any(marker in normalized for marker in _GENERIC_RECOMMENDATION_PATTERNS):
+        return True
+    # Recommendation should communicate an explicit decision, not only generic framing.
+    if len(normalized) < 70 and not _ASSERTIVE_CLAIM_RE.search(normalized):
+        return True
+    return False
+
+
 def evaluate_quality_gates(task) -> dict:
     trace_entries = _collect_trace_entries(task)
     tool_evidence_refs = _collect_tool_evidence_refs(trace_entries)
@@ -389,10 +446,6 @@ def evaluate_quality_gates(task) -> dict:
         repaired_final_output = _inject_inline_citation_in_recommendation(final_output, tool_evidence_refs)
         if repaired_final_output != final_output:
             final_step.output = repaired_final_output
-        fallback_text = str(task.fallback_recovery_notes or "")
-        repaired_fallback_text = _inject_inline_citation_in_recommendation(fallback_text, tool_evidence_refs)
-        if repaired_fallback_text != fallback_text:
-            task.fallback_recovery_notes = repaired_fallback_text
     output_evidence_refs = _collect_output_evidence_refs(task)
     evidence_count = len(tool_evidence_refs)
     steps_with_output = sum(1 for step in task.steps if step.output and step.output != "(No response generated)")
@@ -409,68 +462,14 @@ def evaluate_quality_gates(task) -> dict:
     combined_output = "\n".join(step.output for step in task.steps if step.output).lower()
     objective_lower = task.objective.lower()
     if "researcher_discovery" in task.intent_tags:
-        has_successful_ranking = False
         if "cannot be directly listed" in combined_output or "tool limitation" in combined_output:
-            unresolved_gaps.append("Researcher identification appears incomplete due to tool limitations.")
-        if not any(token in combined_output for token in ["author", "researcher", "investigator"]):
-            unresolved_gaps.append("No explicit researcher entities were reported.")
-        researcher_step = next((step for step in task.steps if "evidence" in step.title.lower()), None)
-        if researcher_step:
-            ranking_calls = [
-                entry
-                for entry in researcher_step.tool_trace
-                if str(entry.get("tool_name", "")) == "rank_researchers_by_activity"
-            ]
-            successful_ranking = [entry for entry in ranking_calls if str(entry.get("outcome")) == "ok"]
-            has_successful_ranking = bool(successful_ranking)
-            if not ranking_calls:
-                unresolved_gaps.append(
-                    "No quantitative ranking tool call (`rank_researchers_by_activity`) was executed."
-                )
-            elif not successful_ranking:
-                unresolved_gaps.append(
-                    "No successful quantitative researcher ranking call completed."
-                )
-            openalex_topic_calls = [
-                entry
-                for entry in researcher_step.tool_trace
-                if str(entry.get("tool_name", "")) in {"rank_researchers_by_activity", "search_openalex_works"}
-            ]
-            failed_openalex_topic_calls = [
-                entry
-                for entry in openalex_topic_calls
-                if str(entry.get("outcome", "")) in {"error", "no_response"}
-            ]
-            if openalex_topic_calls and len(failed_openalex_topic_calls) == len(openalex_topic_calls):
-                unresolved_gaps.append(
-                    "All topic-specific OpenAlex ranking/evidence calls failed; researcher ranking is unreliable."
-                )
-        top_query = any(
-            marker in objective_lower
-            for marker in [" top ", "top ", "most active", "prominent", "leading", "most prominent"]
-        ) or task.request_type == "prioritization"
-        if top_query and not any(
-            marker in combined_output for marker in ["activity score", "score:", "ranked", "topic works"]
-        ):
-            unresolved_gaps.append(
-                "Output lacks quantitative ranking metrics for a top/prominent researcher request."
-            )
-        degraded_researcher_markers = any(
-            marker in combined_output
-            for marker in [
-                "request failed (429)",
-                "rate limit",
-                "preliminary",
-                "could not perform",
-                "could not be performed",
-            ]
-        )
-        if degraded_researcher_markers and not (has_successful_ranking and _contains_pubmed_ref(tool_evidence_refs)):
-            unresolved_gaps.append(
-                "Researcher ranking output still signals degraded evidence quality due to rate limits or incomplete ranking."
-            )
-        if not _contains_pubmed_ref(tool_evidence_refs):
-            _append_gap("Researcher synthesis is missing at least one tool-validated PMID citation from PubMed evidence.")
+            _append_gap("Researcher/entity identification appears incomplete due to tool limitations.")
+        if not any(token in combined_output for token in ["author", "researcher", "investigator", "affiliation"]):
+            _append_gap("No explicit researcher entities were detected in the synthesis.")
+
+    if task.request_type in {"prioritization", "comparison"}:
+        if not any(marker in combined_output for marker in ["rank", "score", "weighted", "priority", "trade-off", "tradeoff"]):
+            _append_gap("Prioritization/comparison output lacks explicit ranking criteria or trade-off signals.")
     if any(token in objective_lower for token in ["target", "druggab", "candidate"]) or "clinical_landscape" in task.intent_tags:
         if any(
             token in combined_output
@@ -492,11 +491,6 @@ def evaluate_quality_gates(task) -> dict:
         for entry in (step.tool_trace or [])
         if str(entry.get("outcome", "")) in {"error", "not_found_or_empty", "no_response", "degraded"}
     ]
-    failed_entries.extend(
-        entry
-        for entry in (task.fallback_tool_trace or [])
-        if str(entry.get("outcome", "")) in {"error", "not_found_or_empty", "no_response", "degraded"}
-    )
     if failed_entries:
         failure_count = len(failed_entries)
         failure_ratio = failure_count / max(tool_call_count, 1)
@@ -553,6 +547,20 @@ def evaluate_quality_gates(task) -> dict:
             "Assertive recommendation claims are missing inline validated citations "
             f"({sample}{'; ...' if len(uncited_assertive_claims) > 2 else ''})."
         )
+    recommendation_text = _selected_recommendation_text(task)
+    if not recommendation_text:
+        _append_gap("Final synthesis is missing an explicit recommendation statement.")
+    elif _looks_placeholder_recommendation(recommendation_text):
+        _append_gap("Final recommendation is generic/template-like and not decision-specific.")
+    requested_papers = _requested_paper_count(task.objective)
+    if requested_papers:
+        final_text = str(task.steps[-1].output or "") if task.steps else ""
+        found_citations = _count_literature_citations_in_text(final_text)
+        if found_citations < requested_papers:
+            _append_gap(
+                "Final synthesis cites fewer literature references than requested "
+                f"({found_citations}/{requested_papers})."
+            )
 
     if evidence_count == 0:
         _append_gap("No tool-validated citation evidence IDs were captured.")
@@ -591,15 +599,41 @@ def evaluate_quality_gates(task) -> dict:
             f"({sample}{'; ...' if len(contract_violations) > 3 else ''})."
         )
 
-    passed = (
-        evidence_count >= 2
-        and coverage_ratio >= 0.9
-        and tool_call_count >= 1
-        and contract_violation_count == 0
-        and len(unresolved_gaps) == 0
+    # Confidence-and-coverage scoring (with deterministic hard-fail conditions kept).
+    evidence_score = min(evidence_count / 4.0, 1.0)
+    coverage_score = min(max(coverage_ratio, 0.0), 1.0)
+    execution_score = min(tool_call_count / 3.0, 1.0)
+    contract_score = 0.0 if contract_violation_count > 0 else 1.0
+    gap_penalty = min(len(unresolved_gaps) / 5.0, 1.0)
+    weighted_score = (
+        0.32 * evidence_score
+        + 0.24 * coverage_score
+        + 0.14 * execution_score
+        + 0.18 * contract_score
+        + 0.12 * (1.0 - gap_penalty)
     )
+    if weighted_score >= 0.75:
+        confidence_label = "high"
+    elif weighted_score >= 0.5:
+        confidence_label = "medium"
+    else:
+        confidence_label = "low"
+
+    must_fail = (
+        contract_violation_count > 0
+        or recommendation_text == ""
+        or len(uncited_assertive_claims) > 0
+        or len(unresolved_gaps) > 0
+    )
+    passed = bool((weighted_score >= 0.58) and not must_fail)
+    task.quality_confidence = confidence_label
+    if task.steps:
+        task.steps[-1].confidence_label = confidence_label
+        task.steps[-1].critic_verdict = "pass" if passed else "needs_revision"
     return {
         "passed": passed,
+        "quality_score": round(weighted_score, 4),
+        "quality_confidence": confidence_label,
         "evidence_count": evidence_count,
         "tool_evidence_count": len(tool_evidence_refs),
         "output_evidence_count": len(output_evidence_refs),
@@ -635,64 +669,43 @@ def should_open_checkpoint(
     active_plan_version_fn=None,
     gate_ack_token_fn=gate_ack_token,
 ) -> tuple[bool, str]:
-    queued = [str(item).strip() for item in (queued_feedback or []) if str(item).strip()]
-    if queued:
-        return True, "queued_feedback_pending"
-
     if not next_step:
         return False, "none"
-
-    quality_state = quality_state or {}
-    unresolved_gap_count = len(quality_state.get("unresolved_gaps", []) or [])
-    last_failures = int(quality_state.get("last_step_failures", 0) or 0)
-    last_output = str(quality_state.get("last_step_output", "") or "").lower()
-    plan = active_plan_version_fn(task) if active_plan_version_fn else None
-    plan_id = plan.version_id if plan else str(task.active_plan_version_id or "none")
-    hitl_events = set(task.hitl_history)
-
-    def _is_gate_acknowledged(reason: str) -> bool:
-        token = gate_ack_token_fn(reason, plan_id)
-        return bool(token and token in hitl_events)
-
+    ensure_phase_state(task)
     if next_step.recommended_tools and not any(step.tool_trace for step in task.steps if step.status == "completed"):
+        payload = {
+            "from_phase": "pre_execution",
+            "to_phase": infer_phase_for_step(next_step),
+            "summary": "Initial execution gate before running evidence tools.",
+            "question": "I have decomposed the plan. Should I begin evidence discovery now?",
+        }
+        task.checkpoint_payload = payload
+        append_event(task, EVENT_CHECKPOINT_OPENED, reason="pre_evidence_execution", payload=payload)
         return True, "pre_evidence_execution"
 
-    is_pre_final = bool(task.steps) and next_step.step_id == task.steps[-1].step_id
-    if unresolved_gap_count >= 2:
-        if _is_gate_acknowledged("quality_gap_spike"):
+    open_boundary, reason = should_checkpoint_for_phase_boundary(task, next_step)
+    if open_boundary:
+        plan_version_id = None
+        if callable(active_plan_version_fn):
+            try:
+                plan_version = active_plan_version_fn(task)
+            except Exception:
+                plan_version = None
+            if plan_version is not None:
+                plan_version_id = str(getattr(plan_version, "version_id", "") or "").strip() or None
+        ack_token = gate_ack_token_fn(reason, plan_version_id) if callable(gate_ack_token_fn) else None
+        if ack_token and ack_token in getattr(task, "hitl_history", []):
             return False, "none"
-        return True, "quality_gap_spike"
-    if is_pre_final and unresolved_gap_count >= 1:
-        if _is_gate_acknowledged("quality_gap_spike"):
-            return False, "none"
-        return True, "quality_gap_spike"
 
-    if last_failures >= 2:
-        if _is_gate_acknowledged("repeated_tool_failures"):
+        transition = str(reason.split(":", 1)[1]) if ":" in reason else ""
+        from_phase, to_phase = (transition.split("->", 1) + [""])[:2]
+        # Do not interrupt immediately before synthesis/reporting.
+        if to_phase.strip() == PHASE_SYNTHESIS:
             return False, "none"
-        return True, "repeated_tool_failures"
-
-    contradiction_markers = (
-        "contradict",
-        "inconsistent",
-        "conflict",
-        "uncertain",
-        "critical gap",
-        "service unavailable",
-        "failed due to api error",
-        "failed due to api errors",
-        "could not retrieve",
-        "unable to retrieve",
-    )
-    if any(marker in last_output for marker in contradiction_markers):
-        if _is_gate_acknowledged("uncertainty_spike"):
-            return False, "none"
-        return True, "uncertainty_spike"
-
-    if is_pre_final and any(event.lower().startswith("revise:") for event in task.hitl_history):
-        if _is_gate_acknowledged("pre_final_after_intent_change"):
-            return False, "none"
-        return True, "pre_final_after_intent_change"
+        payload = checkpoint_payload_for_transition(task, from_phase.strip(), to_phase.strip())
+        task.checkpoint_payload = payload
+        append_event(task, EVENT_CHECKPOINT_OPENED, reason=reason, payload=payload)
+        return True, reason
 
     return False, "none"
 
@@ -704,6 +717,7 @@ def render_quality_gate_message(report: dict) -> str:
         f"- Output references detected: {report.get('output_evidence_count', 0)}",
         f"- Step coverage ratio: {report['coverage_ratio']:.2f}",
         f"- Tool calls captured: {report.get('tool_call_count', 0)}",
+        f"- Quality score/confidence: {report.get('quality_score', 0.0):.2f} / {report.get('quality_confidence', 'unknown')}",
         (
             "- MCP response contracts: "
             f"{report.get('mcp_contract_ok_count', 0)}/{report.get('mcp_contract_expected_count', 0)} valid"
@@ -742,113 +756,6 @@ def clean_recovery_text(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
-async def run_fallback_recovery(
-    runner,
-    session_id: str,
-    user_id: str,
-    task,
-    *,
-    run_runner_turn_with_trace_fn,
-    format_step_execution_error_fn,
-    clean_recovery_text_fn=clean_recovery_text,
-) -> tuple[str, list[dict]]:
-    fallback_tools: list[str] = []
-    for step in task.steps:
-        fallback_tools.extend(step.fallback_tools)
-    fallback_tools = sorted(set(fallback_tools))
-    trace_entries = _collect_trace_entries(task)
-    tool_evidence_refs = _collect_tool_evidence_refs(trace_entries)
-    executed_tools = {
-        str(entry.get("tool_name", "")).strip()
-        for entry in trace_entries
-        if str(entry.get("tool_name", "")).strip()
-    }
-    missing_recommended_tools: list[str] = []
-    for step in task.steps:
-        if step.status != "completed" or not step.recommended_tools or step.tool_trace:
-            continue
-        for tool in step.recommended_tools:
-            normalized_tool = str(tool).strip()
-            if not normalized_tool or normalized_tool in executed_tools:
-                continue
-            if normalized_tool not in missing_recommended_tools:
-                missing_recommended_tools.append(normalized_tool)
-
-    fallback_guidance = ""
-    if "researcher_discovery" in task.intent_tags:
-        fallback_guidance = (
-            "For researcher ranking requests, prioritize publication-centric recovery tools in this order: "
-            "rank_researchers_by_activity, search_openalex_works, search_pubmed_advanced, get_pubmed_author_profile. "
-            "Avoid clinical-trials-only fallback unless explicitly requested.\n"
-        )
-        if not _contains_pubmed_ref(tool_evidence_refs):
-            fallback_guidance += (
-                "Mandatory recovery action: execute `search_pubmed_advanced` and include at least one PMID:#### "
-                "citation in revised_recommendation or key_results.\n"
-            )
-    if missing_recommended_tools:
-        fallback_guidance += (
-            "Mandatory recovery action: execute at least one previously-missed recommended tool if feasible: "
-            f"{', '.join(missing_recommended_tools)}.\n"
-        )
-    prompt = (
-        "Perform one fallback recovery pass before final synthesis.\n"
-        f"Objective: {task.objective}\n"
-        f"Intent tags: {', '.join(task.intent_tags)}\n"
-        f"Fallback tools to prioritize: {', '.join(fallback_tools) if fallback_tools else 'N/A'}\n"
-        f"{fallback_guidance}"
-        "You must execute at least one relevant tool call unless no relevant tool exists.\n"
-        "Required output fields: selected_tools, why_chosen, revised_recommendation, key_results, remaining_gaps.\n"
-        "For revised_recommendation, the first sentence must include at least one inline citation ID "
-        "(PMID/NCT/DOI/OpenAlex) when any validated evidence refs are available.\n"
-        "Use explicit citations where possible."
-    )
-    try:
-        raw, trace_entries = await run_runner_turn_with_trace_fn(runner, session_id, user_id, prompt)
-    except Exception as exc:
-        return format_step_execution_error_fn(exc, fallback_tools), []
-    for entry in trace_entries:
-        entry["phase"] = "fallback_recovery"
-
-    need_pubmed_repair = (
-        "researcher_discovery" in task.intent_tags
-        and not _contains_pubmed_ref(tool_evidence_refs)
-        and not any(
-            str(entry.get("tool_name", "")) == "search_pubmed_advanced"
-            and str(entry.get("outcome", "")) == "ok"
-            for entry in trace_entries
-        )
-    )
-    if need_pubmed_repair:
-        repair_prompt = (
-            "Fallback repair required: prior recovery did not run `search_pubmed_advanced` successfully.\n"
-            f"Objective: {task.objective}\n"
-            "Execute `search_pubmed_advanced` now with the same scoped topic/timeframe and return:\n"
-            "- selected_tools\n"
-            "- revised_recommendation (first sentence must include PMID citation)\n"
-            "- key_results\n"
-            "- remaining_gaps\n"
-            "Use only citation IDs directly supported by this run."
-        )
-        try:
-            repaired_raw, repair_trace = await run_runner_turn_with_trace_fn(runner, session_id, user_id, repair_prompt)
-        except Exception:
-            repair_trace = []
-            repaired_raw = ""
-        if repair_trace:
-            for entry in repair_trace:
-                entry["phase"] = "fallback_recovery_repair"
-            trace_entries.extend(repair_trace)
-            if repaired_raw.strip():
-                raw = repaired_raw
-
-    cleaned = clean_recovery_text_fn(raw)
-    recovery_refs = _collect_tool_evidence_refs(trace_entries)
-    augmented_refs = set(tool_evidence_refs).union(recovery_refs)
-    repaired = _inject_inline_citation_in_recommendation(cleaned, augmented_refs)
-    return repaired, trace_entries
-
-
 async def complete_remaining_steps(
     runner,
     session_id: str,
@@ -859,14 +766,8 @@ async def complete_remaining_steps(
     execute_step_fn,
     evaluate_quality_gates_fn=evaluate_quality_gates,
     render_quality_gate_message_fn=render_quality_gate_message,
-    run_fallback_recovery_fn=None,
     print_fn=print,
 ) -> dict:
-    if run_fallback_recovery_fn is None:
-        raise ValueError("run_fallback_recovery_fn is required")
-
-    task.fallback_recovery_notes = ""
-    task.fallback_tool_trace = []
     for idx in range(task.current_step_index + 1, len(task.steps)):
         step_text = await execute_step_fn(runner, session_id, user_id, task, idx)
         state_store.save_task(task, note=f"step_{idx + 1}_completed")
@@ -874,12 +775,6 @@ async def complete_remaining_steps(
 
     quality = evaluate_quality_gates_fn(task)
     print_fn("\n" + render_quality_gate_message_fn(quality))
-    if not quality["passed"]:
-        print_fn("\nRunning one fallback recovery pass...")
-        recovery, recovery_trace = await run_fallback_recovery_fn(runner, session_id, user_id, task)
-        task.fallback_tool_trace = recovery_trace
-        task.fallback_recovery_notes = recovery or ""
-        quality = evaluate_quality_gates_fn(task)
     return quality
 
 
@@ -894,6 +789,16 @@ def format_checkpoint_reason(reason: str) -> str:
         "queued_feedback_pending": "Queued feedback pending application",
     }
     key = str(reason or "").strip()
+    if key.startswith("phase_boundary:"):
+        transition = key.split(":", 1)[1]
+        from_phase, to_phase = (transition.split("->", 1) + [""])[:2]
+        if from_phase and to_phase:
+            return (
+                "Phase boundary reached: "
+                + from_phase.replace("_", " ")
+                + " -> "
+                + to_phase.replace("_", " ")
+            )
     return mapping.get(key, key.replace("_", " ") if key else "unspecified")
 
 
