@@ -60,8 +60,8 @@ flowchart TD
     O --> P[Persist canonical report markdown + PDF]
     P --> Q[UI/CLI render same report content]
 
-    classDef llm fill:#e6f7ff,stroke:#1890ff,stroke-width:2px;
-    classDef guard fill:#f6ffed,stroke:#52c41a,stroke-width:1px;
+    classDef llm fill:#eef2f7,stroke:#5f6b7a,stroke-width:1.5px,color:#1f2933;
+    classDef guard fill:#f3f4f6,stroke:#6b7280,stroke-width:1.5px,color:#1f2933;
     class C,D,I,J,O llm;
     class B,E,F,H,K,L,M,N,P,Q,Z guard;
 ```
