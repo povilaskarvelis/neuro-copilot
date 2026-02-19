@@ -38,36 +38,38 @@ The flow below highlights where LLM reasoning is required versus deterministic r
 
 ```mermaid
 flowchart TD
-    A[User Query] --> B[Intent + Task Bootstrap]
-    B --> C{{LLM: Intent classification and objective interpretation}}
-    C --> C1{Ambiguity requires clarification?}
-    C1 -->|Yes| C2[Open clarification HITL checkpoint]
-    C2 --> C3[Merge user clarification into objective]
-    C3 --> D{{LLM: Draft dynamic plan graph from tools + objective}}
-    C1 -->|No| D
-    D --> E[Normalize + persist plan version]
-    E --> F[Open initial HITL checkpoint]
-    F --> G{User action}
-    G -->|Start/Continue| H[Execute next planned step]
-    G -->|Revise once| I{{LLM: Parse revision intent + replan remaining steps}}
-    I --> E
-    G -->|Stop| Z[Task paused/blocked]
+    A[User submits a research question] --> B{{Model checks if the question is ambiguous or malformed (clarifier)}}
+    B --> C1{Is clarification needed before running tools?}
+    C1 -->|Yes| C2[Pause and ask the user a short clarification question (HITL clarification gate)]
+    C2 --> C3[Attach the user's clarification to the objective (objective merge)]
+    C1 -->|No| C
+    C3 --> C
+    C{{Hybrid router sets request type, intent tags, and normalized objective (heuristics + LLM)}}
+    C --> D{{Planner drafts a query-specific subgoal graph from objective + available tools (dynamic planner)}}
+    D --> E[Convert subgoals into executable workflow steps and save active plan metadata (WorkflowTask + PlanVersion)]
+    E --> E1[Run the first planning/scope step (step_1 decomposition)]
+    E1 --> F[Open the initial execution checkpoint before tool-heavy steps (pre_evidence_execution)]
+    F --> G{User action at checkpoint}
+    G -->|Start/Continue| H[Run the next planned step and persist task state]
+    G -->|Revise once| I{{Parse user feedback into structured revision intent, then replan remaining steps (replan)}}
+    I --> F
+    G -->|Stop (CLI)| Z[Mark task as blocked/paused until resumed]
 
-    H --> J{{LLM: Step reasoning + tool-call decisions}}
-    J --> K[MCP tool execution + trace capture]
-    K --> L[Quality signals update]
-    L --> M{Adaptive checkpoint needed?}
+    H --> J{{Model executes the current step prompt and chooses from allowed tools (executor)}}
+    J --> K[Run MCP tools, capture tool traces, and validate tool response contracts]
+    K --> L[Recompute quality gates (coverage, citations, unresolved gaps, confidence)]
+    L --> M{Open another checkpoint now? (phase boundary or pre-evidence gate)}
     M -->|Yes| F
-    M -->|No| N{More steps remain?}
+    M -->|No| N{Are there remaining steps?}
     N -->|Yes| H
-    N -->|No| O{{LLM: Final synthesis/report step output}}
-    O --> P[Persist canonical report markdown + PDF]
-    P --> Q[UI/CLI render same report content]
+    N -->|No| O{{Model writes the final recommendation/report step (synthesis)}}
+    O --> P[Persist final report markdown and make PDF export available (report artifacts)]
+    P --> Q[Render the same report content in UI and CLI]
 
     classDef llm fill:#eef2f7,stroke:#5f6b7a,stroke-width:1.5px,color:#1f2933;
     classDef guard fill:#f3f4f6,stroke:#6b7280,stroke-width:1.5px,color:#1f2933;
-    class C,D,I,J,O llm;
-    class B,C1,C2,C3,E,F,H,K,L,M,N,P,Q,Z guard;
+    class B,C,D,I,J,O llm;
+    class C1,C2,C3,E,E1,F,H,K,L,M,N,P,Q,Z guard;
 ```
 
 Legend:
@@ -128,6 +130,13 @@ In co-investigator mode, each request now:
 3. supports one revision opportunity after initial plan creation,
 4. runs straight through to synthesis/reporting (no forced checkpoint right before synthesis),
 5. saves report artifacts to `adk-agent/reports/<task_id>.md` and `adk-agent/reports/<task_id>.pdf`.
+
+Web UI thread model:
+- The sidebar groups runs by conversation thread (not by single task only).
+- Each follow-up creates a new iteration task in the same conversation.
+- Follow-ups can branch from any selected prior report card.
+- Every iteration has a separate research log in main chat.
+- Suggested next actions are shown in main chat only (the report panel omits the `Next Actions` section).
 
 PDF rendering behavior:
 - Uses a high-fidelity HTML/CSS pipeline via headless Chrome/Chromium when available.

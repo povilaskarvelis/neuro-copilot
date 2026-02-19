@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import uuid
 
-from workflow import WorkflowTask
+from workflow import WorkflowTask, generate_chat_title
 
 
 MAX_TASK_HISTORY_REVISIONS = 120
@@ -82,7 +82,19 @@ class TaskStateStore:
         if len(task_history) > MAX_TASK_HISTORY_REVISIONS:
             histories[task_id] = task_history[-MAX_TASK_HISTORY_REVISIONS:]
 
+    def resolve_conversation_id(self, task: WorkflowTask) -> str:
+        conversation_id = str(getattr(task, "conversation_id", "") or "").strip()
+        if conversation_id:
+            return conversation_id
+        task_id = str(getattr(task, "task_id", "") or "").strip()
+        if not task_id:
+            return "conv_unknown"
+        return f"conv_{task_id}"
+
     def save_task(self, task: WorkflowTask, note: str | None = None) -> None:
+        task.conversation_id = self.resolve_conversation_id(task)
+        if not str(task.user_query or "").strip():
+            task.user_query = str(task.objective or "").strip()
         payload = self._read_payload()
         task_payload = task.to_dict()
         self._upsert_task_payload(payload, task_payload)
@@ -93,12 +105,25 @@ class TaskStateStore:
         payload = self._read_payload()
         for item in payload["tasks"]:
             if item.get("task_id") == task_id:
-                return WorkflowTask.from_dict(item)
+                task = WorkflowTask.from_dict(item)
+                if not str(task.conversation_id or "").strip():
+                    task.conversation_id = self.resolve_conversation_id(task)
+                if not str(task.user_query or "").strip():
+                    task.user_query = str(task.objective or "").strip()
+                return task
         return None
 
     def list_tasks(self) -> list[WorkflowTask]:
         payload = self._read_payload()
-        return [WorkflowTask.from_dict(item) for item in payload["tasks"]]
+        tasks: list[WorkflowTask] = []
+        for item in payload["tasks"]:
+            task = WorkflowTask.from_dict(item)
+            if not str(task.conversation_id or "").strip():
+                task.conversation_id = self.resolve_conversation_id(task)
+            if not str(task.user_query or "").strip():
+                task.user_query = str(task.objective or "").strip()
+            tasks.append(task)
+        return tasks
 
     def latest_task(self) -> WorkflowTask | None:
         tasks = self.list_tasks()
@@ -148,3 +173,70 @@ class TaskStateStore:
         )
         self._write_payload(payload)
         return WorkflowTask.from_dict(restored_payload)
+
+    def list_tasks_in_conversation(self, conversation_id: str) -> list[WorkflowTask]:
+        normalized = str(conversation_id or "").strip()
+        if not normalized:
+            return []
+        tasks = [task for task in self.list_tasks() if self.resolve_conversation_id(task) == normalized]
+        tasks.sort(key=lambda task: (str(task.created_at or ""), str(task.task_id or "")))
+        return tasks
+
+    def list_children(self, task_id: str) -> list[WorkflowTask]:
+        normalized = str(task_id or "").strip()
+        if not normalized:
+            return []
+        children = [task for task in self.list_tasks() if str(task.parent_task_id or "").strip() == normalized]
+        children.sort(key=lambda task: (str(task.created_at or ""), str(task.task_id or "")))
+        return children
+
+    def get_task_ancestry(self, task_id: str) -> list[WorkflowTask]:
+        normalized = str(task_id or "").strip()
+        if not normalized:
+            return []
+        tasks_by_id = {task.task_id: task for task in self.list_tasks()}
+        current = tasks_by_id.get(normalized)
+        if current is None:
+            return []
+        ancestry_rev: list[WorkflowTask] = []
+        seen: set[str] = set()
+        conversation_id = self.resolve_conversation_id(current)
+        while current and current.task_id not in seen:
+            seen.add(current.task_id)
+            ancestry_rev.append(current)
+            parent_id = str(current.parent_task_id or "").strip()
+            if not parent_id:
+                break
+            parent = tasks_by_id.get(parent_id)
+            if parent is None:
+                break
+            if self.resolve_conversation_id(parent) != conversation_id:
+                break
+            current = parent
+        return list(reversed(ancestry_rev))
+
+    def list_conversations(self) -> list[dict]:
+        tasks = self.list_tasks()
+        grouped: dict[str, list[WorkflowTask]] = {}
+        for task in tasks:
+            conversation_id = self.resolve_conversation_id(task)
+            grouped.setdefault(conversation_id, []).append(task)
+
+        summaries: list[dict] = []
+        for conversation_id, items in grouped.items():
+            items.sort(key=lambda task: (str(task.updated_at or ""), str(task.task_id or "")), reverse=True)
+            latest = items[0]
+            root = min(items, key=lambda task: (str(task.created_at or ""), str(task.task_id or "")))
+            summaries.append(
+                {
+                    "conversation_id": conversation_id,
+                    "title": str(latest.title or root.title or "").strip() or generate_chat_title(root.objective),
+                    "latest_task_id": latest.task_id,
+                    "latest_status": latest.status,
+                    "updated_at": latest.updated_at,
+                    "iteration_count": len(items),
+                    "root_task_id": root.task_id,
+                }
+            )
+        summaries.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+        return summaries

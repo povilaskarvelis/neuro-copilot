@@ -461,16 +461,25 @@ def evaluate_quality_gates(task) -> dict:
 
     combined_output = "\n".join(step.output for step in task.steps if step.output).lower()
     objective_lower = task.objective.lower()
-    if "researcher_discovery" in task.intent_tags:
+    researcher_mode = any(token in objective_lower for token in ["researcher", "author", "investigator", "affiliation", "expert"])
+    if researcher_mode:
         if "cannot be directly listed" in combined_output or "tool limitation" in combined_output:
             _append_gap("Researcher/entity identification appears incomplete due to tool limitations.")
         if not any(token in combined_output for token in ["author", "researcher", "investigator", "affiliation"]):
             _append_gap("No explicit researcher entities were detected in the synthesis.")
 
-    if task.request_type in {"prioritization", "comparison"}:
+    prioritization_or_comparison = any(
+        token in objective_lower
+        for token in ["prioritize", "priority", "rank", "shortlist", "triage", "compare", "comparison", "versus", " vs "]
+    )
+    if prioritization_or_comparison:
         if not any(marker in combined_output for marker in ["rank", "score", "weighted", "priority", "trade-off", "tradeoff"]):
             _append_gap("Prioritization/comparison output lacks explicit ranking criteria or trade-off signals.")
-    if any(token in objective_lower for token in ["target", "druggab", "candidate"]) or "clinical_landscape" in task.intent_tags:
+    target_or_clinical_mode = any(
+        token in objective_lower
+        for token in ["target", "druggab", "candidate", "trial", "clinical", "nct", "phase"]
+    )
+    if target_or_clinical_mode:
         if any(
             token in combined_output
             for token in [
@@ -505,15 +514,13 @@ def evaluate_quality_gates(task) -> dict:
         for entry in failed_entries
         if str(entry.get("tool_name", "")).strip()
     }
-    genetics_priority = (
-        "genetics_direction" in task.intent_tags
-        or any(token in objective_lower for token in ["genetic", "gwas", "variant", "direction-of-effect"])
-    )
+    genetics_priority = any(token in objective_lower for token in ["genetic", "gwas", "variant", "direction-of-effect"])
     if genetics_priority and failed_tools.intersection(
         {"infer_genetic_effect_direction", "search_gwas_associations", "search_clinvar_variants"}
     ):
         _append_gap("High-priority human genetics direction evidence is incomplete due to tool failures.")
-    if "safety_assessment" in task.intent_tags and "summarize_target_safety_liabilities" in failed_tools:
+    safety_mode = any(token in objective_lower for token in ["safety", "toxicity", "liability", "adverse", "tolerability"])
+    if safety_mode and "summarize_target_safety_liabilities" in failed_tools:
         _append_gap("High-priority safety-liability evidence is incomplete or ambiguous.")
 
     critical_marker_patterns = (

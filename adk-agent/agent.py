@@ -48,16 +48,12 @@ from workflow import (
     RevisionIntent,
     WorkflowTask,
     active_plan_version,
-    classify_request_type,
     create_task,
     extract_evidence_refs,
-    infer_intent_tags,
     initialize_plan_version,
     replan_remaining_steps,
     render_final_report,
     render_status,
-    sanitize_intent_tags,
-    sanitize_request_type,
     step_prompt,
 )
 
@@ -136,31 +132,6 @@ Rules:
 - If no clarification is needed, set questions to [].
 """
 
-INTENT_ROUTER_INSTRUCTION = """You are an intent router for a biomedical co-scientist workflow.
-Your output configures planning behavior only.
-
-Return strict JSON only with this schema:
-{
-  "normalized_query": string,
-  "request_type": "comparison" | "prioritization" | "validation" | "action_planning" | "exploration",
-  "intent_tags": [string],
-  "confidence": number,
-  "reason": string
-}
-
-Rules:
-- Preserve user meaning while lightly correcting obvious typos in normalized_query.
-- intent_tags must come only from this set:
-  researcher_discovery, evidence_landscape, variant_check, pathway_context,
-  clinical_landscape, chemistry_evidence, ontology_expansion, expression_context,
-  genetics_direction, safety_assessment, competitive_landscape, comparison,
-  prioritization, target_comparison.
-- For researcher ranking requests, prefer researcher_discovery and prioritization.
-- Use target_comparison only when the request is explicitly about comparing/ranking targets.
-- confidence must be between 0 and 1.
-- Never include tool names or extra keys.
-"""
-
 REVISION_FEEDBACK_PARSER_INSTRUCTION = """You convert human feedback at a workflow checkpoint into structured intent updates.
 Return strict JSON only with this schema:
 {
@@ -206,6 +177,8 @@ Return strict JSON only with this schema:
 Rules:
 - Use only observable actions and outcomes from provided events.
 - Do not include private reasoning or chain-of-thought.
+- Write in first person as if speaking directly to the user (use "I ...").
+- Do not refer to yourself as "the agent", "the workflow", or "the system".
 - headline: <= 12 words.
 - summary: 1-2 short sentences.
 - completed: max 3 bullets.
@@ -353,55 +326,9 @@ def _normalize_user_query(query: str) -> str:
     return _planning_intent.normalize_user_query(query)
 
 
-def _coerce_model_intent_tags(value) -> list[str]:
-    return _planning_intent.coerce_model_intent_tags(value)
-
-
-def _default_intent_route(query: str) -> dict:
-    return _planning_intent.default_intent_route(query)
-
-
-async def _build_model_intent_route(
-    intent_router_runner,
-    intent_router_session_id: str,
-    user_id: str,
-    query: str,
-) -> dict | None:
-    return await _planning_intent.build_model_intent_route(
-        intent_router_runner,
-        intent_router_session_id,
-        user_id,
-        query,
-        run_runner_turn_fn=_run_runner_turn,
-    )
-
-
-def _merge_intent_routes(deterministic_route: dict, model_route: dict | None) -> dict:
-    return _planning_intent.merge_intent_routes(deterministic_route, model_route)
-
-
-async def _route_query_intent(
-    query: str,
-    *,
-    intent_router_runner=None,
-    intent_router_session_id: str | None = None,
-    user_id: str = "researcher",
-) -> dict:
-    return await _planning_intent.route_query_intent(
-        query,
-        intent_router_runner=intent_router_runner,
-        intent_router_session_id=intent_router_session_id,
-        user_id=user_id,
-        run_runner_turn_fn=_run_runner_turn,
-        build_model_intent_route_fn=_build_model_intent_route,
-    )
-
-
 async def _draft_model_plan_graph(
     objective: str,
     *,
-    request_type: str,
-    intent_tags: list[str],
     planner_runner=None,
     planner_session_id: str | None = None,
     user_id: str = "researcher",
@@ -420,8 +347,6 @@ async def _draft_model_plan_graph(
         f"{PLANNER_PROMPT}\n\n"
         f"{PLANNER_GRAPH_SCHEMA_PROMPT}\n\n"
         f"Objective: {objective}\n"
-        f"Request type: {request_type}\n"
-        f"Intent tags: {', '.join(intent_tags) if intent_tags else 'none'}\n"
         "Available tools (name + inferred capabilities):\n"
         f"{chr(10).join(tool_lines) if tool_lines else '- none'}\n"
     )
@@ -438,8 +363,6 @@ async def _draft_model_plan_graph(
     normalized = _workflow_planning.normalize_plan_graph(
         raw_subgoals,
         objective=objective,
-        intent_tags=intent_tags,
-        request_type=request_type,
     )
     return normalized or None
 
@@ -450,16 +373,6 @@ def create_clarifier_agent():
         name="clarifier",
         model="gemini-2.5-flash",
         instruction=CLARIFIER_INSTRUCTION,
-        tools=[],
-    )
-
-
-def create_intent_router_agent():
-    """Create a no-tool intent router for robust query classification."""
-    return Agent(
-        name="intent_router",
-        model="gemini-2.5-flash",
-        instruction=INTENT_ROUTER_INSTRUCTION,
         tools=[],
     )
 
@@ -767,8 +680,6 @@ async def _apply_feedback_replan_cli(
     task: WorkflowTask,
     feedback_text: str,
     *,
-    intent_router_runner=None,
-    intent_router_session_id: str | None = None,
     planner_runner=None,
     planner_session_id: str | None = None,
     feedback_parser_runner=None,
@@ -801,18 +712,8 @@ async def _apply_feedback_replan_cli(
     )
     revised_objective = _merge_objective_with_revision_intent(task.base_objective or task.objective, merged_intent)
 
-    intent_route = await _route_query_intent(
-        revised_objective,
-        intent_router_runner=intent_router_runner,
-        intent_router_session_id=intent_router_session_id,
-        user_id=user_id,
-    )
-    request_type = str(intent_route.get("request_type", task.request_type) or task.request_type)
-    intent_tags = list(intent_route.get("intent_tags", task.intent_tags) or task.intent_tags)
     model_plan_graph = await _draft_model_plan_graph(
         revised_objective,
-        request_type=request_type,
-        intent_tags=intent_tags,
         planner_runner=planner_runner,
         planner_session_id=planner_session_id,
         user_id=user_id,
@@ -821,8 +722,6 @@ async def _apply_feedback_replan_cli(
     replan_remaining_steps(
         task,
         revised_objective=revised_objective,
-        request_type=request_type,
-        intent_tags=intent_tags,
         revision_intent=merged_intent,
         gate_reason=gate_reason,
         use_dynamic_planner=DYNAMIC_PLANNER_GRAPH_ENABLED,
@@ -970,24 +869,18 @@ async def _start_new_workflow_task(
     user_id: str,
     state_store: TaskStateStore,
     objective: str,
-    intent_route: dict | None = None,
     planner_runner=None,
     planner_session_id: str | None = None,
     task_id_override: str | None = None,
     created_at_override: str | None = None,
     hitl_history_seed: list[str] | None = None,
 ) -> WorkflowTask:
-    route = intent_route or _default_intent_route(objective)
-    routed_objective = str(route.get("normalized_query") or objective).strip() or objective
+    routed_objective = _normalize_user_query(objective) or objective
     original_revision_directive = _extract_revision_directive_from_objective(objective)
     if original_revision_directive and not _extract_revision_directive_from_objective(routed_objective):
         routed_objective = _merge_objective_with_revision(routed_objective, original_revision_directive)
-    routed_request_type = sanitize_request_type(str(route.get("request_type", "")).strip())
-    routed_intent_tags = sanitize_intent_tags(route.get("intent_tags"))
     model_plan_graph = await _draft_model_plan_graph(
         routed_objective,
-        request_type=routed_request_type or classify_request_type(routed_objective),
-        intent_tags=routed_intent_tags or infer_intent_tags(routed_objective),
         planner_runner=planner_runner,
         planner_session_id=planner_session_id,
         user_id=user_id,
@@ -1004,8 +897,6 @@ async def _start_new_workflow_task(
         print("- Re-running scope/decomposition with this revision.")
     task = create_task(
         routed_objective,
-        request_type_override=routed_request_type,
-        intent_tags_override=routed_intent_tags,
         use_dynamic_planner=DYNAMIC_PLANNER_GRAPH_ENABLED,
         tool_registry_summary=_TOOL_REGISTRY.summary(max_tools=120),
         plan_graph_override=model_plan_graph,
@@ -1095,21 +986,6 @@ async def run_interactive_async():
         app_name="co_scientist_clarifier",
         session_service=session_service,
     )
-    intent_router_runner = Runner(
-        agent=create_intent_router_agent(),
-        app_name="co_scientist_intent_router",
-        session_service=session_service,
-    )
-    planner_runner = Runner(
-        agent=create_planner_agent(),
-        app_name="co_scientist_planner",
-        session_service=session_service,
-    )
-    planner_runner = Runner(
-        agent=create_planner_agent(),
-        app_name="co_scientist_planner",
-        session_service=session_service,
-    )
     planner_runner = Runner(
         agent=create_planner_agent(),
         app_name="co_scientist_planner",
@@ -1128,18 +1004,6 @@ async def run_interactive_async():
     )
     clarifier_session = await session_service.create_session(
         app_name="co_scientist_clarifier",
-        user_id="researcher",
-    )
-    intent_router_session = await session_service.create_session(
-        app_name="co_scientist_intent_router",
-        user_id="researcher",
-    )
-    planner_session = await session_service.create_session(
-        app_name="co_scientist_planner",
-        user_id="researcher",
-    )
-    planner_session = await session_service.create_session(
-        app_name="co_scientist_planner",
         user_id="researcher",
     )
     planner_session = await session_service.create_session(
@@ -1263,19 +1127,12 @@ async def run_interactive_async():
                         print("Type your clarification, or `stop` to cancel.")
                         continue
                     print("\nClarification received. Continuing workflow...")
-                    intent_route = await _route_query_intent(
-                        clarified_query,
-                        intent_router_runner=intent_router_runner,
-                        intent_router_session_id=intent_router_session.id,
-                        user_id="researcher",
-                    )
                     active_task = await _start_new_workflow_task(
                         runner,
                         session.id,
                         "researcher",
                         state_store,
                         clarified_query,
-                        intent_route=intent_route,
                         planner_runner=planner_runner,
                         planner_session_id=planner_session.id,
                     )
@@ -1385,8 +1242,6 @@ async def run_interactive_async():
                             state_store=state_store,
                             task=active_task,
                             feedback_text=feedback_text,
-                            intent_router_runner=intent_router_runner,
-                            intent_router_session_id=intent_router_session.id,
                             planner_runner=planner_runner,
                             planner_session_id=planner_session.id,
                             feedback_parser_runner=feedback_parser_runner,
@@ -1415,19 +1270,12 @@ async def run_interactive_async():
                     continue
 
                 # New request -> create a planned workflow and run step 1.
-                intent_route = await _route_query_intent(
-                    user_input,
-                    intent_router_runner=intent_router_runner,
-                    intent_router_session_id=intent_router_session.id,
-                    user_id="researcher",
-                )
                 active_task = await _start_new_workflow_task(
                     runner,
                     session.id,
                     "researcher",
                     state_store,
                     user_input,
-                    intent_route=intent_route,
                     planner_runner=planner_runner,
                     planner_session_id=planner_session.id,
                 )
@@ -1459,11 +1307,6 @@ async def run_single_query_async(query: str, *, state_store_path: Path | None = 
         app_name="co_scientist_clarifier",
         session_service=session_service,
     )
-    intent_router_runner = Runner(
-        agent=create_intent_router_agent(),
-        app_name="co_scientist_intent_router",
-        session_service=session_service,
-    )
     planner_runner = Runner(
         agent=create_planner_agent(),
         app_name="co_scientist_planner",
@@ -1471,10 +1314,6 @@ async def run_single_query_async(query: str, *, state_store_path: Path | None = 
     )
     clarifier_session = await session_service.create_session(
         app_name="co_scientist_clarifier",
-        user_id="researcher",
-    )
-    intent_router_session = await session_service.create_session(
-        app_name="co_scientist_intent_router",
         user_id="researcher",
     )
     planner_session = await session_service.create_session(
@@ -1513,27 +1352,15 @@ async def run_single_query_async(query: str, *, state_store_path: Path | None = 
     )
     default_state_path = Path(__file__).parent / "state" / "workflow_tasks.json"
     state_store = TaskStateStore(state_store_path or default_state_path)
-    intent_route = await _route_query_intent(
-        query,
-        intent_router_runner=intent_router_runner,
-        intent_router_session_id=intent_router_session.id,
-        user_id="researcher",
-    )
-    routed_query = str(intent_route.get("normalized_query") or query).strip() or query
-    request_type = sanitize_request_type(str(intent_route.get("request_type", "")).strip()) or classify_request_type(routed_query)
-    intent_tags = sanitize_intent_tags(intent_route.get("intent_tags")) or infer_intent_tags(routed_query)
+    routed_query = _normalize_user_query(query) or query
     model_plan_graph = await _draft_model_plan_graph(
         routed_query,
-        request_type=request_type,
-        intent_tags=intent_tags,
         planner_runner=planner_runner,
         planner_session_id=planner_session.id,
         user_id="researcher",
     )
     task = create_task(
         routed_query,
-        request_type_override=request_type,
-        intent_tags_override=intent_tags,
         tool_registry_summary=_TOOL_REGISTRY.summary(max_tools=120),
         plan_graph_override=model_plan_graph,
     )

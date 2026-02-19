@@ -447,7 +447,7 @@ body.expanded .messages {
   min-width: 0;
 }
 
-#activityTitle {
+.activity-title {
   font-size: 0.82rem;
   letter-spacing: 0.02em;
   color: #eaf3ff;
@@ -539,6 +539,53 @@ body.expanded .messages {
 
 .checkpoint-action-message .checkpoint-start-btn {
   margin-top: 2px;
+}
+
+.report-card {
+  border: 1px solid #2c3442 !important;
+  border-radius: 12px !important;
+  background: linear-gradient(145deg, rgba(24, 28, 40, 0.94), rgba(14, 17, 26, 0.96)) !important;
+  box-shadow:
+    0 0 0 1px rgba(135, 162, 198, 0.08) inset,
+    0 12px 26px rgba(0, 0, 0, 0.24);
+  padding: 10px 12px !important;
+  cursor: pointer;
+  margin: 2px 0 4px;
+}
+
+.report-card.active {
+  border-color: #5f7ea0 !important;
+  box-shadow:
+    0 0 0 1px rgba(146, 190, 234, 0.22) inset,
+    0 0 18px rgba(84, 130, 183, 0.25);
+}
+
+.report-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.76rem;
+  color: #b8c7d9;
+}
+
+.report-card-title {
+  margin-top: 6px;
+  color: #e7eef8;
+  font-size: 0.86rem;
+  line-height: 1.35;
+}
+
+.branch-badge {
+  display: inline-block;
+  margin-top: 8px;
+  border: 1px solid #35516d;
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: #b6cee8;
+  background: rgba(34, 58, 86, 0.55);
 }
 
 .message-head {

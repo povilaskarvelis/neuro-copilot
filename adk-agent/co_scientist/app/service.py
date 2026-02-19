@@ -17,7 +17,6 @@ from workflow import RevisionIntent, WorkflowTask
 
 MAIN_APP_NAME = "co_scientist_ui"
 CLARIFIER_APP_NAME = "co_scientist_clarifier_ui"
-INTENT_ROUTER_APP_NAME = "co_scientist_intent_router_ui"
 FEEDBACK_PARSER_APP_NAME = "co_scientist_feedback_parser_ui"
 PLANNER_APP_NAME = "co_scientist_planner_ui"
 TITLE_SUMMARIZER_APP_NAME = "co_scientist_title_summarizer_ui"
@@ -28,14 +27,12 @@ PROGRESS_SUMMARIZER_APP_NAME = "co_scientist_progress_summarizer_ui"
 class AppRuntimeComponents:
     runner: Runner
     clarifier_runner: Runner
-    intent_router_runner: Runner
     feedback_parser_runner: Runner
     planner_runner: Runner
     title_summarizer_runner: Runner
     progress_summarizer_runner: Runner
     session_id: str
     clarifier_session_id: str
-    intent_router_session_id: str
     feedback_parser_session_id: str
     planner_session_id: str
     title_summarizer_session_id: str
@@ -59,11 +56,6 @@ async def create_runtime_components(
     clarifier_runner = Runner(
         agent=_agent.create_clarifier_agent(),
         app_name=CLARIFIER_APP_NAME,
-        session_service=session_service,
-    )
-    intent_router_runner = Runner(
-        agent=_agent.create_intent_router_agent(),
-        app_name=INTENT_ROUTER_APP_NAME,
         session_service=session_service,
     )
     feedback_parser_runner = Runner(
@@ -90,7 +82,6 @@ async def create_runtime_components(
     (
         main_session,
         clarifier_session,
-        intent_router_session,
         feedback_parser_session,
         planner_session,
         title_summarizer_session,
@@ -98,7 +89,6 @@ async def create_runtime_components(
     ) = await asyncio.gather(
         session_service.create_session(app_name=MAIN_APP_NAME, user_id=user_id),
         session_service.create_session(app_name=CLARIFIER_APP_NAME, user_id=user_id),
-        session_service.create_session(app_name=INTENT_ROUTER_APP_NAME, user_id=user_id),
         session_service.create_session(app_name=FEEDBACK_PARSER_APP_NAME, user_id=user_id),
         session_service.create_session(app_name=PLANNER_APP_NAME, user_id=user_id),
         session_service.create_session(app_name=TITLE_SUMMARIZER_APP_NAME, user_id=user_id),
@@ -108,14 +98,12 @@ async def create_runtime_components(
     return AppRuntimeComponents(
         runner=runner,
         clarifier_runner=clarifier_runner,
-        intent_router_runner=intent_router_runner,
         feedback_parser_runner=feedback_parser_runner,
         planner_runner=planner_runner,
         title_summarizer_runner=title_summarizer_runner,
         progress_summarizer_runner=progress_summarizer_runner,
         session_id=main_session.id,
         clarifier_session_id=clarifier_session.id,
-        intent_router_session_id=intent_router_session.id,
         feedback_parser_session_id=feedback_parser_session.id,
         planner_session_id=planner_session.id,
         title_summarizer_session_id=title_summarizer_session.id,
@@ -144,29 +132,12 @@ async def build_clarification_request(
     )
 
 
-async def route_query_intent(
-    query: str,
-    *,
-    intent_router_runner=None,
-    intent_router_session_id: str | None = None,
-    user_id: str = "researcher",
-) -> dict:
-    return await _planning_intent.route_query_intent(
-        query,
-        intent_router_runner=intent_router_runner,
-        intent_router_session_id=intent_router_session_id,
-        user_id=user_id,
-        run_runner_turn_fn=run_runner_turn,
-    )
-
-
 async def start_new_workflow_task(
     runner,
     session_id: str,
     user_id: str,
     state_store: TaskStateStore,
     objective: str,
-    intent_route: dict | None = None,
     planner_runner=None,
     planner_session_id: str | None = None,
     task_id_override: str | None = None,
@@ -179,7 +150,6 @@ async def start_new_workflow_task(
         user_id,
         state_store,
         objective,
-        intent_route=intent_route,
         planner_runner=planner_runner,
         planner_session_id=planner_session_id,
         task_id_override=task_id_override,
@@ -191,16 +161,12 @@ async def start_new_workflow_task(
 async def draft_model_plan_graph(
     objective: str,
     *,
-    request_type: str,
-    intent_tags: list[str],
     planner_runner=None,
     planner_session_id: str | None = None,
     user_id: str = "researcher",
 ) -> list[dict] | None:
     return await _agent._draft_model_plan_graph(
         objective,
-        request_type=request_type,
-        intent_tags=intent_tags,
         planner_runner=planner_runner,
         planner_session_id=planner_session_id,
         user_id=user_id,
@@ -264,7 +230,6 @@ __all__ = [
     "AppRuntimeComponents",
     "MAIN_APP_NAME",
     "CLARIFIER_APP_NAME",
-    "INTENT_ROUTER_APP_NAME",
     "FEEDBACK_PARSER_APP_NAME",
     "PLANNER_APP_NAME",
     "TITLE_SUMMARIZER_APP_NAME",
@@ -279,7 +244,6 @@ __all__ = [
     "merge_revision_intents",
     "parse_revision_intent",
     "resolve_rollback_revision_id",
-    "route_query_intent",
     "run_runner_turn",
     "should_open_checkpoint",
     "start_new_workflow_task",

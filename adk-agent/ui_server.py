@@ -31,10 +31,12 @@ from task_state_store import TaskStateStore
 from workflow import (
     WorkflowTask,
     active_plan_version,
+    derive_follow_up_suggestions,
     generate_chat_title,
     render_final_report,
     render_status,
     replan_remaining_steps,
+    split_report_and_next_actions,
 )
 
 
@@ -57,7 +59,10 @@ def _task_summary(task: WorkflowTask) -> dict:
     return {
         "task_id": task.task_id,
         "title": title,
+        "conversation_id": str(getattr(task, "conversation_id", "") or ""),
+        "parent_task_id": getattr(task, "parent_task_id", None),
         "objective": task.objective,
+        "user_query": str(getattr(task, "user_query", "") or task.objective),
         "status": task.status,
         "awaiting_hitl": bool(task.awaiting_hitl),
         "current_step_index": task.current_step_index,
@@ -96,6 +101,45 @@ def _compact_text(value: str, *, max_chars: int = 180) -> str:
     return f"{text[: max_chars - 3].rstrip()}..."
 
 
+def _first_person_progress_text(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+
+    replacements: list[tuple[str, str]] = [
+        (r"\b[Tt]he agents?\b", "I"),
+        (r"\b[Aa]gents?\b", "I"),
+        (r"\b[Tt]he workflow\b", "I"),
+        (r"\b[Tt]his workflow\b", "I"),
+        (r"\b[Tt]he system\b", "I"),
+    ]
+    for pattern, repl in replacements:
+        text = re.sub(pattern, repl, text)
+
+    text = re.sub(r"^\s*Task is\b", "I am", text)
+    text = re.sub(r"^\s*Task was\b", "I was", text)
+    text = re.sub(r"^\s*Task has\b", "I have", text)
+    text = re.sub(r"^\s*Task will\b", "I will", text)
+
+    grammar_fixes: list[tuple[str, str]] = [
+        (r"\bI are\b", "I am"),
+        (r"\bI is\b", "I am"),
+        (r"\bI has\b", "I have"),
+        (r"\bI does\b", "I do"),
+        (r"\bI needs\b", "I need"),
+        (r"\bI waits\b", "I wait"),
+        (r"\bI runs\b", "I run"),
+        (r"\bI opens\b", "I open"),
+        (r"\bI checks\b", "I check"),
+        (r"\bI builds\b", "I build"),
+        (r"\bI applies\b", "I apply"),
+        (r"\bI completes\b", "I complete"),
+    ]
+    for pattern, repl in grammar_fixes:
+        text = re.sub(pattern, repl, text)
+    return text
+
+
 def _extract_json_payload(raw: str) -> dict | None:
     text = str(raw or "").strip()
     if not text:
@@ -128,6 +172,7 @@ class RunRecord:
     progress_events: list[dict] = field(default_factory=list)
     progress_summaries: list[dict] = field(default_factory=list)
     final_report: str | None = None
+    follow_up_suggestions: list[str] = field(default_factory=list)
     clarification: str | None = None
     error: str | None = None
     created_at: str = field(default_factory=_utc_now)
@@ -145,6 +190,7 @@ class RunRecord:
             "progress_events": list(self.progress_events),
             "progress_summaries": list(self.progress_summaries),
             "final_report": self.final_report,
+            "follow_up_suggestions": list(self.follow_up_suggestions),
             "clarification": self.clarification,
             "error": self.error,
             "created_at": self.created_at,
@@ -154,6 +200,8 @@ class RunRecord:
 
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=5000)
+    conversation_id: str | None = Field(default=None, max_length=128)
+    parent_task_id: str | None = Field(default=None, max_length=128)
 
 
 class ReviseRequest(BaseModel):
@@ -182,14 +230,12 @@ class UiRuntime:
         self.session_service: InMemorySessionService | None = None
         self.runner: Runner | None = None
         self.clarifier_runner: Runner | None = None
-        self.intent_router_runner: Runner | None = None
         self.feedback_parser_runner: Runner | None = None
         self.planner_runner: Runner | None = None
         self.title_summarizer_runner: Runner | None = None
         self.progress_summarizer_runner: Runner | None = None
         self.session_id: str | None = None
         self.clarifier_session_id: str | None = None
-        self.intent_router_session_id: str | None = None
         self.feedback_parser_session_id: str | None = None
         self.planner_session_id: str | None = None
         self.title_summarizer_session_id: str | None = None
@@ -220,14 +266,12 @@ class UiRuntime:
             )
             self.runner = components.runner
             self.clarifier_runner = components.clarifier_runner
-            self.intent_router_runner = components.intent_router_runner
             self.feedback_parser_runner = components.feedback_parser_runner
             self.planner_runner = components.planner_runner
             self.title_summarizer_runner = components.title_summarizer_runner
             self.progress_summarizer_runner = components.progress_summarizer_runner
             self.session_id = components.session_id
             self.clarifier_session_id = components.clarifier_session_id
-            self.intent_router_session_id = components.intent_router_session_id
             self.feedback_parser_session_id = components.feedback_parser_session_id
             self.planner_session_id = components.planner_session_id
             self.title_summarizer_session_id = components.title_summarizer_session_id
@@ -252,6 +296,121 @@ class UiRuntime:
         if self.mcp_tools:
             await self.mcp_tools.close()
 
+    def _conversation_id_for_task(self, task: WorkflowTask) -> str:
+        return self.state_store.resolve_conversation_id(task)
+
+    def _build_task_research_log(self, task: WorkflowTask) -> dict:
+        events = [item for item in (task.progress_events or []) if isinstance(item, dict)]
+        summaries = [item for item in (task.progress_summaries or []) if isinstance(item, dict)]
+
+        step_events = [event for event in events if str(event.get("type", "")).strip() == "step.completed"]
+        step_completed_count = len(step_events)
+        tool_call_count = 0
+        evidence_ref_count = 0
+        for event in step_events:
+            metrics = event.get("metrics") or {}
+            try:
+                tool_call_count += int(metrics.get("tool_calls", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                evidence_ref_count += int(metrics.get("evidence_refs", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+
+        started_at = (
+            str(events[0].get("at", "")).strip()
+            if events
+            else str(task.created_at or "").strip()
+        )
+        ended_at = ""
+        if str(task.status or "") in {"completed", "failed"}:
+            ended_at = str(task.updated_at or "").strip()
+
+        return {
+            "task_id": task.task_id,
+            "events": events,
+            "summaries": summaries,
+            "stats": {
+                "step_completed_count": step_completed_count,
+                "tool_call_count": tool_call_count,
+                "evidence_ref_count": evidence_ref_count,
+                "status": str(task.status or ""),
+            },
+            "started_at": started_at,
+            "ended_at": ended_at or None,
+        }
+
+    def _report_payload_for_task(self, task: WorkflowTask) -> dict:
+        report_path = self._report_markdown_path(task.task_id)
+        report_pdf_path = self._report_pdf_path(task.task_id)
+        report_text = report_path.read_text(encoding="utf-8") if report_path.exists() else None
+        if task.status == "completed":
+            report_text = self._ensure_current_report(task, report_text)
+            report_path = self._report_markdown_path(task.task_id)
+        return {
+            "report_markdown_path": str(report_path) if report_path.exists() else None,
+            "report_markdown": report_text,
+            "report_pdf_path": str(report_pdf_path) if report_pdf_path.exists() else None,
+            "has_report": bool(report_text and str(report_text).strip()),
+        }
+
+    def list_conversations(self) -> list[dict]:
+        return self.state_store.list_conversations()
+
+    def get_conversation_detail(self, conversation_id: str) -> dict | None:
+        normalized = str(conversation_id or "").strip()
+        if not normalized:
+            return None
+        tasks = self.state_store.list_tasks_in_conversation(normalized)
+        if not tasks:
+            return None
+        tasks.sort(key=lambda task: (str(task.created_at or ""), str(task.task_id or "")))
+
+        iterations: list[dict] = []
+        for idx, task in enumerate(tasks, start=1):
+            report_payload = self._report_payload_for_task(task)
+            active_plan = active_plan_version(task)
+            iterations.append(
+                {
+                    "iteration_index": idx,
+                    "task": _task_detail(task),
+                    "task_summary": _task_summary(task),
+                    "active_plan_version": active_plan.to_dict() if active_plan else None,
+                    "latest_plan_delta": task.latest_plan_delta.to_dict() if task.latest_plan_delta else None,
+                    "research_log": self._build_task_research_log(task),
+                    "report": report_payload,
+                    "follow_up_suggestions": list(task.follow_up_suggestions or []),
+                    "branch_label": str(task.branch_label or "").strip(),
+                    "parent_task_id": str(task.parent_task_id or "").strip() or None,
+                }
+            )
+
+        latest = max(tasks, key=lambda task: str(task.updated_at or ""))
+        root = min(tasks, key=lambda task: (str(task.created_at or ""), str(task.task_id or "")))
+        latest_completed = next(
+            (
+                item
+                for item in sorted(tasks, key=lambda task: str(task.updated_at or ""), reverse=True)
+                if str(item.status or "") == "completed"
+            ),
+            None,
+        )
+        selected_report_task_id = latest_completed.task_id if latest_completed else latest.task_id
+        return {
+            "conversation": {
+                "conversation_id": normalized,
+                "title": str(latest.title or root.title or "").strip() or generate_chat_title(root.objective),
+                "root_task_id": root.task_id,
+                "latest_task_id": latest.task_id,
+                "latest_status": latest.status,
+                "updated_at": latest.updated_at,
+                "iteration_count": len(tasks),
+                "selected_report_task_id": selected_report_task_id,
+            },
+            "iterations": iterations,
+        }
+
     def list_tasks(self) -> list[dict]:
         tasks = self.state_store.list_tasks()
         tasks.sort(key=_safe_task_sort_key, reverse=True)
@@ -262,12 +421,7 @@ class UiRuntime:
         if not task:
             return None
         revisions = self.state_store.list_revisions(task_id, limit=24)
-        report_path = self._report_markdown_path(task.task_id)
-        report_pdf_path = self._report_pdf_path(task.task_id)
-        report_text = report_path.read_text(encoding="utf-8") if report_path.exists() else None
-        if task.status == "completed":
-            report_text = self._ensure_current_report(task, report_text)
-            report_path = self._report_markdown_path(task.task_id)
+        report_payload = self._report_payload_for_task(task)
         runtime_pending = self.runtime_feedback_queue.get(task.task_id, [])
         active_plan = active_plan_version(task)
         return {
@@ -282,19 +436,20 @@ class UiRuntime:
             "quality_confidence": str(task.quality_confidence or ""),
             "researcher_candidates": list(task.researcher_candidates or []),
             "revisions": revisions,
-            "report_markdown_path": str(report_path) if report_path.exists() else None,
-            "report_markdown": report_text,
-            "report_pdf_path": str(report_pdf_path) if report_pdf_path.exists() else None,
+            "report_markdown_path": report_payload["report_markdown_path"],
+            "report_markdown": report_payload["report_markdown"],
+            "report_pdf_path": report_payload["report_pdf_path"],
         }
 
     def _ensure_current_report(self, task: WorkflowTask, report_text: str | None) -> str | None:
         quality = app_service.evaluate_quality_gates(task)
         regenerated = render_final_report(task, quality_report=quality)
+        report_body, _ = split_report_and_next_actions(regenerated)
         existing = (report_text or "").strip()
-        refreshed = regenerated.strip()
+        refreshed = report_body.strip()
         if existing != refreshed:
-            self.write_report_markdown(task.task_id, regenerated)
-        return regenerated
+            self.write_report_markdown(task.task_id, report_body)
+        return report_body
 
     async def create_run(self, kind: str, *, query: str = "", task_id: str | None = None) -> RunRecord:
         run_title = generate_chat_title(query) if query.strip() else ""
@@ -401,20 +556,20 @@ class UiRuntime:
 
     def _default_next_steps(self, phase: str, *, status: str = "progress") -> list[str]:
         if status == "error":
-            return ["Handle the failure or continue with best available evidence."]
+            return ["I will handle this failure or continue with the best available evidence."]
         if phase == "intake":
-            return ["Route intent and build an initial execution plan."]
+            return ["I will route intent and build an initial execution plan."]
         if phase == "plan":
-            return ["Open the first checkpoint so user can start execution."]
+            return ["I will open the first checkpoint so you can start execution."]
         if phase == "checkpoint":
-            return ["Wait for user input to continue or revise the plan."]
+            return ["I will wait for your input to continue or revise the plan."]
         if phase in {"search", "analyze", "execute"}:
-            return ["Continue evidence retrieval and update quality-state gaps."]
+            return ["I will continue evidence retrieval and update quality-state gaps."]
         if phase == "synthesize":
-            return ["Finalize recommendation and compile diagnostics."]
+            return ["I will finalize the recommendation and compile diagnostics."]
         if phase == "finalize":
-            return ["Persist report artifacts and return final output."]
-        return ["Continue workflow execution."]
+            return ["I will persist report artifacts and return the final output."]
+        return ["I will continue workflow execution."]
 
     def _deterministic_progress_summary(
         self,
@@ -428,7 +583,10 @@ class UiRuntime:
         for event in reversed(events_window):
             if str(event.get("status", "")) != "done":
                 continue
-            line = _compact_text(str(event.get("human_line", "")).strip(), max_chars=120)
+            line = _compact_text(
+                _first_person_progress_text(str(event.get("human_line", "")).strip()),
+                max_chars=120,
+            )
             if line and line not in completed:
                 completed.append(line)
             if len(completed) >= 3:
@@ -437,9 +595,12 @@ class UiRuntime:
 
         latest_line = ""
         if events_window:
-            latest_line = _compact_text(str(events_window[-1].get("human_line", "")).strip(), max_chars=180)
+            latest_line = _compact_text(
+                _first_person_progress_text(str(events_window[-1].get("human_line", "")).strip()),
+                max_chars=180,
+            )
         if not latest_line:
-            latest_line = "Progress updated."
+            latest_line = "I updated progress."
         headline = latest_line
         if len(headline.split()) > 12:
             headline = " ".join(headline.split()[:12])
@@ -486,6 +647,8 @@ class UiRuntime:
         prompt = (
             "Generate a high-level progress summary from observable workflow events only.\n"
             "Return strict JSON with keys: headline, summary, completed, next, confidence.\n"
+            "Use first-person voice as if speaking directly to the user (e.g., 'I ...').\n"
+            "Never refer to yourself as 'the agent', 'the workflow', or 'the system'.\n"
             f"Current phase: {phase}\n"
             f"Status: {status}\n"
             f"Prior summary: {json.dumps(prior_summary or {}, ensure_ascii=True)}\n"
@@ -503,10 +666,24 @@ class UiRuntime:
         payload = _extract_json_payload(raw)
         if not payload:
             return None
-        headline = _compact_text(str(payload.get("headline", "")).strip(), max_chars=72)
-        summary = _compact_text(str(payload.get("summary", "")).strip(), max_chars=220)
-        completed = [str(item).strip() for item in payload.get("completed", []) if str(item).strip()][:3]
-        nxt = [str(item).strip() for item in payload.get("next", []) if str(item).strip()][:2]
+        headline = _compact_text(
+            _first_person_progress_text(str(payload.get("headline", "")).strip()),
+            max_chars=72,
+        )
+        summary = _compact_text(
+            _first_person_progress_text(str(payload.get("summary", "")).strip()),
+            max_chars=220,
+        )
+        completed = [
+            _first_person_progress_text(str(item).strip())
+            for item in payload.get("completed", [])
+            if str(item).strip()
+        ][:3]
+        nxt = [
+            _first_person_progress_text(str(item).strip())
+            for item in payload.get("next", [])
+            if str(item).strip()
+        ][:2]
         confidence = str(payload.get("confidence", "medium")).strip().lower()
         if confidence not in {"low", "medium", "high"}:
             confidence = "medium"
@@ -651,7 +828,7 @@ class UiRuntime:
             "phase": phase,
             "type": event_type,
             "status": status,
-            "human_line": _compact_text(human_line, max_chars=220),
+            "human_line": _compact_text(_first_person_progress_text(human_line), max_chars=220),
             "task_id": task_id or "",
             "step_index": step_index,
             "step_title": step_title or "",
@@ -696,9 +873,22 @@ class UiRuntime:
         self.background_tasks.add(task)
         task.add_done_callback(lambda done: self.background_tasks.discard(done))
 
-    async def start_new_query(self, query: str) -> RunRecord:
+    async def start_new_query(
+        self,
+        query: str,
+        *,
+        conversation_id: str | None = None,
+        parent_task_id: str | None = None,
+    ) -> RunRecord:
         run = await self.create_run("new_query", query=query)
-        job = asyncio.create_task(self._run_new_query(run.run_id, query))
+        job = asyncio.create_task(
+            self._run_new_query(
+                run.run_id,
+                query,
+                conversation_id=conversation_id,
+                parent_task_id=parent_task_id,
+            )
+        )
         self._track_background_task(job)
         return run
 
@@ -732,7 +922,85 @@ class UiRuntime:
             "revision_id": revision_id,
         }
 
-    async def _run_new_query(self, run_id: str, query: str) -> None:
+    def _build_branch_ancestry(self, parent_task_id: str) -> list[WorkflowTask]:
+        return self.state_store.get_task_ancestry(parent_task_id)
+
+    def _summarize_iteration_for_context(self, task: WorkflowTask) -> dict:
+        report_text = ""
+        report_path = self._report_markdown_path(task.task_id)
+        if report_path.exists():
+            try:
+                report_text = report_path.read_text(encoding="utf-8")
+            except OSError:
+                report_text = ""
+        if not report_text and task.steps:
+            report_text = render_final_report(task, quality_report=app_service.evaluate_quality_gates(task))
+        report_body, _ = split_report_and_next_actions(report_text)
+        answer_line = _compact_text(report_body.replace("\n", " "), max_chars=320) if report_body else ""
+        evidence_refs = []
+        for step in task.steps:
+            for ref in (step.evidence_refs or []):
+                value = str(ref).strip()
+                if value and value not in evidence_refs:
+                    evidence_refs.append(value)
+                if len(evidence_refs) >= 8:
+                    break
+            if len(evidence_refs) >= 8:
+                break
+        quality = app_service.evaluate_quality_gates(task)
+        gaps = [str(item).strip() for item in quality.get("unresolved_gaps", []) if str(item).strip()][:4]
+        return {
+            "task_id": task.task_id,
+            "query": str(task.user_query or task.objective).strip(),
+            "recommendation": answer_line,
+            "evidence_refs": evidence_refs,
+            "gaps": gaps,
+        }
+
+    def _build_context_brief(self, ancestry: list[WorkflowTask]) -> str:
+        if not ancestry:
+            return ""
+        lines = [
+            "Prior branch context (root to selected report):",
+        ]
+        for idx, task in enumerate(ancestry, start=1):
+            summary = self._summarize_iteration_for_context(task)
+            query = _compact_text(summary.get("query", ""), max_chars=200)
+            recommendation = _compact_text(summary.get("recommendation", ""), max_chars=260)
+            evidence_refs = summary.get("evidence_refs", [])[:4]
+            gaps = summary.get("gaps", [])[:2]
+            lines.append(f"{idx}. task_id={task.task_id}")
+            if query:
+                lines.append(f"   - query: {query}")
+            if recommendation:
+                lines.append(f"   - prior finding: {recommendation}")
+            if evidence_refs:
+                lines.append(f"   - evidence refs: {', '.join(evidence_refs)}")
+            if gaps:
+                lines.append(f"   - unresolved gaps: {'; '.join(gaps)}")
+        text = "\n".join(lines).strip()
+        if len(text) > 3500:
+            text = text[:3497].rstrip() + "..."
+        return text
+
+    def _compose_objective_with_context(self, query: str, context_brief: str) -> str:
+        if not context_brief.strip():
+            return query
+        return (
+            f"{query.strip()}\n\n"
+            "Branch ancestry context (for planning/execution continuity):\n"
+            f"{context_brief.strip()}\n"
+            "Use this context to build on prior findings; do not repeat prior report text verbatim."
+        ).strip()
+
+    async def _run_new_query(
+        self,
+        run_id: str,
+        query: str,
+        *,
+        conversation_id: str | None = None,
+        parent_task_id: str | None = None,
+    ) -> None:
         await self._update_run(run_id, status="running")
         if not self.ready or not self.runner or not self.session_id:
             await self._update_run(
@@ -746,22 +1014,47 @@ class UiRuntime:
             async with self.execution_lock:
                 title = await self._generate_chat_title(query)
                 await self._update_run(run_id, title=title)
+                normalized_parent_task_id = str(parent_task_id or "").strip() or None
+                normalized_conversation_id = str(conversation_id or "").strip() or None
+                parent_task = None
+                ancestry: list[WorkflowTask] = []
+                context_brief = ""
+                effective_objective = query
+                effective_conversation_id: str | None = None
+                branch_label = ""
+                if normalized_parent_task_id:
+                    parent_task = self.state_store.get_task(normalized_parent_task_id)
+                    if not parent_task:
+                        raise ValueError(f"Parent task {normalized_parent_task_id} not found.")
+                    if str(parent_task.status or "") != "completed":
+                        raise ValueError(f"Parent task {normalized_parent_task_id} is not completed yet.")
+                    parent_conversation_id = self._conversation_id_for_task(parent_task)
+                    if normalized_conversation_id and normalized_conversation_id != parent_conversation_id:
+                        raise ValueError(
+                            "conversation_id does not match parent_task_id conversation."
+                        )
+                    ancestry = self._build_branch_ancestry(parent_task.task_id)
+                    context_brief = self._build_context_brief(ancestry)
+                    effective_objective = self._compose_objective_with_context(query, context_brief)
+                    effective_conversation_id = parent_conversation_id
+                    branch_label = f"Branched from report {parent_task.task_id}"
+
                 await self._append_progress_event(
                     run_id,
                     phase="intake",
                     event_type="run.started",
                     status="start",
-                    human_line=f"Started research run: {title}",
+                    human_line=f"I started this research run: {title}",
                 )
                 await self._append_progress_event(
                     run_id,
                     phase="intake",
                     event_type="clarification.check",
                     status="progress",
-                    human_line="Checking whether clarification is required.",
+                    human_line="I'm checking whether clarification is required.",
                 )
                 clarification_msg = await app_service.build_clarification_request(
-                    query,
+                    effective_objective,
                     clarifier_runner=self.clarifier_runner,
                     clarifier_session_id=self.clarifier_session_id,
                     user_id=self.user_id,
@@ -772,7 +1065,7 @@ class UiRuntime:
                         phase="intake",
                         event_type="clarification.required",
                         status="done",
-                        human_line="Clarification is required before execution.",
+                        human_line="I need clarification before I can execute this plan.",
                     )
                     await self._update_run(
                         run_id,
@@ -784,28 +1077,9 @@ class UiRuntime:
                 await self._append_progress_event(
                     run_id,
                     phase="plan",
-                    event_type="intent.routing",
+                    event_type="plan.initializing",
                     status="start",
-                    human_line="Routing intent and building initial plan.",
-                )
-                intent_route = await app_service.route_query_intent(
-                    query,
-                    intent_router_runner=self.intent_router_runner,
-                    intent_router_session_id=self.intent_router_session_id,
-                    user_id=self.user_id,
-                )
-                route_type = str(intent_route.get("request_type", "unknown"))
-                tags = ", ".join(intent_route.get("intent_tags", [])) or "none"
-                await self._append_progress_event(
-                    run_id,
-                    phase="plan",
-                    event_type="intent.routed",
-                    status="done",
-                    human_line=f"Intent routed: type={route_type}; tags={tags}.",
-                    metrics={
-                        "request_type": route_type,
-                        "intent_tag_count": len(intent_route.get("intent_tags", []) or []),
-                    },
+                    human_line="I'm building the initial workflow plan.",
                 )
 
                 task = await app_service.start_new_workflow_task(
@@ -813,20 +1087,30 @@ class UiRuntime:
                     self.session_id,
                     self.user_id,
                     self.state_store,
-                    query,
-                    intent_route=intent_route,
+                    effective_objective,
                     planner_runner=self.planner_runner,
                     planner_session_id=self.planner_session_id,
                 )
+                task.user_query = query
+                task.parent_task_id = parent_task.task_id if parent_task else None
+                task.conversation_id = (
+                    effective_conversation_id
+                    or f"conv_{task.task_id}"
+                )
+                task.context_source_task_ids = [item.task_id for item in ancestry]
+                task.internal_context_brief = context_brief
+                task.branch_label = branch_label
                 if not task.title:
                     task.title = title
+                task.touch()
+                await self._save_task(task, note="conversation_context_initialized_ui", run_id=run_id)
                 await self._update_run(run_id, task_id=task.task_id, title=task.title or title)
                 await self._append_progress_event(
                     run_id,
                     phase="plan",
                     event_type="task.created",
                     status="done",
-                    human_line=f"Created task {task.task_id} with {len(task.steps)} planned steps.",
+                    human_line=f"I created task {task.task_id} with {len(task.steps)} planned steps.",
                     task_id=task.task_id,
                     metrics={"steps_total": len(task.steps)},
                 )
@@ -843,7 +1127,7 @@ class UiRuntime:
                         phase=self._phase_for_step(task, 0),
                         event_type="step.completed",
                         status="done",
-                        human_line=f"{first_step.title} complete.",
+                        human_line=f"I completed: {first_step.title}.",
                         task_id=task.task_id,
                         step_index=0,
                         step_title=first_step.title,
@@ -868,7 +1152,7 @@ class UiRuntime:
                         phase="checkpoint",
                         event_type="checkpoint.opened",
                         status="done",
-                        human_line=f"Checkpoint opened: {task.checkpoint_reason or 'pre_evidence_execution'}.",
+                        human_line=f"I opened a checkpoint: {task.checkpoint_reason or 'pre_evidence_execution'}.",
                         task_id=task.task_id,
                         metrics={"checkpoint_reason": task.checkpoint_reason or "pre_evidence_execution"},
                     )
@@ -880,7 +1164,7 @@ class UiRuntime:
                         phase="checkpoint",
                         event_type="checkpoint.waiting",
                         status="progress",
-                        human_line="Waiting for user start/feedback at checkpoint.",
+                        human_line="I'm waiting for your start/feedback at this checkpoint.",
                         task_id=task.task_id,
                     )
         except Exception as exc:
@@ -890,7 +1174,7 @@ class UiRuntime:
                 phase="finalize",
                 event_type="run.failed",
                 status="error",
-                human_line=f"Run failed: {error}",
+                human_line=f"I hit an execution error: {error}",
             )
             await self._update_run(run_id, status="failed", error=error)
             traceback.print_exc()
@@ -931,7 +1215,7 @@ class UiRuntime:
                 phase="plan",
                 event_type="feedback.rejected",
                 status="done",
-                human_line="Revision limit reached: one plan revision is allowed per task.",
+                human_line="I already used the one allowed plan revision for this task.",
                 task_id=task.task_id,
             )
             await self._save_task(task, note="feedback_replan_limit_reached_ui", run_id=run_id)
@@ -954,18 +1238,8 @@ class UiRuntime:
             task.base_objective or task.objective,
             merged_intent,
         )
-        intent_route = await app_service.route_query_intent(
-            revised_objective,
-            intent_router_runner=self.intent_router_runner,
-            intent_router_session_id=self.intent_router_session_id,
-            user_id=self.user_id,
-        )
-        request_type = str(intent_route.get("request_type", task.request_type) or task.request_type)
-        intent_tags = list(intent_route.get("intent_tags", task.intent_tags) or task.intent_tags)
         model_plan_graph = await app_service.draft_model_plan_graph(
             revised_objective,
-            request_type=request_type,
-            intent_tags=intent_tags,
             planner_runner=self.planner_runner,
             planner_session_id=self.planner_session_id,
             user_id=self.user_id,
@@ -973,8 +1247,6 @@ class UiRuntime:
         plan_version, delta = replan_remaining_steps(
             task,
             revised_objective=revised_objective,
-            request_type=request_type,
-            intent_tags=intent_tags,
             revision_intent=merged_intent,
             gate_reason=gate_reason,
             plan_graph_override=model_plan_graph,
@@ -992,7 +1264,7 @@ class UiRuntime:
             phase="plan",
             event_type="plan.replanned",
             status="done",
-            human_line=f"Plan updated from feedback: {delta.summary}.",
+            human_line=f"I updated the plan from your feedback: {delta.summary}.",
             task_id=task.task_id,
             metrics={
                 "added_steps": len(delta.added_steps),
@@ -1006,7 +1278,7 @@ class UiRuntime:
             phase="checkpoint",
             event_type="checkpoint.opened",
             status="done",
-            human_line=f"Checkpoint opened after feedback: {gate_reason}.",
+            human_line=f"I opened a checkpoint after applying your feedback: {gate_reason}.",
             task_id=task.task_id,
             metrics={"checkpoint_reason": gate_reason},
         )
@@ -1054,7 +1326,7 @@ class UiRuntime:
                             phase="checkpoint",
                             event_type="feedback.queued_applied",
                             status="progress",
-                            human_line="Applying queued feedback at adaptive checkpoint.",
+                            human_line="I'm applying your queued feedback at this adaptive checkpoint.",
                             task_id=task.task_id,
                             metrics={"queued_feedback_count": len(queued_feedback)},
                         )
@@ -1076,7 +1348,7 @@ class UiRuntime:
                         phase="checkpoint",
                         event_type="checkpoint.opened",
                         status="done",
-                        human_line=f"Adaptive checkpoint opened: {gate_reason}.",
+                        human_line=f"I opened an adaptive checkpoint: {gate_reason}.",
                         task_id=task.task_id,
                         metrics={"checkpoint_reason": gate_reason},
                     )
@@ -1103,7 +1375,7 @@ class UiRuntime:
                 phase=self._phase_for_step(task, next_idx),
                 event_type="step.completed",
                 status="done",
-                human_line=f"{step.title} complete.",
+                human_line=f"I completed: {step.title}.",
                 task_id=task.task_id,
                 step_index=next_idx,
                 step_title=step.title,
@@ -1131,7 +1403,7 @@ class UiRuntime:
             event_type="quality.evaluated",
             status="done",
             human_line=(
-                "Quality evaluated: "
+                "I evaluated quality: "
                 f"{final_quality.get('tool_call_count', 0)} tool calls, "
                 f"{final_quality.get('evidence_count', 0)} evidence IDs."
             ),
@@ -1184,7 +1456,7 @@ class UiRuntime:
                     phase="checkpoint",
                     event_type="checkpoint.resumed",
                     status="start",
-                    human_line=f"Execution resumed for task {task_id}.",
+                    human_line=f"I resumed execution for task {task_id}.",
                     task_id=task_id,
                 )
                 ack_token = app_service.gate_ack_token(task.checkpoint_reason, task.active_plan_version_id)
@@ -1208,7 +1480,7 @@ class UiRuntime:
                     phase="execute",
                     event_type="execution.running",
                     status="progress",
-                    human_line="Running from checkpoint until completion or next adaptive gate.",
+                    human_line="I'm running from this checkpoint until completion or the next adaptive gate.",
                     task_id=task_id,
                 )
 
@@ -1228,7 +1500,7 @@ class UiRuntime:
                         phase="checkpoint",
                         event_type="checkpoint.waiting",
                         status="done",
-                        human_line=f"Checkpoint opened: {task.checkpoint_reason or 'adaptive_gate'}.",
+                        human_line=f"I opened a checkpoint: {task.checkpoint_reason or 'adaptive_gate'}.",
                         task_id=task.task_id,
                         metrics={"checkpoint_reason": task.checkpoint_reason or "adaptive_gate"},
                     )
@@ -1240,8 +1512,6 @@ class UiRuntime:
                 task.checkpoint_state = "closed"
                 task.checkpoint_reason = ""
                 task.checkpoint_payload = {}
-                task.touch()
-                await self._save_task(task, note="workflow_completed_ui", run_id=run_id)
 
                 await self._append_progress_event(
                     run_id,
@@ -1249,7 +1519,7 @@ class UiRuntime:
                     event_type="quality.evaluated",
                     status="done",
                     human_line=(
-                        "Quality gate complete: "
+                        "I completed quality gates: "
                         f"evidence={quality.get('evidence_count', 0)}, "
                         f"coverage={quality.get('coverage_ratio', 0):.2f}, "
                         f"tools={quality.get('tool_call_count', 0)}."
@@ -1263,20 +1533,29 @@ class UiRuntime:
                     },
                 )
 
-                final_report = render_final_report(task, quality_report=quality)
-                markdown_path = self.write_report_markdown(task.task_id, final_report)
+                final_report_raw = render_final_report(task, quality_report=quality)
+                final_report_body, extracted_suggestions = split_report_and_next_actions(final_report_raw)
+                follow_up_suggestions = extracted_suggestions or derive_follow_up_suggestions(
+                    final_report_raw,
+                    quality_report=quality,
+                )
+                task.follow_up_suggestions = [str(item).strip() for item in follow_up_suggestions if str(item).strip()][:5]
+                task.touch()
+                await self._save_task(task, note="workflow_completed_ui", run_id=run_id)
+                self.write_report_markdown(task.task_id, final_report_body)
                 await self._update_run(
                     run_id,
                     status="completed",
                     task_id=task.task_id,
-                    final_report=final_report,
+                    final_report=final_report_body,
+                    follow_up_suggestions=task.follow_up_suggestions,
                 )
                 await self._append_progress_event(
                     run_id,
                     phase="finalize",
                     event_type="run.completed",
                     status="done",
-                    human_line="Report completed.",
+                    human_line="I completed the report.",
                     task_id=task.task_id,
                 )
         except Exception as exc:
@@ -1286,7 +1565,7 @@ class UiRuntime:
                 phase="finalize",
                 event_type="run.failed",
                 status="error",
-                human_line=f"Run failed: {error}",
+                human_line=f"I hit an execution error: {error}",
                 task_id=task_id,
             )
             await self._update_run(run_id, status="failed", error=error)
@@ -1314,7 +1593,7 @@ class UiRuntime:
                     phase="checkpoint",
                     event_type="feedback.queued",
                     status="done",
-                    human_line="Feedback queued and will be applied at the next checkpoint.",
+                    human_line="I queued your feedback and will apply it at the next checkpoint.",
                     task_id=task_id,
                     metrics={"queued_feedback_count": len(queue)},
                 )
@@ -1337,7 +1616,7 @@ class UiRuntime:
                             phase="plan",
                             event_type="feedback.rejected",
                             status="done",
-                            human_line="Revision limit reached: one plan revision is allowed per task.",
+                            human_line="I already used the one allowed plan revision for this task.",
                             task_id=task.task_id,
                         )
                         await self._update_run(run_id, status="completed", task_id=task.task_id)
@@ -1350,7 +1629,7 @@ class UiRuntime:
                         phase="checkpoint",
                         event_type="feedback.queued",
                         status="done",
-                        human_line="Task is not at checkpoint; feedback queued for next adaptive gate.",
+                        human_line="I'm not at a checkpoint yet, so I queued your feedback for the next adaptive gate.",
                         task_id=task.task_id,
                         metrics={"queued_feedback_count": len(task.pending_feedback_queue)},
                     )
@@ -1362,7 +1641,7 @@ class UiRuntime:
                     phase="plan",
                     event_type="feedback.applying",
                     status="start",
-                    human_line=f"Applying feedback to task {task_id}.",
+                    human_line=f"I'm applying your feedback to task {task_id}.",
                     task_id=task.task_id,
                 )
                 await self._apply_feedback_replan(
@@ -1377,7 +1656,7 @@ class UiRuntime:
                     phase="checkpoint",
                     event_type="feedback.applied",
                     status="done",
-                    human_line="Feedback incorporated. Updated plan is ready at checkpoint.",
+                    human_line="I incorporated your feedback. The updated plan is ready at checkpoint.",
                     task_id=task.task_id,
                 )
         except Exception as exc:
@@ -1387,7 +1666,7 @@ class UiRuntime:
                 phase="finalize",
                 event_type="run.failed",
                 status="error",
-                human_line=f"Run failed: {error}",
+                human_line=f"I hit an execution error: {error}",
                 task_id=task_id,
             )
             await self._update_run(run_id, status="failed", error=error)
@@ -1487,6 +1766,19 @@ async def list_tasks() -> dict:
     return {"tasks": runtime.list_tasks()}
 
 
+@app.get("/api/conversations")
+async def list_conversations() -> dict:
+    return {"conversations": runtime.list_conversations()}
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def conversation_detail(conversation_id: str) -> dict:
+    detail = runtime.get_conversation_detail(conversation_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
+    return detail
+
+
 @app.get("/api/tasks/{task_id}")
 async def task_detail(task_id: str) -> dict:
     detail = runtime.get_task_detail(task_id)
@@ -1515,7 +1807,11 @@ async def export_report_pdf(task_id: str) -> FileResponse:
 async def start_query(payload: QueryRequest) -> dict:
     if not runtime.ready:
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
-    run = await runtime.start_new_query(payload.query.strip())
+    run = await runtime.start_new_query(
+        payload.query.strip(),
+        conversation_id=payload.conversation_id.strip() if payload.conversation_id else None,
+        parent_task_id=payload.parent_task_id.strip() if payload.parent_task_id else None,
+    )
     return run.to_dict()
 
 

@@ -4,16 +4,14 @@ import pytest
 
 import agent
 from co_scientist.domain.models import WorkflowTask
-from co_scientist.planning.intent import route_query_intent
+from co_scientist.planning.intent import normalize_user_query
 from co_scientist.planning.revision import parse_revision_intent
 from workflow import create_task, render_final_report
 
 
-@pytest.mark.asyncio
-async def test_route_query_intent_uses_heuristic_when_router_missing():
-    route = await route_query_intent("Compare LRRK2 vs GBA1 for Parkinson disease.")
-    assert route["source"] == "heuristic"
-    assert route["request_type"] in {"comparison", "prioritization", "validation", "action_planning", "exploration"}
+def test_normalize_user_query_applies_known_typos():
+    normalized = normalize_user_query("Find top reseachers for PD targets")
+    assert normalized == "Find top researchers for PD targets"
 
 
 @pytest.mark.asyncio

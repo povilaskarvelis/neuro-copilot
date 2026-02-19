@@ -108,10 +108,6 @@ VALID_REQUEST_TYPES = _planning.VALID_REQUEST_TYPES
 VALID_INTENT_TAGS = _planning.VALID_INTENT_TAGS
 CAPABILITY_PATTERNS = _planning.CAPABILITY_PATTERNS
 
-classify_request_type = _planning.classify_request_type
-sanitize_request_type = _planning.sanitize_request_type
-sanitize_intent_tags = _planning.sanitize_intent_tags
-infer_intent_tags = _planning.infer_intent_tags
 build_success_criteria = _planning.build_success_criteria
 build_plan_steps = _planning.build_plan_steps
 create_task = _planning.create_task
@@ -732,6 +728,42 @@ def _extract_next_actions(answer_text: str) -> tuple[str, list[str]]:
     return body, actions
 
 
+def split_report_and_next_actions(markdown: str) -> tuple[str, list[str]]:
+    text = str(markdown or "").strip()
+    if not text:
+        return "", []
+    body, actions = _extract_next_actions(text)
+    normalized_body = _sanitize_markdown_artifacts(body)
+    normalized_body = _humanize_internal_tool_mentions(normalized_body)
+    normalized_body = re.sub(r"\n{3,}", "\n\n", normalized_body).strip()
+    cleaned_actions: list[str] = []
+    for item in actions:
+        cleaned = _humanize_internal_tool_mentions(str(item).strip())
+        if not cleaned:
+            continue
+        if cleaned not in cleaned_actions:
+            cleaned_actions.append(cleaned)
+        if len(cleaned_actions) >= 5:
+            break
+    return normalized_body, cleaned_actions
+
+
+def derive_follow_up_suggestions(markdown: str, quality_report: dict | None = None) -> list[str]:
+    _, actions = split_report_and_next_actions(markdown)
+    if actions:
+        return actions[:5]
+
+    gaps = quality_report.get("unresolved_gaps", []) if isinstance(quality_report, dict) else []
+    suggestions = [f"Resolve evidence gap: {str(gap).strip()}" for gap in gaps[:3] if str(gap).strip()]
+    if not suggestions:
+        suggestions = [
+            "Run a focused follow-up on the highest-uncertainty claim.",
+            "Stress-test the recommendation against one independent evidence source.",
+            "Convert findings into an execution plan with owners and milestones.",
+        ]
+    return suggestions[:5]
+
+
 def _extract_answer_line(answer_text: str, label: str) -> str | None:
     pattern = re.compile(
         rf"^\s*(?:[-*]\s+)?\*{{0,2}}{re.escape(label)}\*{{0,2}}\s*:\s*(.+)$",
@@ -872,8 +904,6 @@ def _build_structured_output_contract(
         "generated_at_utc": _utc_now(),
         "task_id": task.task_id,
         "status": task.status,
-        "request_type": task.request_type,
-        "intent_tags": sorted({str(tag) for tag in task.intent_tags if str(tag).strip()}),
         "quality_gate_passed": quality_passed,
         "recommendation": recommendation or answer_summary,
         "confidence": confidence,
@@ -897,18 +927,21 @@ def _build_structured_output_contract(
 
 
 def _methodology_strategy_sentence(task: WorkflowTask) -> str:
-    focus_map = {
-        "genetics_direction": "human genetics direction-of-effect",
-        "variant_check": "variant-level evidence",
-        "clinical_landscape": "clinical outcome patterns",
-        "safety_assessment": "safety liabilities",
-        "chemistry_evidence": "chemical and tractability evidence",
-        "competitive_landscape": "development landscape signals",
-        "pathway_context": "pathway/network context",
-        "expression_context": "tissue and cell-context evidence",
-        "researcher_discovery": "research-ecosystem signals",
-    }
-    focus = [label for tag, label in focus_map.items() if tag in task.intent_tags]
+    objective_lower = str(task.objective or "").lower()
+    focus: list[str] = []
+    keyword_focus = (
+        (("genetic", "gwas", "variant", "direction-of-effect"), "human genetics direction-of-effect"),
+        (("trial", "clinical", "nct", "phase"), "clinical outcome patterns"),
+        (("safety", "toxicity", "adverse", "liability"), "safety liabilities"),
+        (("chembl", "compound", "potency", "druggability"), "chemical and tractability evidence"),
+        (("competitive", "pipeline", "program", "landscape"), "development landscape signals"),
+        (("pathway", "interaction", "reactome", "string"), "pathway/network context"),
+        (("expression", "tissue", "cell type", "single-cell"), "tissue and cell-context evidence"),
+        (("researcher", "author", "investigator", "affiliation"), "research-ecosystem signals"),
+    )
+    for tokens, label in keyword_focus:
+        if any(token in objective_lower for token in tokens):
+            focus.append(label)
     if focus:
         if len(focus) == 1:
             focus_text = focus[0]
@@ -1204,6 +1237,18 @@ def render_final_report(task: WorkflowTask, quality_report: dict | None = None) 
     return text
 
 
+def _final_response_principles(objective: str) -> list[str]:
+    del objective
+    return [
+        "Adapt structure to the query type and evidence quality.",
+        "Lead with a concise and direct answer first, and then elaborate on the rationale and methodology in separate sections.",
+        "Methodology should include a provenance summary detailing the search strategy and tools utilized to reach the conclusion.",
+        "Literature supporting the answer should be cited and listed as full references at the end, while tools should be mentioned in the text using real-world names.",
+        "Use only the sections, bullets, or tables that improve clarity for the specific query.",
+        "Ground major claims in executed evidence and cite source IDs or references where possible.",
+    ]
+
+
 def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
     revision = _extract_revision_directive(task.objective)
     revision_directives = _extract_revision_directives(task.objective)
@@ -1216,14 +1261,12 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
             "- Apply these directives even when they change tool choice, sequence, or output shape.\n"
             "- If any directive cannot be fully satisfied, explain the blocker and fallback explicitly.\n"
         )
-    prioritization_guardrail = ""
-    if task.request_type in {"prioritization", "comparison"} and step.recommended_tools:
-        prioritization_guardrail = (
-            "\nPrioritization/comparison requirements:\n"
-            "- Use explicit criteria or scoring dimensions whenever ranking/comparing candidates.\n"
-            "- If a high-priority evidence axis is missing, mark conclusions provisional and call out the gap.\n"
-            "- Avoid presenting confident rank order when primary tools return degraded or empty outputs.\n"
-        )
+    decision_quality_guardrail = (
+        "\nDecision quality requirements:\n"
+        "- Use explicit criteria when comparing or ranking options.\n"
+        "- If high-priority evidence is missing, mark conclusions provisional and call out the gap.\n"
+        "- Avoid high-confidence claims when primary evidence retrieval is degraded or empty.\n"
+    )
     step_freshness_guardrail = (
         "\nExecution integrity requirements:\n"
         "- Treat this as a fresh execution of the current step.\n"
@@ -1248,16 +1291,17 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
             "- Carry forward revision directives as execution constraints for this step.\n"
         )
     if task.steps and step.step_id == task.steps[-1].step_id:
+        final_principles_block = "\n".join(f"- {item}" for item in _final_response_principles(task.objective))
         step_freshness_guardrail += (
-            "- Final output format: Recommendation first, then Rationale narrative, then Methodology, then Next Actions.\n"
-            "- The first recommendation sentence must include at least one inline citation ID (PMID/NCT/DOI/OpenAlex) from executed evidence.\n"
-            "- When citing papers, provide full formatted citations (author(s), year, title, source) rather than only IDs.\n"
-            "- Include DOI as a clickable markdown link when available (for example, [DOI:10.xxxx/xxxx](https://doi.org/10.xxxx/xxxx)).\n"
-            "- Add a final `References` section with numbered APA-style citations for papers used in the answer.\n"
-            "- Recommendation must state a concrete decision (e.g., choose/prioritize/deprioritize/go-no-go/rank) tied to the user objective.\n"
-            "- Do not use placeholder language such as 'The available evidence supports the recommendation below.'\n"
+            "\nFinal response principles:\n"
+            f"{final_principles_block}\n"
+            "- After the opening answer, include separate `Rationale` and `Methodology` sections.\n"
+            "- `Methodology` must include a provenance summary of search strategy and tools used.\n"
+            "- Mention tools in narrative using real-world names (for example, PubMed or OpenAlex), not internal tool identifiers.\n"
+            "- Add a final `References` section with full formatted citations for supporting literature.\n"
+            "- Include DOI markdown links when available.\n"
+            "- Include an optional `Next Actions` section (up to 3 items) only when it materially helps the user.\n"
             "- Keep the narrative concise and avoid repeating full evidence lists already stated in prior steps.\n"
-            "- Limit Next Actions to 3 concrete items.\n"
         )
     role_directive = "executor"
     if step.step_id == "step_1" or step.subgoal_id == "sg_scope":
@@ -1313,5 +1357,5 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
         f"{evidence_requirements_block}"
         f"{revision_directive_block}"
         f"{step_freshness_guardrail}"
-        f"{prioritization_guardrail}"
+        f"{decision_quality_guardrail}"
     )

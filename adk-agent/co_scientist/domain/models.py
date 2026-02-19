@@ -253,6 +253,9 @@ class WorkflowTask:
     task_id: str
     objective: str
     title: str = ""
+    conversation_id: str = ""
+    parent_task_id: str | None = None
+    user_query: str = ""
     request_type: str = "exploration"
     intent_tags: list[str] = field(default_factory=list)
     success_criteria: list[str] = field(default_factory=list)
@@ -277,6 +280,10 @@ class WorkflowTask:
     event_log: list[dict] = field(default_factory=list)
     checkpoint_payload: dict = field(default_factory=dict)
     researcher_candidates: list[dict] = field(default_factory=list)
+    follow_up_suggestions: list[str] = field(default_factory=list)
+    context_source_task_ids: list[str] = field(default_factory=list)
+    branch_label: str = ""
+    internal_context_brief: str = ""
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
 
@@ -289,6 +296,9 @@ class WorkflowTask:
             "task_id": self.task_id,
             "objective": self.objective,
             "title": title,
+            "conversation_id": str(self.conversation_id or "").strip(),
+            "parent_task_id": str(self.parent_task_id or "").strip() or None,
+            "user_query": str(self.user_query or "").strip(),
             "request_type": self.request_type,
             "intent_tags": self.intent_tags,
             "success_criteria": self.success_criteria,
@@ -313,6 +323,10 @@ class WorkflowTask:
             "event_log": list(self.event_log),
             "checkpoint_payload": dict(self.checkpoint_payload),
             "researcher_candidates": list(self.researcher_candidates),
+            "follow_up_suggestions": [str(x).strip() for x in self.follow_up_suggestions if str(x).strip()],
+            "context_source_task_ids": [str(x).strip() for x in self.context_source_task_ids if str(x).strip()],
+            "branch_label": str(self.branch_label or "").strip(),
+            "internal_context_brief": str(self.internal_context_brief or "").strip(),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -327,6 +341,9 @@ class WorkflowTask:
             task_id=payload.get("task_id", ""),
             objective=payload.get("objective", ""),
             title=(str(payload.get("title", "")).strip() or generate_chat_title(payload.get("objective", ""))),
+            conversation_id=str(payload.get("conversation_id", "")).strip(),
+            parent_task_id=str(payload.get("parent_task_id", "")).strip() or None,
+            user_query=str(payload.get("user_query", "")).strip() or str(payload.get("objective", "")).strip(),
             request_type=payload.get("request_type", "exploration"),
             intent_tags=list(payload.get("intent_tags", [])),
             success_criteria=list(payload.get("success_criteria", [])),
@@ -359,6 +376,10 @@ class WorkflowTask:
             event_log=[item for item in payload.get("event_log", []) if isinstance(item, dict)],
             checkpoint_payload=dict(payload.get("checkpoint_payload", {}) or {}),
             researcher_candidates=[item for item in payload.get("researcher_candidates", []) if isinstance(item, dict)],
+            follow_up_suggestions=[str(x).strip() for x in payload.get("follow_up_suggestions", []) if str(x).strip()],
+            context_source_task_ids=[str(x).strip() for x in payload.get("context_source_task_ids", []) if str(x).strip()],
+            branch_label=str(payload.get("branch_label", "")).strip(),
+            internal_context_brief=str(payload.get("internal_context_brief", "")).strip(),
             created_at=payload.get("created_at", _utc_now()),
             updated_at=payload.get("updated_at", _utc_now()),
         )

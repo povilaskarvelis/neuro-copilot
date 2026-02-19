@@ -31,6 +31,33 @@ async def test_start_endpoint_uses_plan_version_id(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_endpoint_forwards_conversation_and_parent(monkeypatch):
+    calls: list[tuple[str, str | None, str | None]] = []
+
+    async def fake_start(query: str, *, conversation_id: str | None = None, parent_task_id: str | None = None):
+        calls.append((query, conversation_id, parent_task_id))
+        return ui_server.RunRecord(
+            run_id="run_query_1",
+            kind="new_query",
+            status="queued",
+            query=query,
+        )
+
+    monkeypatch.setattr(ui_server.runtime, "ready", True)
+    monkeypatch.setattr(ui_server.runtime, "start_new_query", fake_start)
+
+    payload = ui_server.QueryRequest(
+        query="follow-up",
+        conversation_id="conv_task_1",
+        parent_task_id="task_1",
+    )
+    result = await ui_server.start_query(payload)
+
+    assert calls == [("follow-up", "conv_task_1", "task_1")]
+    assert result["run_id"] == "run_query_1"
+
+
+@pytest.mark.asyncio
 async def test_continue_endpoint_is_start_alias_with_deprecation_log(monkeypatch):
     start_calls: list[tuple[str, str | None]] = []
     logs: list[tuple[str, str]] = []
@@ -117,6 +144,18 @@ async def test_task_detail_includes_enriched_hitl_fields(monkeypatch):
     assert payload["latest_plan_delta"]["summary"] == "added 1 step(s)"
     assert payload["pending_feedback_queue_count"] == 2
     assert payload["checkpoint_reason"] == "feedback_replan"
+
+
+@pytest.mark.asyncio
+async def test_conversation_detail_endpoint_returns_payload(monkeypatch):
+    monkeypatch.setattr(ui_server.runtime, "get_conversation_detail", lambda _conversation_id: {
+        "conversation": {"conversation_id": "conv_task_1", "iteration_count": 2},
+        "iterations": [],
+    })
+
+    payload = await ui_server.conversation_detail("conv_task_1")
+    assert payload["conversation"]["conversation_id"] == "conv_task_1"
+    assert payload["conversation"]["iteration_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -238,3 +277,12 @@ def test_task_summary_includes_title():
 
     assert summary["title"]
     assert summary["task_id"] == task.task_id
+
+
+def test_first_person_progress_text_normalizes_third_person():
+    assert ui_server._first_person_progress_text("The agent is gathering evidence.") == "I am gathering evidence."
+    assert ui_server._first_person_progress_text("Agents are executing the approved plan.") == "I am executing the approved plan."
+    assert (
+        ui_server._first_person_progress_text("Task is not at checkpoint; feedback queued for next adaptive gate.")
+        == "I am not at checkpoint; feedback queued for next adaptive gate."
+    )

@@ -23,8 +23,6 @@ def _synthetic_trace(tool_name: str, outcome: str = "ok", refs: list[str] | None
 def test_dynamic_planner_builds_non_template_graph():
     task = create_task(
         "Prioritize two fibrosis targets and stress-test contradictory evidence before recommending next experiments.",
-        request_type_override="prioritization",
-        intent_tags_override=["prioritization", "target_comparison", "genetics_direction"],
         use_dynamic_planner=True,
     )
     assert task.planner_mode == "dynamic"

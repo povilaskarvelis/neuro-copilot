@@ -20,30 +20,9 @@ from co_scientist.domain.models import (
     generate_chat_title,
 )
 
-VALID_REQUEST_TYPES = {
-    "comparison",
-    "prioritization",
-    "validation",
-    "action_planning",
-    "exploration",
-}
+VALID_REQUEST_TYPES = {"exploration"}
 
-VALID_INTENT_TAGS = {
-    "researcher_discovery",
-    "evidence_landscape",
-    "variant_check",
-    "pathway_context",
-    "clinical_landscape",
-    "chemistry_evidence",
-    "ontology_expansion",
-    "expression_context",
-    "genetics_direction",
-    "safety_assessment",
-    "competitive_landscape",
-    "comparison",
-    "prioritization",
-    "target_comparison",
-}
+VALID_INTENT_TAGS: set[str] = set()
 
 CAPABILITY_PATTERNS: list[tuple[str, str]] = [
     ("gwas", r"\bgwas\b|genome[-\s]*wide association|\bsnp\b|\blocus\b"),
@@ -61,39 +40,15 @@ CAPABILITY_PATTERNS: list[tuple[str, str]] = [
     ("local_data", r"\blocal dataset\b|\binternal data\b|\bcsv\b|\bfile\b"),
 ]
 
-INTENT_CAPABILITY_HINTS: dict[str, set[str]] = {
-    "researcher_discovery": {"researcher", "literature"},
-    "evidence_landscape": {"literature"},
-    "variant_check": {"genetics", "variants", "gwas"},
-    "pathway_context": {"pathways"},
-    "clinical_landscape": {"clinical"},
-    "chemistry_evidence": {"chemistry", "druggability"},
-    "ontology_expansion": {"disease_context"},
-    "expression_context": {"expression", "target_biology"},
-    "genetics_direction": {"genetics", "gwas", "directionality"},
-    "safety_assessment": {"safety", "clinical"},
-    "competitive_landscape": {"competitive", "clinical"},
-    "target_comparison": {"comparison", "synthesis"},
-}
-
 def classify_request_type(objective: str) -> str:
-    lower = objective.lower()
-    if any(token in lower for token in ["compare", "versus", "vs", "tradeoff", "trade-off", "difference"]):
-        return "comparison"
-    if any(token in lower for token in ["rank", "prioritize", "top", "best", "shortlist", "triage"]):
-        return "prioritization"
-    if any(token in lower for token in ["validate", "verify", "check", "plausible", "hypothesis", "stress-test"]):
-        return "validation"
-    if any(token in lower for token in ["plan", "roadmap", "next steps", "how should", "what should", "execution plan"]):
-        return "action_planning"
+    del objective
     return "exploration"
 
 
 def sanitize_request_type(request_type: str | None) -> str | None:
     if not request_type:
         return None
-    normalized = request_type.strip().lower()
-    return normalized if normalized in VALID_REQUEST_TYPES else None
+    return "exploration"
 
 
 def sanitize_intent_tags(intent_tags: list[str] | str | None) -> list[str]:
@@ -101,191 +56,32 @@ def sanitize_intent_tags(intent_tags: list[str] | str | None) -> list[str]:
         return []
     if isinstance(intent_tags, str):
         intent_tags = [item.strip() for item in re.split(r"[,\n;]+", intent_tags) if item.strip()]
-    cleaned: set[str] = set()
-    for tag in intent_tags:
-        normalized = str(tag).strip().lower()
-        if normalized in VALID_INTENT_TAGS:
-            cleaned.add(normalized)
-    return sorted(cleaned)
-
-
-def _mentions_researcher_role(text: str) -> bool:
-    patterns = (
-        r"\bresearch(?:er|ers)?\b",
-        r"\breseach(?:er|ers)?\b",
-        r"\breseacher(?:s)?\b",
-        r"\breseachers?\b",
-        r"\bauthor(?:s)?\b",
-        r"\bexpert(?:s)?\b",
-        r"\binvestigator(?:s)?\b",
-    )
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def _mentions_target_context(text: str) -> bool:
-    lower_text = str(text or "").lower()
-    if any(
-        token in lower_text
-        for token in [
-            "target",
-            "gene",
-            "protein",
-            "druggab",
-            "candidate",
-            "mechanism",
-            "pathway",
-        ]
-    ):
-        return True
-
-    # Heuristic: in comparison phrasing, multiple uppercase gene-like tokens usually imply target context.
-    comparison_markers = (" vs ", " versus ", "compare ", "between ")
-    if any(marker in lower_text for marker in comparison_markers):
-        tokens = re.findall(r"\b[A-Za-z0-9-]{3,12}\b", text)
-        gene_like = [
-            token
-            for token in tokens
-            if token.upper() == token
-            and any(ch.isalpha() for ch in token)
-            and not token.startswith(("NCT", "PMID", "ENSG", "MONDO_", "EFO_"))
-        ]
-        if len(gene_like) >= 2:
-            return True
-    return False
+    return sorted({str(tag).strip().lower() for tag in intent_tags if str(tag).strip()})
 
 
 def infer_intent_tags(objective: str) -> list[str]:
-    lower = objective.lower()
-    tags: list[str] = []
-    researcher_role_query = _mentions_researcher_role(lower)
-    target_context_query = _mentions_target_context(objective)
-    if researcher_role_query or "contact" in lower:
-        tags.append("researcher_discovery")
-    if any(
-        token in lower
-        for token in [
-            "evidence",
-            "landscape",
-            "literature",
-            "paper",
-            "publication",
-            "systematic review",
-            "meta-analysis",
-            "benchmark",
-        ]
-    ):
-        tags.append("evidence_landscape")
-    if any(token in lower for token in ["variant", "clinvar", "pathogenic", "gwas", "mutation", "allele", "polymorphism"]):
-        tags.append("variant_check")
-    if any(token in lower for token in ["pathway", "network", "interaction", "reactome", "string", "mechanism", "signaling"]):
-        tags.append("pathway_context")
-    if any(
-        token in lower
-        for token in ["trial", "clinical", "nct", "phase", "terminated", "recruiting", "real-world", "rwe"]
-    ):
-        tags.append("clinical_landscape")
-    if any(
-        token in lower
-        for token in [
-            "compound",
-            "chembl",
-            "potency",
-            "ic50",
-            "ki",
-            "ec50",
-            "small molecule",
-            "chemical matter",
-            "selectivity",
-            "binding affinity",
-        ]
-    ):
-        tags.append("chemistry_evidence")
-    if any(token in lower for token in ["ontology", "synonym", "disease context", "efo", "mondo"]):
-        tags.append("ontology_expansion")
-    if any(
-        token in lower
-        for token in ["expression", "tissue", "cell type", "single-cell", "cell context", "specificity", "atlas", "spatial"]
-    ):
-        tags.append("expression_context")
-    if any(token in lower for token in ["direction", "risk allele", "protective", "causal", "direction-of-effect", "doe"]):
-        tags.append("genetics_direction")
-    if any(
-        token in lower
-        for token in ["safety", "liability", "toxicity", "adverse", "off-target", "off target", "on-target", "tolerability"]
-    ):
-        tags.append("safety_assessment")
-    if any(token in lower for token in ["competitive", "competition", "crowded", "white space", "novelty", "landscape"]):
-        tags.append("competitive_landscape")
-    if any(token in lower for token in ["compare", "versus", "vs"]):
-        tags.append("comparison")
-        if target_context_query:
-            tags.append("target_comparison")
-    if any(token in lower for token in ["rank", "prioritize", "top", "shortlist", "triage"]):
-        tags.append("prioritization")
-        if target_context_query and not researcher_role_query:
-            tags.append("target_comparison")
-    if not tags:
-        tags.append("evidence_landscape")
-    return sorted(set(tags))
+    del objective
+    return []
 
 
-def build_success_criteria(request_type: str) -> list[str]:
-    criteria = [
+def build_success_criteria(objective_or_request_type: str) -> list[str]:
+    del objective_or_request_type
+    return [
         "Plan contains 2-4 executable steps aligned to the request.",
         "Each major claim is tied to at least one source or tool output.",
         "At least one uncertainty or limitation is stated explicitly.",
+        "Findings summarize key signals, limitations, and open questions.",
     ]
-    if request_type == "comparison":
-        criteria.append("Comparison includes explicit dimensions and trade-offs.")
-    elif request_type == "prioritization":
-        criteria.append("Ranking includes transparent criteria and confidence.")
-    elif request_type == "validation":
-        criteria.append("Validation includes supporting and contradictory evidence.")
-    elif request_type == "action_planning":
-        criteria.append("Next actions include concrete owners, dependencies, or sequence.")
-    else:
-        criteria.append("Findings summarize key signals and open questions.")
-    return criteria
 
 
-def _is_target_focused_query(objective: str, intent_tags: list[str]) -> bool:
-    if "target_comparison" in intent_tags:
-        return True
-    if re.search(r"\bENSG\d{11}\b", objective or "", flags=re.IGNORECASE):
-        return True
-    return _mentions_target_context(objective)
-
-
-def _infer_capability_needs(objective: str, intent_tags: list[str], request_type: str) -> list[str]:
+def _infer_capability_needs(objective: str) -> list[str]:
     lower = str(objective or "").lower()
     required: set[str] = set()
-    for tag in intent_tags:
-        required.update(INTENT_CAPABILITY_HINTS.get(tag, set()))
 
     for capability, pattern in CAPABILITY_PATTERNS:
         if re.search(pattern, lower, flags=re.IGNORECASE):
             required.add(capability)
-
-    target_focused = _is_target_focused_query(objective, intent_tags)
-    if target_focused:
-        # Ensure target-focused requests trigger target-grounded evidence stages,
-        # not only abstract synthesis/comparison stages.
-        required.add("target_mapping")
-        if request_type in {"comparison", "prioritization", "validation"}:
-            required.update({"genetics", "clinical", "druggability"})
-        if request_type in {"comparison", "prioritization"}:
-            required.add("safety")
-
-    if request_type in {"comparison", "prioritization"} and target_focused:
-        required.update({"comparison", "synthesis"})
-    elif request_type in {"comparison", "prioritization"}:
-        required.add("synthesis")
-
-    if request_type in {"validation", "action_planning"}:
-        required.add("synthesis")
-
-    if not required:
-        required.add("literature")
+    required.update(infer_capabilities_from_text(objective))
     return sorted(required)
 
 
@@ -302,25 +98,38 @@ def _build_scope_step() -> WorkflowStep:
     )
 
 
-def _build_final_stage(request_type: str) -> WorkflowStep:
+FINAL_REPORT_PRINCIPLES: tuple[str, ...] = (
+    "Adapt structure to the query type and evidence quality.",
+    "Lead with a concise and direct answer first, and then elaborate on the rationale and methodology in separate sections.",
+    "Methodology should include a provenance summary detailing the search strategy and tools utilized to reach the conclusion.",
+    "Literature supporting the answer should be cited and listed as full references at the end, while tools should be mentioned in the text using real-world names.",
+    "Use only the sections, bullets, or tables that improve clarity for the specific query.",
+    "Ground major claims in executed evidence and cite source IDs or references where possible.",
+)
+
+
+def _build_final_stage_done_criteria() -> list[str]:
+    return [
+        "response directly addresses the user objective",
+        "major claims are grounded with evidence references",
+        "uncertainty and key limitations are explicit",
+        "structure choices improve clarity for the specific objective",
+    ]
+
+
+def _build_final_stage() -> WorkflowStep:
     final_instruction = (
-        "Produce a concise final report with recommendation first, followed by rationale, methodology, limitations, and next actions."
+        "Produce a concise, decision-ready final response guided by these principles: "
+        + " ".join(FINAL_REPORT_PRINCIPLES)
     )
-    if request_type == "comparison":
-        final_instruction += " Include explicit winner/loser rationale and unresolved trade-offs."
-    elif request_type == "prioritization":
-        final_instruction += " Include rank order, scoring rationale, and confidence by item."
-    elif request_type == "validation":
-        final_instruction += " Include both supporting and contradictory evidence in the judgment."
-    elif request_type == "action_planning":
-        final_instruction += " Include sequenced next actions with dependencies and readiness gates."
 
     return WorkflowStep(
         step_id="",
-        title="Decision report",
+        title="Final synthesis",
         instruction=final_instruction,
         rationale="Convert multi-stage evidence into an auditable, decision-ready output.",
-        expected_output_fields=["recommendation", "confidence", "citations", "limitations", "next_actions"],
+        expected_output_fields=["answer", "confidence", "citations", "limitations"],
+        done_criteria=_build_final_stage_done_criteria(),
     )
 
 
@@ -354,32 +163,6 @@ def _registry_summary_tools_for_capabilities(
     return ranked[:k], fallback[:k]
 
 
-def _capability_map_from_registry_summary(tool_registry_summary: list[dict] | None) -> dict[str, set[str]]:
-    capability_map: dict[str, set[str]] = {}
-    for item in tool_registry_summary or []:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name", "")).strip()
-        if not name:
-            continue
-        caps = {str(cap).strip() for cap in item.get("capabilities", []) if str(cap).strip()}
-        capability_map[name] = caps
-    return capability_map
-
-
-def _tool_has_capability(
-    tool_name: str,
-    capability: str,
-    *,
-    tool_capability_map: dict[str, set[str]] | None = None,
-) -> bool:
-    caps = (tool_capability_map or {}).get(tool_name)
-    if caps:
-        return capability in caps
-    inferred = infer_capabilities_from_text(tool_name)
-    return capability in inferred
-
-
 def _split_objective_subgoals(objective: str) -> list[str]:
     text = re.sub(r"\s+", " ", str(objective or "")).strip()
     if not text:
@@ -401,22 +184,17 @@ def _split_objective_subgoals(objective: str) -> list[str]:
 def build_dynamic_plan_graph(
     objective: str,
     *,
-    intent_tags: list[str],
-    request_type: str,
     tool_registry_summary: list[dict] | None = None,
 ) -> list[dict]:
-    required_capabilities = _infer_capability_needs(objective, intent_tags, request_type)
+    del tool_registry_summary
     atomic_goals = _split_objective_subgoals(objective)
     graph: list[dict] = []
-    if atomic_goals:
-        goal_texts = atomic_goals[:4]
-    else:
-        goal_texts = [f"Investigate {cap.replace('_', ' ')} evidence relevant to the objective." for cap in required_capabilities[:3]]
+    goal_texts = atomic_goals[:4] if atomic_goals else []
     if not goal_texts:
         goal_texts = [objective.strip() or "Investigate evidence relevant to the objective."]
 
     for idx, clause in enumerate(goal_texts, start=1):
-        clause_caps = sorted(set(_infer_capability_needs(clause, intent_tags, request_type)))
+        clause_caps = sorted(set(_infer_capability_needs(clause)))
         subgoal_id = f"sg_dynamic_{idx}"
         deps = [f"sg_dynamic_{idx - 1}"] if idx > 1 else []
         graph.append(
@@ -425,7 +203,7 @@ def build_dynamic_plan_graph(
                 "title": f"Evidence subgoal {idx}",
                 "objective": clause,
                 "dependencies": deps,
-                "evidence_requirements": clause_caps[:5] or required_capabilities[:3] or ["literature"],
+                "evidence_requirements": clause_caps[:5],
                 "done_criteria": [
                     "at least one grounded finding",
                     "explicit uncertainty",
@@ -435,24 +213,11 @@ def build_dynamic_plan_graph(
                 "phase": _infer_phase_for_node_text(clause),
             }
         )
-
-    # Optional signal from registry scale: when many tools exist, ask planner to keep retrieval selective.
-    if tool_registry_summary and len(tool_registry_summary) > 80:
-        for node in graph:
-            if node["subgoal_id"].startswith("sg_dynamic_"):
-                node["done_criteria"].append("tool shortlist remained focused to relevant subset")
     return graph
 
 
 def _infer_phase_for_node_text(text: str) -> str:
-    lowered = str(text or "").lower()
-    if any(token in lowered for token in ["researcher", "author", "investigator", "openalex", "affiliation"]):
-        return "researcher_scouting"
-    if any(
-        token in lowered
-        for token in ["synthesis", "report", "recommend", "decision", "critique", "contradiction", "stress-test"]
-    ):
-        return "synthesis_reporting"
+    del text
     return "evidence_discovery"
 
 
@@ -460,11 +225,8 @@ def normalize_plan_graph(
     plan_graph: list[dict] | None,
     *,
     objective: str,
-    intent_tags: list[str],
-    request_type: str,
     max_nodes: int = 6,
 ) -> list[dict]:
-    required_capabilities = _infer_capability_needs(objective, intent_tags, request_type)
     raw_nodes = plan_graph or []
     normalized: list[dict] = []
     seen_ids: set[str] = set()
@@ -488,8 +250,6 @@ def normalize_plan_graph(
             raw_caps = [item.strip() for item in re.split(r"[,\n;]+", raw_caps) if item.strip()]
         node_caps = {str(item).strip() for item in (raw_caps or []) if str(item).strip()}
         node_caps.update(infer_capabilities_from_text(node_objective))
-        if not node_caps:
-            node_caps.update(required_capabilities[:2] or ["literature"])
 
         raw_deps = raw.get("dependencies", [])
         if isinstance(raw_deps, str):
@@ -541,8 +301,6 @@ def normalize_plan_graph(
 
     fallback_graph = build_dynamic_plan_graph(
         objective,
-        intent_tags=intent_tags,
-        request_type=request_type,
         tool_registry_summary=None,
     )
     return fallback_graph[:max_nodes]
@@ -556,35 +314,23 @@ def build_dynamic_plan_steps(
     tool_registry_summary: list[dict] | None = None,
     plan_graph_override: list[dict] | None = None,
 ) -> tuple[list[WorkflowStep], list[dict]]:
-    intent_tags = (
-        sanitize_intent_tags(intent_tags_override)
-        if intent_tags_override is not None
-        else infer_intent_tags(objective)
-    )
-    if not intent_tags:
-        intent_tags = infer_intent_tags(objective)
-    request_type = sanitize_request_type(request_type_override) or classify_request_type(objective)
+    # Legacy routing metadata is intentionally ignored; planning is objective-driven.
+    del intent_tags_override, request_type_override
     using_model_override = bool(plan_graph_override)
     if using_model_override:
         plan_graph = normalize_plan_graph(
             plan_graph_override,
             objective=objective,
-            intent_tags=intent_tags,
-            request_type=request_type,
         )
     else:
         plan_graph = build_dynamic_plan_graph(
             objective,
-            intent_tags=intent_tags,
-            request_type=request_type,
             tool_registry_summary=tool_registry_summary,
         )
     if not plan_graph:
         return [], []
 
     steps: list[WorkflowStep] = []
-    researcher_mode = "researcher_discovery" in intent_tags
-    tool_capability_map = _capability_map_from_registry_summary(tool_registry_summary)
     for node in plan_graph:
         subgoal_id = str(node.get("subgoal_id", "")).strip()
         evidence_requirements = {
@@ -592,72 +338,20 @@ def build_dynamic_plan_steps(
         }
         recommended_tools, fallback_tools = _registry_summary_tools_for_capabilities(
             tool_registry_summary,
-            evidence_requirements or {"literature"},
+            evidence_requirements,
             k=8,
         )
-        if researcher_mode and subgoal_id != "sg_critique":
-            recommended_tools = [
-                tool
-                for tool in recommended_tools
-                if not _tool_has_capability(tool, "clinical", tool_capability_map=tool_capability_map)
-            ]
-            fallback_tools = [
-                tool
-                for tool in fallback_tools
-                if not _tool_has_capability(tool, "clinical", tool_capability_map=tool_capability_map)
-            ]
         node_title = str(node.get("title", "")).strip()
-        if not using_model_override and subgoal_id == "sg_scope":
-            step = _build_scope_step()
-        elif not using_model_override and subgoal_id == "sg_critique":
-            step = WorkflowStep(
-                step_id="",
-                title="Critic loop and contradiction check",
-                instruction=str(node.get("objective", "")).strip(),
-                recommended_tools=recommended_tools[:4],
-                fallback_tools=fallback_tools[:4],
-                rationale="Before recommendation, validate cross-source consistency and confidence bounds.",
-                expected_output_fields=["consistency_findings", "contradictions", "confidence_bounds", "remaining_gaps"],
-            )
-        elif not using_model_override and subgoal_id == "sg_researchers":
-            # Researcher scouting should stay literature/researcher-focused and avoid
-            # clinical-trial fallback drift.
-            recommended_tools = [
-                tool
-                for tool in recommended_tools
-                if not _tool_has_capability(tool, "clinical", tool_capability_map=tool_capability_map)
-            ]
-            fallback_tools = [
-                tool
-                for tool in fallback_tools
-                if not _tool_has_capability(tool, "clinical", tool_capability_map=tool_capability_map)
-            ]
-            step = WorkflowStep(
-                step_id="",
-                title="Researcher scouting and activity map",
-                instruction=str(node.get("objective", "")).strip(),
-                recommended_tools=recommended_tools[:8],
-                fallback_tools=fallback_tools[:8],
-                rationale="Researcher discovery should happen as a distinct phase after evidence context is established.",
-                expected_output_fields=[
-                    "selected_tools",
-                    "researcher_candidates",
-                    "activity_level_summary",
-                    "contact_signals",
-                    "limitations",
-                ],
-            )
-        else:
-            instruction = str(node.get("objective", "")).strip() or "Collect the required evidence."
-            step = WorkflowStep(
-                step_id="",
-                title=node_title or f"Dynamic subgoal: {subgoal_id}",
-                instruction=instruction,
-                recommended_tools=recommended_tools,
-                fallback_tools=fallback_tools,
-                rationale="Dynamic plan node generated from objective-specific decomposition.",
-                expected_output_fields=["selected_tools", "findings", "citations", "limitations"],
-            )
+        instruction = str(node.get("objective", "")).strip() or "Collect the required evidence."
+        step = WorkflowStep(
+            step_id="",
+            title=node_title or f"Dynamic subgoal: {subgoal_id}",
+            instruction=instruction,
+            recommended_tools=recommended_tools,
+            fallback_tools=fallback_tools,
+            rationale="Dynamic plan node generated from objective-specific decomposition.",
+            expected_output_fields=["selected_tools", "findings", "citations", "limitations"],
+        )
         step.subgoal_id = subgoal_id
         step.evidence_requirements = sorted(evidence_requirements)
         step.dependencies = [str(item).strip() for item in node.get("dependencies", []) if str(item).strip()]
@@ -667,10 +361,9 @@ def build_dynamic_plan_steps(
             step.observations = list(step.observations) + [f"phase={str(node.get('phase')).strip()}"]
         steps.append(step)
 
-    final_stage = _build_final_stage(request_type)
+    final_stage = _build_final_stage()
     final_stage.subgoal_id = "sg_final_report"
     final_stage.dependencies = [step.subgoal_id for step in steps if step.subgoal_id]
-    final_stage.done_criteria = ["decision statement present", "confidence stated", "limitations and next actions included"]
     steps.append(final_stage)
     for idx, step in enumerate(steps, start=1):
         step.step_id = f"step_{idx}"
@@ -691,7 +384,7 @@ def build_plan_steps(
     )
     if dynamic_steps:
         return dynamic_steps
-    return [_build_scope_step(), _build_final_stage("exploration")]
+    return [_build_scope_step(), _build_final_stage()]
 
 
 def create_task(
@@ -703,36 +396,24 @@ def create_task(
     tool_registry_summary: list[dict] | None = None,
     plan_graph_override: list[dict] | None = None,
 ) -> WorkflowTask:
+    # Legacy routing metadata is intentionally ignored; planning is objective-driven.
+    del request_type_override, intent_tags_override
     task_id = f"task_{uuid.uuid4().hex[:8]}"
-    request_type = sanitize_request_type(request_type_override) or classify_request_type(objective)
-    intent_tags = (
-        sanitize_intent_tags(intent_tags_override)
-        if intent_tags_override is not None
-        else infer_intent_tags(objective)
-    )
-    if not intent_tags:
-        intent_tags = infer_intent_tags(objective)
     task = WorkflowTask(
         task_id=task_id,
         objective=objective,
         title=generate_chat_title(objective),
-        request_type=request_type,
-        intent_tags=intent_tags,
-        success_criteria=build_success_criteria(request_type),
+        request_type="exploration",
+        intent_tags=[],
+        success_criteria=build_success_criteria(objective),
         status="pending",
     )
     dynamic_steps, plan_graph = build_dynamic_plan_steps(
         objective,
-        intent_tags_override=intent_tags,
-        request_type_override=request_type,
         tool_registry_summary=tool_registry_summary,
         plan_graph_override=plan_graph_override,
     )
-    task.steps = dynamic_steps or build_plan_steps(
-        objective,
-        intent_tags_override=intent_tags,
-        request_type_override=request_type,
-    )
+    task.steps = dynamic_steps or build_plan_steps(objective)
     task.planner_graph = plan_graph
     task.planner_mode = "model_dynamic" if plan_graph_override else "dynamic"
     ensure_phase_state(task)
@@ -934,8 +615,8 @@ def register_plan_version(
     task: WorkflowTask,
     *,
     base_from_step_index: int,
-    request_type: str,
-    intent_tags: list[str],
+    request_type: str | None = None,
+    intent_tags: list[str] | None = None,
     revision_intent: RevisionIntent | None,
     steps: list[WorkflowStep],
     gate_reason: str,
@@ -946,8 +627,8 @@ def register_plan_version(
         version_id=f"plan_{uuid.uuid4().hex[:10]}",
         created_at=_utc_now(),
         base_from_step_index=base_from_step_index,
-        request_type=request_type,
-        intent_tags=list(intent_tags),
+        request_type=str(request_type or "exploration"),
+        intent_tags=list(intent_tags or []),
         revision_intent=revision_intent,
         steps=[clone_step(step) for step in steps],
         gate_reason=gate_reason,
@@ -971,8 +652,8 @@ def initialize_plan_version(task: WorkflowTask, gate_reason: str) -> PlanVersion
     return register_plan_version(
         task,
         base_from_step_index=base_from_step_index,
-        request_type=task.request_type,
-        intent_tags=task.intent_tags,
+        request_type="exploration",
+        intent_tags=[],
         revision_intent=None,
         steps=remaining,
         gate_reason=gate_reason,
@@ -985,14 +666,16 @@ def replan_remaining_steps(
     task: WorkflowTask,
     *,
     revised_objective: str,
-    request_type: str,
-    intent_tags: list[str],
+    request_type: str | None = None,
+    intent_tags: list[str] | None = None,
     revision_intent: RevisionIntent | None,
     gate_reason: str,
     use_dynamic_planner: bool = False,
     tool_registry_summary: list[dict] | None = None,
     plan_graph_override: list[dict] | None = None,
 ) -> tuple[PlanVersion, PlanDelta]:
+    # Legacy routing metadata is intentionally ignored; planning is objective-driven.
+    del request_type, intent_tags
     base_from_step_index = max(0, task.current_step_index + 1)
     existing_remaining = [clone_step(step) for step in task.steps[base_from_step_index:]]
     previous = active_plan_version(task)
@@ -1000,16 +683,10 @@ def replan_remaining_steps(
 
     dynamic_steps, dynamic_graph = build_dynamic_plan_steps(
         revised_objective,
-        intent_tags_override=intent_tags,
-        request_type_override=request_type,
         tool_registry_summary=tool_registry_summary,
         plan_graph_override=plan_graph_override,
     )
-    new_full_plan = dynamic_steps or build_plan_steps(
-        revised_objective,
-        intent_tags_override=intent_tags,
-        request_type_override=request_type,
-    )
+    new_full_plan = dynamic_steps or build_plan_steps(revised_objective)
     task.planner_graph = dynamic_graph
     task.planner_mode = "model_dynamic" if plan_graph_override else "dynamic"
     new_remaining_raw = new_full_plan[base_from_step_index:] if base_from_step_index < len(new_full_plan) else []
@@ -1021,8 +698,8 @@ def replan_remaining_steps(
     frozen_steps = [clone_step(step) for step in task.steps[:base_from_step_index]]
     task.steps = frozen_steps + new_remaining
     task.objective = revised_objective
-    task.request_type = request_type
-    task.intent_tags = list(intent_tags)
+    task.request_type = "exploration"
+    task.intent_tags = []
     task.checkpoint_state = "open"
     task.checkpoint_reason = gate_reason
     ensure_phase_state(task)
@@ -1031,8 +708,8 @@ def replan_remaining_steps(
         version_id=f"plan_{uuid.uuid4().hex[:10]}",
         created_at=_utc_now(),
         base_from_step_index=base_from_step_index,
-        request_type=request_type,
-        intent_tags=list(intent_tags),
+        request_type="exploration",
+        intent_tags=[],
         revision_intent=revision_intent,
         steps=[clone_step(step) for step in new_remaining],
         gate_reason=gate_reason,
