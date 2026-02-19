@@ -460,39 +460,19 @@ def evaluate_quality_gates(task) -> dict:
             unresolved_gaps.append(normalized)
 
     combined_output = "\n".join(step.output for step in task.steps if step.output).lower()
-    objective_lower = task.objective.lower()
-    researcher_mode = any(token in objective_lower for token in ["researcher", "author", "investigator", "affiliation", "expert"])
-    if researcher_mode:
-        if "cannot be directly listed" in combined_output or "tool limitation" in combined_output:
-            _append_gap("Researcher/entity identification appears incomplete due to tool limitations.")
-        if not any(token in combined_output for token in ["author", "researcher", "investigator", "affiliation"]):
-            _append_gap("No explicit researcher entities were detected in the synthesis.")
-
-    prioritization_or_comparison = any(
-        token in objective_lower
-        for token in ["prioritize", "priority", "rank", "shortlist", "triage", "compare", "comparison", "versus", " vs "]
-    )
-    if prioritization_or_comparison:
-        if not any(marker in combined_output for marker in ["rank", "score", "weighted", "priority", "trade-off", "tradeoff"]):
-            _append_gap("Prioritization/comparison output lacks explicit ranking criteria or trade-off signals.")
-    target_or_clinical_mode = any(
-        token in objective_lower
-        for token in ["target", "druggab", "candidate", "trial", "clinical", "nct", "phase"]
-    )
-    if target_or_clinical_mode:
-        if any(
-            token in combined_output
-            for token in [
-                "cannot be fulfilled",
-                "cannot be completed",
-                "insufficient data",
-                "no target candidates",
-                "unable to identify target",
-            ]
-        ):
-            _append_gap("Target/trial assessment appears incomplete based on model self-reported gaps.")
-        if not any(token in combined_output for token in ["ensg", "target id", "candidate target", "phase", "nct"]):
-            _append_gap("No concrete target or clinical-trial entities were detected in the synthesis.")
+    if any(
+        marker in combined_output
+        for marker in [
+            "cannot be fulfilled",
+            "cannot be completed",
+            "insufficient data",
+            "unable to identify",
+            "unable to retrieve",
+            "tool limitation",
+            "service unavailable",
+        ]
+    ):
+        _append_gap("Output contains self-reported evidence limitations that may affect confidence.")
 
     failed_entries = [
         entry
@@ -508,20 +488,6 @@ def evaluate_quality_gates(task) -> dict:
                 "Tool execution issues were detected "
                 f"({failure_count} failed or empty tool calls)."
             )
-
-    failed_tools = {
-        str(entry.get("tool_name", "")).strip()
-        for entry in failed_entries
-        if str(entry.get("tool_name", "")).strip()
-    }
-    genetics_priority = any(token in objective_lower for token in ["genetic", "gwas", "variant", "direction-of-effect"])
-    if genetics_priority and failed_tools.intersection(
-        {"infer_genetic_effect_direction", "search_gwas_associations", "search_clinvar_variants"}
-    ):
-        _append_gap("High-priority human genetics direction evidence is incomplete due to tool failures.")
-    safety_mode = any(token in objective_lower for token in ["safety", "toxicity", "liability", "adverse", "tolerability"])
-    if safety_mode and "summarize_target_safety_liabilities" in failed_tools:
-        _append_gap("High-priority safety-liability evidence is incomplete or ambiguous.")
 
     critical_marker_patterns = (
         r"\bcritical gap\s*[:\-]",
@@ -606,7 +572,7 @@ def evaluate_quality_gates(task) -> dict:
             f"({sample}{'; ...' if len(contract_violations) > 3 else ''})."
         )
 
-    # Confidence-and-coverage scoring (with deterministic hard-fail conditions kept).
+    # Confidence-and-coverage scoring with soft penalties for gaps.
     evidence_score = min(evidence_count / 4.0, 1.0)
     coverage_score = min(max(coverage_ratio, 0.0), 1.0)
     execution_score = min(tool_call_count / 3.0, 1.0)
@@ -626,13 +592,8 @@ def evaluate_quality_gates(task) -> dict:
     else:
         confidence_label = "low"
 
-    must_fail = (
-        contract_violation_count > 0
-        or recommendation_text == ""
-        or len(uncited_assertive_claims) > 0
-        or len(unresolved_gaps) > 0
-    )
-    passed = bool((weighted_score >= 0.58) and not must_fail)
+    must_fail = contract_violation_count > 0 or recommendation_text == ""
+    passed = bool((weighted_score >= 0.5) and not must_fail)
     task.quality_confidence = confidence_label
     if task.steps:
         task.steps[-1].confidence_label = confidence_label

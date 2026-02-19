@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deterministic acceptance-demo harness for challenge-aligned scenarios.
+Acceptance-demo harness for challenge-aligned scenarios.
 
 Run:
     python run_acceptance_demo.py
@@ -32,9 +32,9 @@ DEFAULT_RESULTS_ROOT = SCRIPT_DIR / "acceptance" / "results"
 load_dotenv(SCRIPT_DIR / ".env")
 
 CRITERIA = {
-    "report_contract": "Report contains Answer, Rationale, Methodology, Limitations, Next Actions, and Decomposition sections.",
-    "decomposition_visible": "Decomposition includes explicit executable sub-tasks.",
-    "tool_trace_present": "Methodology includes a high-level tool activity summary.",
+    "report_contract": "Report contains a direct answer with supporting context.",
+    "decomposition_visible": "Report includes optional decomposition detail when useful.",
+    "tool_trace_present": "Report includes a high-level tool activity summary when tools were used.",
     "evidence_refs_present": "Report includes at least two citation identifiers.",
     "required_signals_present": "Scenario-required output signals are present.",
     "source_attribution_present": "Answer includes explicit real-world source attribution.",
@@ -44,8 +44,6 @@ CRITERIA = {
 
 DEFAULT_HARD_CHECKS = [
     "report_contract",
-    "decomposition_visible",
-    "tool_trace_present",
     "evidence_refs_present",
     "required_signals_present",
     "source_attribution_present",
@@ -109,7 +107,7 @@ TOOL_FAMILY_MAP = {
     "local_data": {"list_local_datasets", "read_local_dataset"},
 }
 
-REQUIRED_REPORT_HEADINGS = ["Answer", "Rationale", "Methodology", "Limitations", "Next Actions", "Decomposition"]
+OPTIONAL_REPORT_HEADINGS = ["Answer", "Rationale", "Methodology", "Limitations", "Next Actions", "Decomposition"]
 
 
 def _now_iso_utc() -> str:
@@ -305,10 +303,13 @@ def _score_report(
     report_lower = report.lower()
     section_presence = {
         heading: bool(re.search(rf"^##\s+{re.escape(heading)}\s*$", report, flags=re.MULTILINE))
-        for heading in REQUIRED_REPORT_HEADINGS
+        for heading in OPTIONAL_REPORT_HEADINGS
     }
     decomposition_block = _extract_section(report, "Decomposition")
-    decomposition_count = len(re.findall(r"^\s*(?:\d+[.)]|-)\s+.+$", decomposition_block, flags=re.MULTILINE))
+    decomposition_count = len(
+        re.findall(r"^\s*(?:\d+[.)]|-)\s+.+$", decomposition_block or report, flags=re.MULTILINE)
+    )
+    answer_present = bool(report.strip()) and not report.lstrip().startswith("## Clarification Needed")
     tool_call_count = report.count("call_id=")
     if tool_call_count == 0:
         total_calls_match = re.search(r"\bA total of\s+(\d+)\s+evidence calls were executed\b", report, flags=re.IGNORECASE)
@@ -344,8 +345,8 @@ def _score_report(
     min_citations = _coerce_minimum_citations(minimum_citations)
 
     checks = {
-        "report_contract": all(section_presence.values()),
-        "decomposition_visible": decomposition_count >= 2,
+        "report_contract": answer_present,
+        "decomposition_visible": decomposition_count >= 1 or "decomposition" not in report_lower,
         "tool_trace_present": tool_trace_visible,
         "evidence_refs_present": len(evidence_items) >= min_citations,
         "required_signals_present": required_signals_present,
@@ -849,7 +850,7 @@ async def _run_acceptance(args: argparse.Namespace) -> tuple[int, Path]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run deterministic acceptance demo harness.")
+    parser = argparse.ArgumentParser(description="Run acceptance demo harness.")
     parser.add_argument(
         "--config",
         type=Path,

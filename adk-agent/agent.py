@@ -71,7 +71,7 @@ AGENT_INSTRUCTION = """You are an agentic AI research assistant operating like a
 Think in iterative Plan-Act-Reflect cycles.
 Use tools to gather evidence, keep provenance, and state uncertainty explicitly.
 After each major phase, pause and ask the user for confirmation before continuing.
-Always end with a decision-ready final report grounded in captured evidence."""
+Always end with a final response grounded in captured evidence and adapted to the user query."""
 
 PLANNER_PROMPT = """You are the planning role for an agentic scientific workflow.
 Generate query-specific subgoals, dependencies, and evidence requirements.
@@ -108,7 +108,9 @@ CRITIC_PROMPT = """You are the critic/verifier role for an agentic scientific wo
 Assess evidence sufficiency, contradictions, and confidence calibration before final recommendation."""
 
 REPORT_SYNTHESIZER_PROMPT = """You are the reporting role for an agentic scientific workflow.
-Produce a decision-ready final report with explicit recommendation, rationale, limitations, and next actions."""
+Produce a concise final response that adapts structure to the query and evidence quality.
+Lead with a direct answer first, then add only the rationale, methodology/provenance, limitations,
+and references needed for clarity."""
 
 _TOOL_REGISTRY = ToolRegistry()
 
@@ -462,18 +464,10 @@ def create_agent(tool_filter: list[str] | None = None):
     return agent, mcp_tools
 
 
-STEP_SCOPE_TOOLS = _runtime_exec.STEP_SCOPE_TOOLS
-
-
 async def _refresh_tool_registry(mcp_tools) -> int:
     if not DYNAMIC_TOOL_REGISTRY_ENABLED:
         return 0
     return await _TOOL_REGISTRY.refresh_from_mcp_toolset(mcp_tools, merge=True)
-
-
-def _is_reasoning_only_step(task: WorkflowTask, step_idx: int) -> bool:
-    return _runtime_exec.is_reasoning_only_step(task, step_idx)
-
 
 def _build_step_allowed_tools(task: WorkflowTask, step_idx: int) -> list[str]:
     registry = _TOOL_REGISTRY if DYNAMIC_TOOL_RETRIEVAL_ENABLED else None

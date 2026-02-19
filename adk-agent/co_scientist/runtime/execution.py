@@ -17,12 +17,6 @@ from .event_orchestrator import (
 )
 
 
-STEP_SCOPE_TOOLS = {
-    "search_diseases",
-    "search_targets",
-    "expand_disease_context",
-}
-
 VALID_MCP_RESULT_STATUSES = {"ok", "error", "not_found_or_empty", "degraded"}
 SEQUENCE_FALLBACK_TRIGGER_OUTCOMES = {"error", "not_found_or_empty", "no_response", "degraded"}
 GENERIC_PAYLOAD_REQUIRED_KEYS = [
@@ -388,20 +382,20 @@ def validate_mcp_response_contract(response_payload) -> dict:
     }
 
 
-def is_reasoning_only_step(task, step_idx: int) -> bool:
-    return step_idx == 0 or step_idx == len(task.steps) - 1
-
-
 def build_step_allowed_tools(task, step_idx: int, tool_registry: ToolRegistry | None = None) -> list[str]:
     step = task.steps[step_idx]
-
-    # Keep scope and final synthesis steps tool-constrained.
-    if is_reasoning_only_step(task, step_idx):
-        return sorted(STEP_SCOPE_TOOLS) if step_idx == 0 else []
+    shortlist = sorted(set(step.recommended_tools + step.fallback_tools))
+    hints = set(getattr(step, "evidence_requirements", []) or [])
+    hints.update(infer_capabilities_from_text(f"{step.title} {step.instruction}"))
+    hints = {str(item).strip() for item in hints if str(item).strip()}
 
     if tool_registry is not None:
-        hints = set(getattr(step, "evidence_requirements", []) or [])
-        allowed_list = tool_registry.names()
+        registry_names = set(tool_registry.names())
+        allowed_list = [name for name in shortlist if name in registry_names] if shortlist else []
+        if not allowed_list:
+            if not hints:
+                return []
+            allowed_list = tool_registry.names()
         ranked = tool_registry.rank_tools(
             query=f"{step.title} {step.instruction}",
             capability_hints=hints,
@@ -412,7 +406,7 @@ def build_step_allowed_tools(task, step_idx: int, tool_registry: ToolRegistry | 
             short_context = tool_registry.compact_descriptions(ranked[:6])
             step.observations = list(step.observations) + [f"tool_shortlist={', '.join(ranked[:6])}"] + short_context
             return ranked
-    return sorted(set(step.recommended_tools + step.fallback_tools))
+    return shortlist
 
 
 def should_escalate_allowlist(step, trace_entries: list[dict], output: str) -> bool:
@@ -433,16 +427,18 @@ def build_escalated_allowed_tools(
     task, step_idx: int, tool_registry: ToolRegistry | None = None
 ) -> list[str]:
     base = set(build_step_allowed_tools(task, step_idx, tool_registry=tool_registry))
-    # Escalation broadens coverage while keeping synthesis steps tool-free.
-    if is_reasoning_only_step(task, step_idx):
-        return sorted(base)
     escalated = sorted(base)
     if tool_registry is not None:
-        hints = set(getattr(task.steps[step_idx], "evidence_requirements", []) or [])
-        if not escalated:
+        step = task.steps[step_idx]
+        hints = set(getattr(step, "evidence_requirements", []) or [])
+        hints.update(infer_capabilities_from_text(f"{step.title} {step.instruction} escalation"))
+        hints = {str(item).strip() for item in hints if str(item).strip()}
+        if not escalated and hints:
             escalated = tool_registry.names()
+        if not escalated:
+            return []
         ranked = tool_registry.rank_tools(
-            query=f"{task.steps[step_idx].title} {task.steps[step_idx].instruction} escalation",
+            query=f"{step.title} {step.instruction} escalation",
             capability_hints=hints,
             candidates=escalated,
             k=min(max(len(escalated), 1), 20),

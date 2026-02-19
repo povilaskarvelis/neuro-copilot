@@ -20,54 +20,16 @@ from co_scientist.domain.models import (
     generate_chat_title,
 )
 
-VALID_REQUEST_TYPES = {"exploration"}
+VALID_REQUEST_TYPES: set[str] = set()
 
 VALID_INTENT_TAGS: set[str] = set()
 
-CAPABILITY_PATTERNS: list[tuple[str, str]] = [
-    ("gwas", r"\bgwas\b|genome[-\s]*wide association|\bsnp\b|\blocus\b"),
-    ("genetics", r"\bgenetic|\bgenomic|\bvariant|\bmutation|\bheritable"),
-    ("directionality", r"direction[-\s]*of[-\s]*effect|risk[-\s]*increasing|protective"),
-    ("safety", r"\bsafety\b|\btoxicity\b|adverse|liabilit|risk signal"),
-    ("clinical", r"\bclinical trial|\bphase\s*[1234]\b|\bpatient\b|clinicaltrials\.gov"),
-    ("literature", r"\bpubmed\b|\bliterature\b|\bpaper|\bpublication|\bcitation"),
-    ("druggability", r"\bdruggability\b|\btractability\b|\bmodality\b"),
-    ("chemistry", r"\bchembl\b|\bcompound\b|chemical matter|potency|ic50"),
-    ("competitive", r"\bcompetitive\b|\blandscape\b|\bpipeline\b|\bprogram\b"),
-    ("expression", r"\bexpression\b|\btissue\b|\bcell type\b|\banatom"),
-    ("pathways", r"\bpathway\b|\breactome\b|\binteraction\b|\bstring\b"),
-    ("researcher", r"\bresearcher\b|\bauthor\b|\baffiliation\b|\binvestigator\b"),
-    ("local_data", r"\blocal dataset\b|\binternal data\b|\bcsv\b|\bfile\b"),
-]
+CAPABILITY_PATTERNS: list[tuple[str, str]] = []
 
-def classify_request_type(objective: str) -> str:
+def build_success_criteria(objective: str) -> list[str]:
     del objective
-    return "exploration"
-
-
-def sanitize_request_type(request_type: str | None) -> str | None:
-    if not request_type:
-        return None
-    return "exploration"
-
-
-def sanitize_intent_tags(intent_tags: list[str] | str | None) -> list[str]:
-    if not intent_tags:
-        return []
-    if isinstance(intent_tags, str):
-        intent_tags = [item.strip() for item in re.split(r"[,\n;]+", intent_tags) if item.strip()]
-    return sorted({str(tag).strip().lower() for tag in intent_tags if str(tag).strip()})
-
-
-def infer_intent_tags(objective: str) -> list[str]:
-    del objective
-    return []
-
-
-def build_success_criteria(objective_or_request_type: str) -> list[str]:
-    del objective_or_request_type
     return [
-        "Plan contains 2-4 executable steps aligned to the request.",
+        "Plan contains executable steps aligned to the request and available evidence pathways.",
         "Each major claim is tied to at least one source or tool output.",
         "At least one uncertainty or limitation is stated explicitly.",
         "Findings summarize key signals, limitations, and open questions.",
@@ -75,26 +37,18 @@ def build_success_criteria(objective_or_request_type: str) -> list[str]:
 
 
 def _infer_capability_needs(objective: str) -> list[str]:
-    lower = str(objective or "").lower()
-    required: set[str] = set()
-
-    for capability, pattern in CAPABILITY_PATTERNS:
-        if re.search(pattern, lower, flags=re.IGNORECASE):
-            required.add(capability)
-    required.update(infer_capabilities_from_text(objective))
-    return sorted(required)
+    return sorted(infer_capabilities_from_text(objective))
 
 
 def _build_scope_step() -> WorkflowStep:
     return WorkflowStep(
         step_id="step_1",
-        title="Scope and decomposition",
+        title="Scope and execution framing",
         instruction=(
             "Extract concrete entities, constraints, and success criteria from the request. "
-            "Define decomposition subtasks that can be executed with available evidence tools."
+            "Define only the structure needed to guide effective evidence gathering."
         ),
-        rationale="Explicit scoping prevents retrieval drift and improves traceable synthesis quality.",
-        expected_output_fields=["objective", "constraints", "success_criteria", "decomposition_subtasks"],
+        rationale="Explicit scoping reduces retrieval drift and improves traceable synthesis quality.",
     )
 
 
@@ -119,7 +73,7 @@ def _build_final_stage_done_criteria() -> list[str]:
 
 def _build_final_stage() -> WorkflowStep:
     final_instruction = (
-        "Produce a concise, decision-ready final response guided by these principles: "
+        "Produce a concise final response guided by these principles: "
         + " ".join(FINAL_REPORT_PRINCIPLES)
     )
 
@@ -127,8 +81,7 @@ def _build_final_stage() -> WorkflowStep:
         step_id="",
         title="Final synthesis",
         instruction=final_instruction,
-        rationale="Convert multi-stage evidence into an auditable, decision-ready output.",
-        expected_output_fields=["answer", "confidence", "citations", "limitations"],
+        rationale="Convert multi-stage evidence into an auditable output.",
         done_criteria=_build_final_stage_done_criteria(),
     )
 
@@ -309,13 +262,9 @@ def normalize_plan_graph(
 def build_dynamic_plan_steps(
     objective: str,
     *,
-    intent_tags_override: list[str] | None = None,
-    request_type_override: str | None = None,
     tool_registry_summary: list[dict] | None = None,
     plan_graph_override: list[dict] | None = None,
 ) -> tuple[list[WorkflowStep], list[dict]]:
-    # Legacy routing metadata is intentionally ignored; planning is objective-driven.
-    del intent_tags_override, request_type_override
     using_model_override = bool(plan_graph_override)
     if using_model_override:
         plan_graph = normalize_plan_graph(
@@ -350,7 +299,6 @@ def build_dynamic_plan_steps(
             recommended_tools=recommended_tools,
             fallback_tools=fallback_tools,
             rationale="Dynamic plan node generated from objective-specific decomposition.",
-            expected_output_fields=["selected_tools", "findings", "citations", "limitations"],
         )
         step.subgoal_id = subgoal_id
         step.evidence_requirements = sorted(evidence_requirements)
@@ -372,15 +320,9 @@ def build_dynamic_plan_steps(
 
 def build_plan_steps(
     objective: str,
-    *,
-    intent_tags_override: list[str] | None = None,
-    request_type_override: str | None = None,
 ) -> list[WorkflowStep]:
-    # Compatibility wrapper: legacy callers still resolve to the agentic dynamic planner.
     dynamic_steps, _ = build_dynamic_plan_steps(
         objective,
-        intent_tags_override=intent_tags_override,
-        request_type_override=request_type_override,
     )
     if dynamic_steps:
         return dynamic_steps
@@ -390,21 +332,16 @@ def build_plan_steps(
 def create_task(
     objective: str,
     *,
-    request_type_override: str | None = None,
-    intent_tags_override: list[str] | None = None,
     use_dynamic_planner: bool = True,
     tool_registry_summary: list[dict] | None = None,
     plan_graph_override: list[dict] | None = None,
 ) -> WorkflowTask:
-    # Legacy routing metadata is intentionally ignored; planning is objective-driven.
-    del request_type_override, intent_tags_override
+    del use_dynamic_planner
     task_id = f"task_{uuid.uuid4().hex[:8]}"
     task = WorkflowTask(
         task_id=task_id,
         objective=objective,
         title=generate_chat_title(objective),
-        request_type="exploration",
-        intent_tags=[],
         success_criteria=build_success_criteria(objective),
         status="pending",
     )
@@ -490,7 +427,7 @@ def _apply_revision_plan_overrides(steps: list[WorkflowStep], objective: str) ->
     for idx, step in enumerate(steps):
         if idx == 0:
             step.instruction += (
-                " Update decomposition_subtasks to reflect all revision directives and any changed execution path."
+                " Update scope framing and execution strategy to reflect all revision directives and any changed execution path."
             )
             if tool_hints:
                 step.instruction += (
@@ -615,8 +552,6 @@ def register_plan_version(
     task: WorkflowTask,
     *,
     base_from_step_index: int,
-    request_type: str | None = None,
-    intent_tags: list[str] | None = None,
     revision_intent: RevisionIntent | None,
     steps: list[WorkflowStep],
     gate_reason: str,
@@ -627,8 +562,6 @@ def register_plan_version(
         version_id=f"plan_{uuid.uuid4().hex[:10]}",
         created_at=_utc_now(),
         base_from_step_index=base_from_step_index,
-        request_type=str(request_type or "exploration"),
-        intent_tags=list(intent_tags or []),
         revision_intent=revision_intent,
         steps=[clone_step(step) for step in steps],
         gate_reason=gate_reason,
@@ -652,8 +585,6 @@ def initialize_plan_version(task: WorkflowTask, gate_reason: str) -> PlanVersion
     return register_plan_version(
         task,
         base_from_step_index=base_from_step_index,
-        request_type="exploration",
-        intent_tags=[],
         revision_intent=None,
         steps=remaining,
         gate_reason=gate_reason,
@@ -666,16 +597,13 @@ def replan_remaining_steps(
     task: WorkflowTask,
     *,
     revised_objective: str,
-    request_type: str | None = None,
-    intent_tags: list[str] | None = None,
     revision_intent: RevisionIntent | None,
     gate_reason: str,
     use_dynamic_planner: bool = False,
     tool_registry_summary: list[dict] | None = None,
     plan_graph_override: list[dict] | None = None,
 ) -> tuple[PlanVersion, PlanDelta]:
-    # Legacy routing metadata is intentionally ignored; planning is objective-driven.
-    del request_type, intent_tags
+    del use_dynamic_planner
     base_from_step_index = max(0, task.current_step_index + 1)
     existing_remaining = [clone_step(step) for step in task.steps[base_from_step_index:]]
     previous = active_plan_version(task)
@@ -698,8 +626,6 @@ def replan_remaining_steps(
     frozen_steps = [clone_step(step) for step in task.steps[:base_from_step_index]]
     task.steps = frozen_steps + new_remaining
     task.objective = revised_objective
-    task.request_type = "exploration"
-    task.intent_tags = []
     task.checkpoint_state = "open"
     task.checkpoint_reason = gate_reason
     ensure_phase_state(task)
@@ -708,8 +634,6 @@ def replan_remaining_steps(
         version_id=f"plan_{uuid.uuid4().hex[:10]}",
         created_at=_utc_now(),
         base_from_step_index=base_from_step_index,
-        request_type="exploration",
-        intent_tags=[],
         revision_intent=revision_intent,
         steps=[clone_step(step) for step in new_remaining],
         gate_reason=gate_reason,

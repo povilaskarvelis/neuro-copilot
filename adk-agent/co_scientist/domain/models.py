@@ -63,7 +63,6 @@ class WorkflowStep:
     allowed_tools: list[str] = field(default_factory=list)
     tool_trace: list[dict] = field(default_factory=list)
     rationale: str = ""
-    expected_output_fields: list[str] = field(default_factory=list)
     reasoning_summary: str = ""
     actions: list[str] = field(default_factory=list)
     observations: list[str] = field(default_factory=list)
@@ -88,7 +87,6 @@ class WorkflowStep:
             "allowed_tools": self.allowed_tools,
             "tool_trace": self.tool_trace,
             "rationale": self.rationale,
-            "expected_output_fields": self.expected_output_fields,
             "reasoning_summary": self.reasoning_summary,
             "actions": self.actions,
             "observations": self.observations,
@@ -115,7 +113,6 @@ class WorkflowStep:
             allowed_tools=list(payload.get("allowed_tools", [])),
             tool_trace=list(payload.get("tool_trace", [])),
             rationale=payload.get("rationale", ""),
-            expected_output_fields=list(payload.get("expected_output_fields", [])),
             reasoning_summary=payload.get("reasoning_summary", ""),
             actions=list(payload.get("actions", [])),
             observations=list(payload.get("observations", [])),
@@ -212,8 +209,6 @@ class PlanVersion:
     version_id: str
     created_at: str
     base_from_step_index: int
-    request_type: str
-    intent_tags: list[str] = field(default_factory=list)
     revision_intent: RevisionIntent | None = None
     steps: list[WorkflowStep] = field(default_factory=list)
     gate_reason: str = ""
@@ -223,8 +218,6 @@ class PlanVersion:
             "version_id": self.version_id,
             "created_at": self.created_at,
             "base_from_step_index": self.base_from_step_index,
-            "request_type": self.request_type,
-            "intent_tags": list(self.intent_tags),
             "revision_intent": self.revision_intent.to_dict() if self.revision_intent else None,
             "steps": [step.to_dict() for step in self.steps],
             "gate_reason": self.gate_reason,
@@ -238,8 +231,6 @@ class PlanVersion:
             version_id=str(payload.get("version_id", "")).strip(),
             created_at=str(payload.get("created_at", "")).strip() or _utc_now(),
             base_from_step_index=int(payload.get("base_from_step_index", 0) or 0),
-            request_type=str(payload.get("request_type", "exploration") or "exploration"),
-            intent_tags=[str(x).strip() for x in payload.get("intent_tags", []) if str(x).strip()],
             revision_intent=RevisionIntent.from_dict(payload.get("revision_intent")),
             steps=[WorkflowStep.from_dict(step) for step in payload.get("steps", []) if isinstance(step, dict)],
             gate_reason=str(payload.get("gate_reason", "")).strip(),
@@ -256,8 +247,6 @@ class WorkflowTask:
     conversation_id: str = ""
     parent_task_id: str | None = None
     user_query: str = ""
-    request_type: str = "exploration"
-    intent_tags: list[str] = field(default_factory=list)
     success_criteria: list[str] = field(default_factory=list)
     status: str = "pending"
     steps: list[WorkflowStep] = field(default_factory=list)
@@ -274,7 +263,7 @@ class WorkflowTask:
     progress_events: list[dict] = field(default_factory=list)
     progress_summaries: list[dict] = field(default_factory=list)
     planner_graph: list[dict] = field(default_factory=list)
-    planner_mode: str = "deterministic"
+    planner_mode: str = "dynamic"
     quality_confidence: str = ""
     phase_state: dict[str, str] = field(default_factory=dict)
     event_log: list[dict] = field(default_factory=list)
@@ -299,8 +288,6 @@ class WorkflowTask:
             "conversation_id": str(self.conversation_id or "").strip(),
             "parent_task_id": str(self.parent_task_id or "").strip() or None,
             "user_query": str(self.user_query or "").strip(),
-            "request_type": self.request_type,
-            "intent_tags": self.intent_tags,
             "success_criteria": self.success_criteria,
             "status": self.status,
             "steps": [step.to_dict() for step in self.steps],
@@ -344,8 +331,6 @@ class WorkflowTask:
             conversation_id=str(payload.get("conversation_id", "")).strip(),
             parent_task_id=str(payload.get("parent_task_id", "")).strip() or None,
             user_query=str(payload.get("user_query", "")).strip() or str(payload.get("objective", "")).strip(),
-            request_type=payload.get("request_type", "exploration"),
-            intent_tags=list(payload.get("intent_tags", [])),
             success_criteria=list(payload.get("success_criteria", [])),
             status=payload.get("status", "pending"),
             steps=[WorkflowStep.from_dict(step) for step in payload.get("steps", [])],
@@ -366,7 +351,7 @@ class WorkflowTask:
             progress_events=[item for item in payload.get("progress_events", []) if isinstance(item, dict)],
             progress_summaries=[item for item in payload.get("progress_summaries", []) if isinstance(item, dict)],
             planner_graph=[item for item in payload.get("planner_graph", []) if isinstance(item, dict)],
-            planner_mode=str(payload.get("planner_mode", "deterministic") or "deterministic"),
+            planner_mode=str(payload.get("planner_mode", "dynamic") or "dynamic"),
             quality_confidence=str(payload.get("quality_confidence", "")).strip(),
             phase_state={
                 str(k).strip(): str(v).strip()

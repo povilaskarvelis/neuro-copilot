@@ -20,12 +20,15 @@ EVENT_CHECKPOINT_REVISED = "checkpoint_revised"
 
 def infer_phase_for_step(step) -> str:
     subgoal = str(getattr(step, "subgoal_id", "") or "").strip().lower()
-    title = str(getattr(step, "title", "") or "").lower()
-    instruction = str(getattr(step, "instruction", "") or "").lower()
-    text = f"{subgoal} {title} {instruction}"
-    if "researcher" in text or "openalex" in text or "author" in text or "investigator" in text:
-        return PHASE_RESEARCHERS
-    if subgoal.startswith("sg_final") or "decision report" in text or "synthesis" in text:
+    observations = [str(item).strip().lower() for item in getattr(step, "observations", []) if str(item).strip()]
+    for item in observations:
+        if not item.startswith("phase="):
+            continue
+        _, _, value = item.partition("=")
+        normalized = value.strip()
+        if normalized in {PHASE_EVIDENCE, PHASE_RESEARCHERS, PHASE_SYNTHESIS}:
+            return normalized
+    if subgoal.startswith("sg_final"):
         return PHASE_SYNTHESIS
     return PHASE_EVIDENCE
 

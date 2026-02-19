@@ -7,25 +7,55 @@ from dataclasses import dataclass, field
 import re
 
 
-_CAPABILITY_PATTERNS: list[tuple[str, str]] = [
-    ("gwas", r"\bgwas\b|genome[-\s]*wide association|\bsnp\b|\blocus\b"),
-    ("genetics", r"\bgenetic|\bgenomic|\bvariant|\bmutation|\bheritable"),
-    ("directionality", r"direction[-\s]*of[-\s]*effect|risk[-\s]*increasing|protective"),
-    ("safety", r"\bsafety\b|\btoxicity\b|adverse|liabilit|risk signal"),
-    ("clinical", r"\bclinical trial|\bphase\s*[1234]\b|\bpatient\b|clinicaltrials\.gov"),
-    ("literature", r"\bpubmed\b|\bliterature\b|\bpaper|\bpublication|\bcitation"),
-    ("druggability", r"\bdruggability\b|\btractability\b|\bmodality\b"),
-    ("chemistry", r"\bchembl\b|\bcompound\b|chemical matter|potency|ic50"),
-    ("competitive", r"\bcompetitive\b|\blandscape\b|\bpipeline\b|\bprogram\b"),
-    ("expression", r"\bexpression\b|\btissue\b|\bcell type\b|\banatom"),
-    ("pathways", r"\bpathway\b|\breactome\b|\binteraction\b|\bstring\b"),
-    ("researcher", r"\bresearcher\b|\bauthor\b|\baffiliation\b|\binvestigator\b"),
-    ("disease_context", r"\bdisease\b|\bmondo\b|\befo\b|\bontology\b|\bsynonym\b"),
-    ("target_mapping", r"\btarget\b|\bgene\b|\bensg\b|\bsymbol\b"),
-    ("local_data", r"\blocal dataset\b|\binternal data\b|\bcsv\b|\bfile\b"),
-    ("comparison", r"\bcompare\b|\bversus\b|\bvs\b|\brank\b|\bprioriti"),
-    ("synthesis", r"\bsynthes|\brecommend|\bdecision\b|\btrade[-\s]*off"),
-]
+_CAPABILITY_STOPWORDS: set[str] = {
+    "about",
+    "across",
+    "after",
+    "also",
+    "analysis",
+    "answer",
+    "based",
+    "before",
+    "between",
+    "build",
+    "collect",
+    "compare",
+    "current",
+    "data",
+    "details",
+    "evidence",
+    "final",
+    "find",
+    "from",
+    "high",
+    "include",
+    "into",
+    "latest",
+    "list",
+    "many",
+    "method",
+    "more",
+    "most",
+    "need",
+    "only",
+    "output",
+    "query",
+    "report",
+    "results",
+    "review",
+    "score",
+    "search",
+    "show",
+    "step",
+    "steps",
+    "summary",
+    "synthesize",
+    "this",
+    "tool",
+    "tools",
+    "using",
+    "with",
+}
 
 
 @dataclass
@@ -44,11 +74,20 @@ class ToolDescriptor:
 
 
 def infer_capabilities_from_text(text: str) -> set[str]:
-    value = str(text or "").lower()
+    value = re.sub(r"[-/]+", " ", str(text or "").lower())
+    tokens = re.findall(r"\b[a-z][a-z0-9_]{2,}\b", value)
     found: set[str] = set()
-    for capability, pattern in _CAPABILITY_PATTERNS:
-        if re.search(pattern, value, flags=re.IGNORECASE):
-            found.add(capability)
+    for token in tokens:
+        if token in _CAPABILITY_STOPWORDS:
+            continue
+        if len(token) < 4:
+            continue
+        normalized = token.rstrip("s") if len(token) > 5 else token
+        if normalized in _CAPABILITY_STOPWORDS:
+            continue
+        found.add(normalized)
+        if len(found) >= 24:
+            break
     return found
 
 

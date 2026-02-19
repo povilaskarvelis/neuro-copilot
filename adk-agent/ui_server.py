@@ -44,12 +44,6 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-_LEGACY_REPORT_SECTION_RE = re.compile(
-    r"^##\s*(?:Query|Scope)\b|^###\s*Why this recommendation\b|^\s*Rationale Narrative\s*:",
-    flags=re.IGNORECASE | re.MULTILINE,
-)
-
-
 def _safe_task_sort_key(task: WorkflowTask) -> str:
     return str(getattr(task, "updated_at", "") or "")
 
@@ -571,7 +565,7 @@ class UiRuntime:
             return ["I will persist report artifacts and return the final output."]
         return ["I will continue workflow execution."]
 
-    def _deterministic_progress_summary(
+    def _fallback_progress_summary(
         self,
         *,
         phase: str,
@@ -762,7 +756,7 @@ class UiRuntime:
                 return
             prior_summary = run.progress_summaries[-1] if run.progress_summaries else None
 
-        deterministic = self._deterministic_progress_summary(
+        fallback = self._fallback_progress_summary(
             phase=phase,
             status=status,
             events_window=events_window,
@@ -774,7 +768,7 @@ class UiRuntime:
             events_window=events_window,
             prior_summary=prior_summary,
         )
-        payload = model_summary or deterministic
+        payload = model_summary or fallback
         snapshot = {
             "snapshot_id": f"snap_{uuid.uuid4().hex[:10]}",
             "at": _utc_now(),

@@ -1,7 +1,6 @@
 """Runtime layer exports for execution/trace utilities."""
 
 from .execution import (
-    STEP_SCOPE_TOOLS,
     build_escalated_allowed_tools,
     build_step_allowed_tools,
     classify_tool_response,
@@ -11,7 +10,6 @@ from .execution import (
     extract_missing_tool_name,
     extract_response_excerpt,
     format_step_execution_error,
-    is_reasoning_only_step,
     normalize_trace_detail,
     populate_step_rao_fields,
     run_runner_turn,
@@ -53,7 +51,6 @@ from .event_orchestrator import (
 )
 
 __all__ = [
-    "STEP_SCOPE_TOOLS",
     "build_escalated_allowed_tools",
     "build_step_allowed_tools",
     "classify_tool_response",
@@ -63,7 +60,6 @@ __all__ = [
     "extract_missing_tool_name",
     "extract_response_excerpt",
     "format_step_execution_error",
-    "is_reasoning_only_step",
     "normalize_trace_detail",
     "populate_step_rao_fields",
     "run_runner_turn",

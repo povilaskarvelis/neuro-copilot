@@ -354,40 +354,18 @@ def _default_decomposition(task: WorkflowTask) -> list[str]:
 
 
 def _decomposition_status(task: WorkflowTask, subtask: str) -> str:
-    tool_names = {
-        str(entry.get("tool_name", ""))
-        for step in task.steps
-        for entry in step.tool_trace
-    }
-    combined_output = "\n".join(step.output for step in task.steps if step.output).lower()
-    lower = subtask.lower()
-
-    if any(token in lower for token in ["disease", "topic", "scope", "timeframe"]):
-        observed = bool(task.steps and task.steps[0].output.strip()) or bool(
-            tool_names.intersection({"search_diseases", "search_targets", "expand_disease_context"})
-        )
-    elif any(token in lower for token in ["publication", "literature"]):
-        observed = bool(
-            tool_names.intersection(
-                {
-                    "search_openalex_works",
-                    "search_pubmed",
-                    "search_pubmed_advanced",
-                    "get_pubmed_abstract",
-                    "get_pubmed_paper_details",
-                }
-            )
-        )
-    elif any(token in lower for token in ["author", "researcher", "investigator", "affiliation"]):
-        observed = bool(
-            tool_names.intersection(
-                {"search_openalex_authors", "get_pubmed_author_profile", "rank_researchers_by_activity"}
-            )
-        )
-    elif any(token in lower for token in ["activity", "rank", "prominence", "shortlist"]):
-        observed = "rank_researchers_by_activity" in tool_names or "rank" in combined_output
-    else:
-        observed = bool(combined_output.strip())
+    normalized_subtask = str(subtask or "").strip().lower()
+    subtask_tokens = [token for token in re.findall(r"[a-z0-9]{4,}", normalized_subtask) if token]
+    observed = False
+    if subtask_tokens:
+        for step in task.steps:
+            haystack = f"{step.title} {step.instruction} {step.output}".lower()
+            overlap = sum(1 for token in subtask_tokens if token in haystack)
+            if overlap >= max(1, min(2, len(subtask_tokens))):
+                observed = True
+                break
+    if not observed:
+        observed = any(bool((step.output or "").strip()) for step in task.steps)
 
     if observed and task.status == "completed":
         return "completed"
@@ -927,35 +905,16 @@ def _build_structured_output_contract(
 
 
 def _methodology_strategy_sentence(task: WorkflowTask) -> str:
-    objective_lower = str(task.objective or "").lower()
-    focus: list[str] = []
-    keyword_focus = (
-        (("genetic", "gwas", "variant", "direction-of-effect"), "human genetics direction-of-effect"),
-        (("trial", "clinical", "nct", "phase"), "clinical outcome patterns"),
-        (("safety", "toxicity", "adverse", "liability"), "safety liabilities"),
-        (("chembl", "compound", "potency", "druggability"), "chemical and tractability evidence"),
-        (("competitive", "pipeline", "program", "landscape"), "development landscape signals"),
-        (("pathway", "interaction", "reactome", "string"), "pathway/network context"),
-        (("expression", "tissue", "cell type", "single-cell"), "tissue and cell-context evidence"),
-        (("researcher", "author", "investigator", "affiliation"), "research-ecosystem signals"),
-    )
-    for tokens, label in keyword_focus:
-        if any(token in objective_lower for token in tokens):
-            focus.append(label)
-    if focus:
-        if len(focus) == 1:
-            focus_text = focus[0]
-        elif len(focus) == 2:
-            focus_text = f"{focus[0]} and {focus[1]}"
-        else:
-            focus_text = f"{', '.join(focus[:-1])}, and {focus[-1]}"
+    trace_entries = [entry for step in task.steps for entry in (step.tool_trace or []) if isinstance(entry, dict)]
+    source_count = len(_detect_source_families(task))
+    if trace_entries:
         return (
-            "The workflow was composed around the detected request scope and prioritized "
-            f"{focus_text} before final synthesis."
+            "The workflow iteratively scoped the objective, executed evidence retrieval, and synthesized findings, "
+            f"using {len(trace_entries)} tool calls across {source_count or 1} evidence source family(ies)."
         )
     return (
-        "The workflow first scoped the objective, then assembled evidence modules aligned to the request, "
-        "and finally synthesized findings into a decision-oriented recommendation."
+        "The workflow scoped the objective, reasoned over available context, and synthesized findings while "
+        "tracking uncertainties and limitations."
     )
 
 
@@ -1263,30 +1222,21 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
         )
     decision_quality_guardrail = (
         "\nDecision quality requirements:\n"
-        "- Use explicit criteria when comparing or ranking options.\n"
-        "- If high-priority evidence is missing, mark conclusions provisional and call out the gap.\n"
-        "- Avoid high-confidence claims when primary evidence retrieval is degraded or empty.\n"
+        "- Ground major claims in captured evidence from this run.\n"
+        "- If evidence is missing, degraded, or contradictory, state uncertainty and limitations explicitly.\n"
+        "- Use only the amount of structure that improves clarity for this specific query.\n"
     )
     step_freshness_guardrail = (
         "\nExecution integrity requirements:\n"
         "- Treat this as a fresh execution of the current step.\n"
         "- Do not state that this step was already completed in a previous turn.\n"
     )
-    if step.step_id == "step_1":
+    if revision:
         step_freshness_guardrail += (
-            "- Output must include `decomposition_subtasks` as a numbered list (3-5 concrete sub-tasks).\n"
-            "- Each sub-task must be executable and reflect intended tool/data operations.\n"
+            f"- Explicitly acknowledge this revision and apply it: {revision}\n"
+            "- Restate updated timeframe constraints in explicit year terms when relevant.\n"
         )
-        if revision:
-            step_freshness_guardrail += (
-                f"- Explicitly acknowledge this revision and apply it: {revision}\n"
-                "- Restate the updated timeframe in explicit year terms when relevant.\n"
-            )
-        if revision_directives:
-            step_freshness_guardrail += (
-                "- Include a brief `revision_alignment` mapping from each directive to concrete plan updates.\n"
-            )
-    elif revision_directives:
+    if revision_directives:
         step_freshness_guardrail += (
             "- Carry forward revision directives as execution constraints for this step.\n"
         )
@@ -1295,12 +1245,8 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
         step_freshness_guardrail += (
             "\nFinal response principles:\n"
             f"{final_principles_block}\n"
-            "- After the opening answer, include separate `Rationale` and `Methodology` sections.\n"
-            "- `Methodology` must include a provenance summary of search strategy and tools used.\n"
+            "- Choose structure adaptively rather than following a fixed template.\n"
             "- Mention tools in narrative using real-world names (for example, PubMed or OpenAlex), not internal tool identifiers.\n"
-            "- Add a final `References` section with full formatted citations for supporting literature.\n"
-            "- Include DOI markdown links when available.\n"
-            "- Include an optional `Next Actions` section (up to 3 items) only when it materially helps the user.\n"
             "- Keep the narrative concise and avoid repeating full evidence lists already stated in prior steps.\n"
         )
     role_directive = "executor"

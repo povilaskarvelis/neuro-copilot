@@ -32,15 +32,11 @@ from .workflow_planning import (
     build_plan_delta,
     build_plan_steps,
     build_success_criteria,
-    classify_request_type,
     clone_step,
     create_task,
-    infer_intent_tags,
     initialize_plan_version,
     register_plan_version,
     replan_remaining_steps,
-    sanitize_intent_tags,
-    sanitize_request_type,
 )
 
 __all__ = [
@@ -55,7 +51,6 @@ __all__ = [
     "build_plan_delta",
     "build_plan_steps",
     "build_success_criteria",
-    "classify_request_type",
     "clone_step",
     "coerce_str_list",
     "contains_malformed_biomedical_identifier",
@@ -66,7 +61,6 @@ __all__ = [
     "extract_revision_directives",
     "extract_timeframe_hint",
     "find_ambiguous_abbreviations",
-    "infer_intent_tags",
     "initialize_plan_version",
     "looks_like_low_value_typo_clarification",
     "merge_objective_with_revision",
@@ -78,6 +72,4 @@ __all__ = [
     "render_revision_intent_as_text",
     "register_plan_version",
     "replan_remaining_steps",
-    "sanitize_intent_tags",
-    "sanitize_request_type",
 ]
