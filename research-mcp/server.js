@@ -26,6 +26,8 @@ const STRING_API = "https://string-db.org/api";
 const GWAS_API = "https://www.ebi.ac.uk/gwas/rest/api";
 const CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data";
 const OLS_API = "https://www.ebi.ac.uk/ols4";
+const EUROPE_PMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest";
+const OPENFDA_API = "https://api.fda.gov";
 const DATA_DIR = path.resolve(__dirname, "data");
 const OPENALEX_MAILTO = process.env.OPENALEX_MAILTO || process.env.CONTACT_EMAIL || "";
 let gwasCooldownUntilMs = 0;
@@ -250,6 +252,114 @@ function buildOpenAlexUrl(pathname, params = new URLSearchParams()) {
   }
   const query = nextParams.toString();
   return query ? `${OPENALEX_API}${pathname}?${query}` : `${OPENALEX_API}${pathname}`;
+}
+
+function buildUniProtUrl(pathname, params = new URLSearchParams()) {
+  const query = params.toString();
+  return query ? `${UNIPROT_API}${pathname}?${query}` : `${UNIPROT_API}${pathname}`;
+}
+
+function buildEuropePmcUrl(pathname, params = new URLSearchParams()) {
+  const query = params.toString();
+  return query ? `${EUROPE_PMC_API}${pathname}?${query}` : `${EUROPE_PMC_API}${pathname}`;
+}
+
+function buildOpenFdaUrl(pathname, params = new URLSearchParams()) {
+  const query = params.toString();
+  return query ? `${OPENFDA_API}${pathname}?${query}` : `${OPENFDA_API}${pathname}`;
+}
+
+function extractUniProtProteinName(entry) {
+  const recommended = normalizeWhitespace(entry?.proteinDescription?.recommendedName?.fullName?.value || "");
+  if (recommended) return recommended;
+  const submitted = normalizeWhitespace(entry?.proteinDescription?.submissionNames?.[0]?.fullName?.value || "");
+  if (submitted) return submitted;
+  const alternative = normalizeWhitespace(entry?.proteinDescription?.alternativeNames?.[0]?.fullName?.value || "");
+  if (alternative) return alternative;
+  return "Unknown protein";
+}
+
+function extractUniProtGeneSymbols(entry, limit = 6) {
+  const genes = Array.isArray(entry?.genes) ? entry.genes : [];
+  const symbols = [];
+  for (const gene of genes) {
+    const primary = normalizeWhitespace(gene?.geneName?.value || "");
+    if (primary) symbols.push(primary);
+    const synonyms = Array.isArray(gene?.synonyms) ? gene.synonyms : [];
+    for (const synonym of synonyms) {
+      const value = normalizeWhitespace(synonym?.value || "");
+      if (value) symbols.push(value);
+    }
+  }
+  return dedupeArray(symbols).slice(0, limit);
+}
+
+function extractUniProtEnsemblGeneIds(entry, limit = 6) {
+  const refs = Array.isArray(entry?.uniProtKBCrossReferences) ? entry.uniProtKBCrossReferences : [];
+  const geneIds = [];
+  for (const ref of refs) {
+    if (normalizeWhitespace(ref?.database || "").toLowerCase() !== "ensembl") continue;
+    const properties = Array.isArray(ref?.properties) ? ref.properties : [];
+    for (const prop of properties) {
+      if (normalizeWhitespace(prop?.key || "").toLowerCase() !== "geneid") continue;
+      const value = normalizeWhitespace(prop?.value || "");
+      if (!value) continue;
+      geneIds.push(value.split(".")[0]);
+    }
+  }
+  return dedupeArray(geneIds).slice(0, limit);
+}
+
+function extractUniProtCommentTexts(entry, commentType, limit = 3, maxChars = 280) {
+  const wantedType = normalizeWhitespace(commentType || "").toUpperCase();
+  const comments = Array.isArray(entry?.comments) ? entry.comments : [];
+  const output = [];
+  for (const comment of comments) {
+    if (normalizeWhitespace(comment?.commentType || "").toUpperCase() !== wantedType) continue;
+    const texts = Array.isArray(comment?.texts) ? comment.texts : [];
+    for (const textEntry of texts) {
+      const value = normalizeWhitespace(textEntry?.value || "");
+      if (!value) continue;
+      output.push(compactErrorMessage(value, maxChars));
+      if (output.length >= limit) return output;
+    }
+  }
+  return output;
+}
+
+function extractUniProtSubcellularLocations(entry, limit = 8) {
+  const comments = Array.isArray(entry?.comments) ? entry.comments : [];
+  const locations = [];
+  for (const comment of comments) {
+    if (normalizeWhitespace(comment?.commentType || "").toUpperCase() !== "SUBCELLULAR LOCATION") continue;
+    const slots = Array.isArray(comment?.subcellularLocations) ? comment.subcellularLocations : [];
+    for (const slot of slots) {
+      const location = normalizeWhitespace(slot?.location?.value || "");
+      if (location) locations.push(location);
+    }
+  }
+  return dedupeArray(locations).slice(0, limit);
+}
+
+function extractUniProtCrossRefs(entry, databaseName, limit = 8) {
+  const database = normalizeWhitespace(databaseName || "").toLowerCase();
+  const refs = Array.isArray(entry?.uniProtKBCrossReferences) ? entry.uniProtKBCrossReferences : [];
+  const ids = refs
+    .filter((ref) => normalizeWhitespace(ref?.database || "").toLowerCase() === database)
+    .map((ref) => normalizeWhitespace(ref?.id || ""))
+    .filter(Boolean);
+  return dedupeArray(ids).slice(0, limit);
+}
+
+function summarizeUniProtFeatureTypes(entry, limit = 8) {
+  const features = Array.isArray(entry?.features) ? entry.features : [];
+  const counts = new Map();
+  for (const feature of features) {
+    const type = normalizeWhitespace(feature?.type || "");
+    if (!type) continue;
+    incrementCount(counts, type);
+  }
+  return summarizeTopCounts(counts, limit);
 }
 
 async function fetchWithRetry(url, options = {}) {
@@ -1998,6 +2108,216 @@ server.registerTool(
 );
 
 // ============================================
+// TOOL 1B: Search Europe PMC preprints
+// ============================================
+server.registerTool(
+  "search_europe_pmc_preprints",
+  {
+    description: "Search Europe PMC preprints with optional medRxiv/bioRxiv and publication-year filters.",
+    inputSchema: {
+      query: z.string().describe("Preprint query (e.g., 'LRRK2 Parkinson biomarker')."),
+      server: z
+        .enum(["any", "medrxiv", "biorxiv"])
+        .optional()
+        .default("any")
+        .describe("Preprint server filter: any, medrxiv, or biorxiv."),
+      fromYear: z.number().optional().describe("Optional publication year lower bound (e.g., 2023)."),
+      toYear: z.number().optional().describe("Optional publication year upper bound (e.g., 2026)."),
+      limit: z.number().optional().default(10).describe("Max number of preprints to return (1-25)."),
+    },
+  },
+  async ({ query, server = "any", fromYear, toYear, limit = 10 }) => {
+    try {
+      const normalizedQuery = normalizeWhitespace(query || "");
+      if (!normalizedQuery) {
+        return {
+          content: [{ type: "text", text: "Provide a non-empty preprint query string." }],
+        };
+      }
+
+      const boundedLimit = Math.max(1, Math.min(25, Math.round(limit)));
+      const normalizedServer = String(server || "any").trim().toLowerCase();
+      const serverFilter = new Set(["any", "medrxiv", "biorxiv"]).has(normalizedServer) ? normalizedServer : "any";
+      const serverLabel =
+        serverFilter === "medrxiv" ? "medRxiv" : serverFilter === "biorxiv" ? "bioRxiv" : "all preprint servers";
+
+      const parsedFromYear = Number(fromYear);
+      const parsedToYear = Number(toYear);
+      const normalizedFromYear = Number.isFinite(parsedFromYear)
+        ? Math.max(1900, Math.min(2100, Math.trunc(parsedFromYear)))
+        : null;
+      const normalizedToYear = Number.isFinite(parsedToYear)
+        ? Math.max(1900, Math.min(2100, Math.trunc(parsedToYear)))
+        : null;
+      if (normalizedFromYear !== null && normalizedToYear !== null && normalizedFromYear > normalizedToYear) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Invalid year range: fromYear (${normalizedFromYear}) is greater than toYear (${normalizedToYear}).`,
+            },
+          ],
+        };
+      }
+
+      const scanSize = Math.min(100, Math.max(30, boundedLimit * 6));
+      const params = new URLSearchParams({
+        query: `SRC:PPR AND (${normalizedQuery})`,
+        resultType: "core",
+        format: "json",
+        pageSize: String(scanSize),
+      });
+      const url = buildEuropePmcUrl("/search", params);
+      const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
+      const rows = Array.isArray(data?.resultList?.result) ? data.resultList.result : [];
+
+      const normalizedRows = rows.map((row) => {
+        const serverName =
+          normalizeWhitespace(row?.bookOrReportDetails?.publisher || "") ||
+          normalizeWhitespace(row?.journalTitle || "") ||
+          "Unknown";
+        const serverKey = serverName.toLowerCase().replace(/\s+/g, "");
+        const source = normalizeWhitespace(row?.source || "PPR") || "PPR";
+        const id = normalizeWhitespace(row?.id || "");
+        const firstPublicationDate = normalizeWhitespace(row?.firstPublicationDate || "");
+        const pubYear = toNonNegativeInt(row?.pubYear || firstPublicationDate.slice(0, 4), 0);
+        const doi = normalizeDoiValue(row?.doi || "");
+        const europePmcUrl = id
+          ? `https://europepmc.org/article/${encodeURIComponent(source)}/${encodeURIComponent(id)}`
+          : "";
+        return {
+          id,
+          source,
+          title: compactErrorMessage(normalizeWhitespace(row?.title || "Untitled"), 320),
+          authors: compactErrorMessage(normalizeWhitespace(row?.authorString || "Unknown authors"), 180),
+          abstract: compactErrorMessage(sanitizeXmlText(row?.abstractText || ""), 480),
+          server_name: serverName,
+          server_key: serverKey,
+          pub_year: pubYear > 0 ? pubYear : null,
+          first_publication_date: firstPublicationDate || "",
+          cited_by_count: toNonNegativeInt(row?.citedByCount),
+          doi,
+          europe_pmc_url: europePmcUrl,
+        };
+      });
+
+      const filteredRows = normalizedRows.filter((row) => {
+        if (serverFilter !== "any" && row.server_key !== serverFilter) return false;
+        if (normalizedFromYear !== null && (!row.pub_year || row.pub_year < normalizedFromYear)) return false;
+        if (normalizedToYear !== null && (!row.pub_year || row.pub_year > normalizedToYear)) return false;
+        return true;
+      });
+      const selectedRows = filteredRows.slice(0, boundedLimit);
+
+      const payloadBase = {
+        schema: "search_europe_pmc_preprints.v1",
+        query: normalizedQuery,
+        server_filter: serverFilter,
+        from_year: normalizedFromYear,
+        to_year: normalizedToYear,
+        limit: boundedLimit,
+        total_hits_reported: toNonNegativeInt(data?.hitCount),
+        records_scanned: normalizedRows.length,
+      };
+
+      if (selectedRows.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: "No Europe PMC preprints matched the current query and filters.",
+                keyFields: [
+                  `Query: ${normalizedQuery}`,
+                  `Server filter: ${serverLabel}`,
+                  `Year filter: ${normalizedFromYear ?? "none"} to ${normalizedToYear ?? "none"}`,
+                  `Records scanned: ${normalizedRows.length}`,
+                ],
+                sources: [url],
+                limitations: [
+                  "Europe PMC indexing can lag behind preprint servers and Crossref updates.",
+                  "Server/year filters are applied after retrieval on the scanned page window.",
+                ],
+              }),
+            },
+          ],
+          structuredContent: {
+            ...payloadBase,
+            result_status: "not_found_or_empty",
+            preprints: [],
+            notes: ["No preprints matched query and filters in the scanned result window."],
+          },
+        };
+      }
+
+      const keyFields = selectedRows.map((row, idx) => {
+        const doiMarkdown = row.doi ? `[DOI:${row.doi}](https://doi.org/${encodeURIComponent(row.doi)})` : "No DOI";
+        const epmcMarkdown = row.europe_pmc_url ? `[Europe PMC](${row.europe_pmc_url})` : "";
+        return `${idx + 1}. ${row.authors} (${row.pub_year || "n.d."}). ${row.title}. Server: ${row.server_name}. ${doiMarkdown}${epmcMarkdown ? ` ${epmcMarkdown}` : ""} | Cited by: ${row.cited_by_count}`;
+      });
+
+      const sourceLinks = dedupeArray([url, ...selectedRows.slice(0, 5).map((row) => row.europe_pmc_url)]);
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Retrieved ${selectedRows.length} Europe PMC preprint${selectedRows.length === 1 ? "" : "s"} for "${normalizedQuery}".`,
+              keyFields,
+              sources: sourceLinks,
+              limitations: [
+                "Preprints are non-peer-reviewed and should be interpreted with additional caution.",
+                "Only a bounded scan window is queried per request; increase limit or broaden terms if needed.",
+              ],
+            }),
+          },
+        ],
+        structuredContent: {
+          ...payloadBase,
+          result_status: "ok",
+          preprints: selectedRows.map((row, idx) => ({
+            rank: idx + 1,
+            id: row.id,
+            source: row.source,
+            title: row.title,
+            authors: row.authors,
+            abstract: row.abstract,
+            server: row.server_name,
+            pub_year: row.pub_year,
+            first_publication_date: row.first_publication_date,
+            doi: row.doi,
+            cited_by_count: row.cited_by_count,
+            europe_pmc_url: row.europe_pmc_url,
+          })),
+          notes: [
+            "Results are restricted to Europe PMC preprint source (SRC:PPR).",
+            serverFilter === "any" ? "No server-specific post-filter was applied." : `Post-filtered to ${serverLabel}.`,
+          ],
+        },
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error in search_europe_pmc_preprints: ${error.message}` }],
+        structuredContent: {
+          schema: "search_europe_pmc_preprints.v1",
+          result_status: "error",
+          query: String(query || ""),
+          server_filter: String(server || "any"),
+          from_year: toNullableNumber(fromYear),
+          to_year: toNullableNumber(toYear),
+          limit: Math.max(1, toNonNegativeInt(limit, 10)),
+          total_hits_reported: 0,
+          records_scanned: 0,
+          preprints: [],
+          notes: ["Unexpected error during Europe PMC preprint search."],
+          error: compactErrorMessage(error?.message || "unknown error"),
+        },
+      };
+    }
+  }
+);
+
+// ============================================
 // TOOL 2: Fetch PubMed abstract by PMID
 // ============================================
 server.registerTool(
@@ -2966,6 +3286,498 @@ Link: https://clinicaltrials.gov/study/${nctId}`,
         },
       ],
     };
+  }
+);
+
+// ============================================
+// TOOL 13B: openFDA adverse-event signal summary
+// ============================================
+server.registerTool(
+  "summarize_openfda_adverse_events",
+  {
+    description:
+      "Summarize post-marketing adverse-event signals for a drug from openFDA FAERS (reaction, seriousness, country, and outcome trends).",
+    inputSchema: {
+      drugQuery: z.string().describe("Drug name query (brand or generic), e.g. pembrolizumab, metformin, aspirin."),
+      fromDate: z.string().optional().describe("Optional lower bound date in YYYYMMDD (FAERS receive date)."),
+      toDate: z.string().optional().describe("Optional upper bound date in YYYYMMDD (FAERS receive date)."),
+      topReactions: z.number().optional().default(10).describe("Top adverse reaction terms to return (1-20)."),
+      topCountries: z.number().optional().default(6).describe("Top reporter countries to return (1-15)."),
+    },
+  },
+  async ({ drugQuery, fromDate, toDate, topReactions = 10, topCountries = 6 }) => {
+    try {
+      const normalizedDrug = normalizeWhitespace(drugQuery || "");
+      if (!normalizedDrug) {
+        return { content: [{ type: "text", text: "Provide a non-empty drug query string." }] };
+      }
+
+      const dateRegex = /^\d{8}$/;
+      const normalizedFromDate = normalizeWhitespace(fromDate || "");
+      const normalizedToDate = normalizeWhitespace(toDate || "");
+      if (normalizedFromDate && !dateRegex.test(normalizedFromDate)) {
+        return { content: [{ type: "text", text: "Invalid fromDate format. Use YYYYMMDD." }] };
+      }
+      if (normalizedToDate && !dateRegex.test(normalizedToDate)) {
+        return { content: [{ type: "text", text: "Invalid toDate format. Use YYYYMMDD." }] };
+      }
+      if (normalizedFromDate && normalizedToDate && normalizedFromDate > normalizedToDate) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Invalid date range: fromDate (${normalizedFromDate}) is after toDate (${normalizedToDate}).`,
+            },
+          ],
+        };
+      }
+
+      const boundedTopReactions = Math.max(1, Math.min(20, Math.round(topReactions)));
+      const boundedTopCountries = Math.max(1, Math.min(15, Math.round(topCountries)));
+      const escapedDrug = normalizedDrug.replace(/["\\]/g, "\\$&");
+
+      const clauses = [
+        `(patient.drug.medicinalproduct:"${escapedDrug}" OR patient.drug.openfda.brand_name:"${escapedDrug}" OR patient.drug.openfda.generic_name:"${escapedDrug}")`,
+      ];
+      if (normalizedFromDate || normalizedToDate) {
+        const start = normalizedFromDate || "19000101";
+        const end = normalizedToDate || "29991231";
+        clauses.push(`receivedate:[${start}+TO+${end}]`);
+      }
+      const searchExpr = clauses.join(" AND ");
+
+      const totalUrl = buildOpenFdaUrl(
+        "/drug/event.json",
+        new URLSearchParams({
+          search: searchExpr,
+          limit: "1",
+        })
+      );
+      const reactionsUrl = buildOpenFdaUrl(
+        "/drug/event.json",
+        new URLSearchParams({
+          search: searchExpr,
+          count: "patient.reaction.reactionmeddrapt.exact",
+        })
+      );
+      const seriousnessUrl = buildOpenFdaUrl(
+        "/drug/event.json",
+        new URLSearchParams({
+          search: searchExpr,
+          count: "serious",
+        })
+      );
+      const countriesUrl = buildOpenFdaUrl(
+        "/drug/event.json",
+        new URLSearchParams({
+          search: searchExpr,
+          count: "occurcountry.exact",
+        })
+      );
+      const outcomesUrl = buildOpenFdaUrl(
+        "/drug/event.json",
+        new URLSearchParams({
+          search: searchExpr,
+          count: "patient.reaction.reactionoutcome",
+        })
+      );
+
+      let totalPayload = null;
+      try {
+        totalPayload = await fetchJsonWithRetry(totalUrl, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
+      } catch (error) {
+        const message = String(error?.message || "");
+        if (message.includes("Request failed (404)")) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: renderStructuredResponse({
+                  summary: `No openFDA adverse-event reports matched "${normalizedDrug}".`,
+                  keyFields: [
+                    `Drug query: ${normalizedDrug}`,
+                    `Date filter: ${normalizedFromDate || "none"} to ${normalizedToDate || "none"}`,
+                  ],
+                  sources: [totalUrl],
+                  limitations: ["FAERS uses spontaneous reporting and missing matches can reflect name normalization or sparse submissions."],
+                }),
+              },
+            ],
+            structuredContent: {
+              schema: "summarize_openfda_adverse_events.v1",
+              result_status: "not_found_or_empty",
+              drug_query: normalizedDrug,
+              date_from: normalizedFromDate || null,
+              date_to: normalizedToDate || null,
+              reports_total: 0,
+              serious_reports: 0,
+              non_serious_reports: 0,
+              unknown_serious_reports: 0,
+              top_reactions: [],
+              top_countries: [],
+              top_outcomes: [],
+              notes: ["No FAERS records matched query and date filters."],
+            },
+          };
+        }
+        throw error;
+      }
+
+      const fetchCountRows = async (url) => {
+        try {
+          const payload = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
+          return Array.isArray(payload?.results) ? payload.results : [];
+        } catch (error) {
+          const message = String(error?.message || "");
+          if (message.includes("Request failed (404)")) return [];
+          throw error;
+        }
+      };
+
+      const [reactionRows, seriousnessRows, countryRows, outcomeRows] = await Promise.all([
+        fetchCountRows(reactionsUrl),
+        fetchCountRows(seriousnessUrl),
+        fetchCountRows(countriesUrl),
+        fetchCountRows(outcomesUrl),
+      ]);
+
+      const totalReports = toNonNegativeInt(totalPayload?.meta?.results?.total);
+      if (totalReports === 0 && reactionRows.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: `No openFDA adverse-event reports matched "${normalizedDrug}".`,
+                keyFields: [
+                  `Drug query: ${normalizedDrug}`,
+                  `Date filter: ${normalizedFromDate || "none"} to ${normalizedToDate || "none"}`,
+                ],
+                sources: [totalUrl],
+                limitations: ["FAERS uses spontaneous reporting and missing matches can reflect name normalization or sparse submissions."],
+              }),
+            },
+          ],
+          structuredContent: {
+            schema: "summarize_openfda_adverse_events.v1",
+            result_status: "not_found_or_empty",
+            drug_query: normalizedDrug,
+            date_from: normalizedFromDate || null,
+            date_to: normalizedToDate || null,
+            reports_total: 0,
+            serious_reports: 0,
+            non_serious_reports: 0,
+            unknown_serious_reports: 0,
+            top_reactions: [],
+            top_countries: [],
+            top_outcomes: [],
+            notes: ["No FAERS records matched query and date filters."],
+          },
+        };
+      }
+
+      let seriousReports = 0;
+      let nonSeriousReports = 0;
+      let unknownSeriousReports = 0;
+      for (const row of seriousnessRows) {
+        const term = String(row?.term || "").trim();
+        const count = toNonNegativeInt(row?.count);
+        if (term === "1") seriousReports += count;
+        else if (term === "2") nonSeriousReports += count;
+        else unknownSeriousReports += count;
+      }
+
+      const topReactionRows = reactionRows.slice(0, boundedTopReactions).map((row, idx) => ({
+        rank: idx + 1,
+        term: String(row?.term || "Unknown reaction"),
+        count: toNonNegativeInt(row?.count),
+      }));
+      const topCountryRows = countryRows.slice(0, boundedTopCountries).map((row, idx) => ({
+        rank: idx + 1,
+        country: String(row?.term || "Unknown"),
+        count: toNonNegativeInt(row?.count),
+      }));
+      const outcomeLabelByCode = {
+        "1": "Recovered/Resolved",
+        "2": "Recovering/Resolving",
+        "3": "Not Recovered/Not Resolved",
+        "4": "Recovered with Sequelae",
+        "5": "Fatal",
+        "6": "Unknown",
+      };
+      const topOutcomeRows = outcomeRows.slice(0, 6).map((row, idx) => {
+        const code = String(row?.term || "").trim();
+        const label = outcomeLabelByCode[code] || `Code ${code || "unknown"}`;
+        return {
+          rank: idx + 1,
+          code: code || "unknown",
+          label,
+          count: toNonNegativeInt(row?.count),
+        };
+      });
+
+      const keyFields = [
+        `Drug query: ${normalizedDrug}`,
+        `Date filter: ${normalizedFromDate || "none"} to ${normalizedToDate || "none"}`,
+        `Matched FAERS reports: ${totalReports}`,
+        `Seriousness mix: serious=${seriousReports}, non-serious=${nonSeriousReports}, unknown=${unknownSeriousReports}`,
+        `Top reactions: ${
+          topReactionRows.length > 0 ? topReactionRows.map((row) => `${row.term} (${row.count})`).join(", ") : "N/A"
+        }`,
+        `Top reporting countries: ${
+          topCountryRows.length > 0 ? topCountryRows.map((row) => `${row.country} (${row.count})`).join(", ") : "N/A"
+        }`,
+        `Top outcomes: ${
+          topOutcomeRows.length > 0 ? topOutcomeRows.map((row) => `${row.label} (${row.count})`).join(", ") : "N/A"
+        }`,
+      ];
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Generated openFDA adverse-event signal summary for "${normalizedDrug}".`,
+              keyFields,
+              sources: [totalUrl, reactionsUrl, seriousnessUrl, countriesUrl, outcomesUrl],
+              limitations: [
+                "FAERS is a spontaneous reporting system and cannot estimate incidence rates or causality.",
+                "Duplicate, confounded, and incomplete reports can bias apparent signal strength.",
+              ],
+            }),
+          },
+        ],
+        structuredContent: {
+          schema: "summarize_openfda_adverse_events.v1",
+          result_status: "ok",
+          drug_query: normalizedDrug,
+          date_from: normalizedFromDate || null,
+          date_to: normalizedToDate || null,
+          reports_total: totalReports,
+          serious_reports: seriousReports,
+          non_serious_reports: nonSeriousReports,
+          unknown_serious_reports: unknownSeriousReports,
+          top_reactions: topReactionRows,
+          top_countries: topCountryRows,
+          top_outcomes: topOutcomeRows,
+          notes: [
+            "openFDA adverse event data mirrors FAERS spontaneous reports.",
+            "Counts indicate report frequency, not confirmed adverse-event incidence.",
+          ],
+        },
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error in summarize_openfda_adverse_events: ${error.message}` }],
+        structuredContent: {
+          schema: "summarize_openfda_adverse_events.v1",
+          result_status: "error",
+          drug_query: String(drugQuery || ""),
+          date_from: normalizeWhitespace(fromDate || "") || null,
+          date_to: normalizeWhitespace(toDate || "") || null,
+          reports_total: 0,
+          serious_reports: 0,
+          non_serious_reports: 0,
+          unknown_serious_reports: 0,
+          top_reactions: [],
+          top_countries: [],
+          top_outcomes: [],
+          notes: ["Unexpected error during openFDA adverse-event summarization."],
+          error: compactErrorMessage(error?.message || "unknown error"),
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL 13C: openFDA drug-label safety summary
+// ============================================
+server.registerTool(
+  "get_openfda_drug_label_summary",
+  {
+    description:
+      "Retrieve and summarize drug-label safety sections (boxed warning, warnings, contraindications, adverse reactions) from openFDA labels.",
+    inputSchema: {
+      drugQuery: z.string().describe("Drug name query (brand or generic), e.g. pembrolizumab, aspirin."),
+      limit: z.number().optional().default(3).describe("How many matching labels to inspect (1-10)."),
+    },
+  },
+  async ({ drugQuery, limit = 3 }) => {
+    try {
+      const normalizedDrug = normalizeWhitespace(drugQuery || "");
+      if (!normalizedDrug) {
+        return { content: [{ type: "text", text: "Provide a non-empty drug query string." }] };
+      }
+
+      const boundedLimit = Math.max(1, Math.min(10, Math.round(limit)));
+      const escapedDrug = normalizedDrug.replace(/["\\]/g, "\\$&");
+      const searchExpr = `(openfda.brand_name:"${escapedDrug}" OR openfda.generic_name:"${escapedDrug}" OR openfda.substance_name:"${escapedDrug}")`;
+      const url = buildOpenFdaUrl(
+        "/drug/label.json",
+        new URLSearchParams({
+          search: searchExpr,
+          limit: String(boundedLimit),
+        })
+      );
+
+      let payload = null;
+      try {
+        payload = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
+      } catch (error) {
+        const message = String(error?.message || "");
+        if (message.includes("Request failed (404)")) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: renderStructuredResponse({
+                  summary: `No openFDA drug labels matched "${normalizedDrug}".`,
+                  keyFields: [`Drug query: ${normalizedDrug}`],
+                  sources: [url],
+                  limitations: ["Label matching depends on openFDA name normalization across brand, generic, and substance fields."],
+                }),
+              },
+            ],
+            structuredContent: {
+              schema: "get_openfda_drug_label_summary.v1",
+              result_status: "not_found_or_empty",
+              drug_query: normalizedDrug,
+              labels_matched: 0,
+              selected_label: null,
+              notes: ["No label records matched query."],
+            },
+          };
+        }
+        throw error;
+      }
+
+      const rows = Array.isArray(payload?.results) ? payload.results : [];
+      if (rows.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: `No openFDA drug labels matched "${normalizedDrug}".`,
+                keyFields: [`Drug query: ${normalizedDrug}`],
+                sources: [url],
+                limitations: ["Label matching depends on openFDA name normalization across brand, generic, and substance fields."],
+              }),
+            },
+          ],
+          structuredContent: {
+            schema: "get_openfda_drug_label_summary.v1",
+            result_status: "not_found_or_empty",
+            drug_query: normalizedDrug,
+            labels_matched: 0,
+            selected_label: null,
+            notes: ["No label records matched query."],
+          },
+        };
+      }
+
+      const row = rows[0];
+      const getList = (value, max = 5) =>
+        dedupeArray((Array.isArray(value) ? value : []).map((item) => normalizeWhitespace(item || "")).filter(Boolean)).slice(0, max);
+      const getSection = (field, maxChars = 700) =>
+        compactErrorMessage(sanitizeXmlText((Array.isArray(row?.[field]) ? row[field] : []).join(" ")), maxChars);
+
+      const brands = getList(row?.openfda?.brand_name, 4);
+      const generics = getList(row?.openfda?.generic_name, 4);
+      const substances = getList(row?.openfda?.substance_name, 4);
+      const manufacturers = getList(row?.openfda?.manufacturer_name, 4);
+      const routes = getList(row?.openfda?.route, 4);
+      const productTypes = getList(row?.openfda?.product_type, 3);
+      const setId = normalizeWhitespace(row?.set_id || row?.openfda?.spl_set_id?.[0] || "");
+      const effectiveTime = normalizeWhitespace(row?.effective_time || "");
+      const dailyMedUrl = setId
+        ? `https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid=${encodeURIComponent(setId)}`
+        : "";
+
+      const boxedWarning = getSection("boxed_warning", 1000);
+      const warnings = getSection("warnings", 900);
+      const contraindications = getSection("contraindications", 650);
+      const adverseReactions = getSection("adverse_reactions", 800);
+      const indications = getSection("indications_and_usage", 700);
+      const drugInteractions = getSection("drug_interactions", 650);
+      const dosage = getSection("dosage_and_administration", 650);
+
+      const keyFields = [
+        `Drug query: ${normalizedDrug}`,
+        `Matched label records: ${rows.length}`,
+        `Brand names: ${brands.join(", ") || "N/A"}`,
+        `Generic names: ${generics.join(", ") || "N/A"}`,
+        `Substances: ${substances.join(", ") || "N/A"}`,
+        `Manufacturer(s): ${manufacturers.join(", ") || "N/A"}`,
+        `Route(s): ${routes.join(", ") || "N/A"}`,
+        `Product type: ${productTypes.join(", ") || "N/A"}`,
+        `Effective time: ${effectiveTime || "N/A"}`,
+        ...(setId ? [`SPL set ID: ${setId}`] : []),
+      ];
+      if (boxedWarning) keyFields.push(`Boxed warning: ${boxedWarning}`);
+      if (warnings) keyFields.push(`Warnings: ${warnings}`);
+      if (contraindications) keyFields.push(`Contraindications: ${contraindications}`);
+      if (adverseReactions) keyFields.push(`Adverse reactions: ${adverseReactions}`);
+      if (drugInteractions) keyFields.push(`Drug interactions: ${drugInteractions}`);
+      if (indications) keyFields.push(`Indications and usage: ${indications}`);
+      if (dosage) keyFields.push(`Dosage and administration: ${dosage}`);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Retrieved openFDA drug-label safety summary for "${normalizedDrug}".`,
+              keyFields,
+              sources: dedupeArray([url, dailyMedUrl]),
+              limitations: [
+                "Label text can be product-specific (manufacturer/formulation) and may not represent every marketed version.",
+                "Label sections are descriptive regulatory text and do not quantify event incidence in routine practice.",
+              ],
+            }),
+          },
+        ],
+        structuredContent: {
+          schema: "get_openfda_drug_label_summary.v1",
+          result_status: "ok",
+          drug_query: normalizedDrug,
+          labels_matched: rows.length,
+          selected_label: {
+            set_id: setId || null,
+            effective_time: effectiveTime || null,
+            brand_names: brands,
+            generic_names: generics,
+            substance_names: substances,
+            manufacturers,
+            routes,
+            product_types: productTypes,
+            boxed_warning: boxedWarning || "",
+            warnings: warnings || "",
+            contraindications: contraindications || "",
+            adverse_reactions: adverseReactions || "",
+            indications_and_usage: indications || "",
+            drug_interactions: drugInteractions || "",
+            dosage_and_administration: dosage || "",
+            dailymed_url: dailyMedUrl || "",
+          },
+          notes: ["Summary is generated from openFDA drug label endpoint fields."],
+        },
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error in get_openfda_drug_label_summary: ${error.message}` }],
+        structuredContent: {
+          schema: "get_openfda_drug_label_summary.v1",
+          result_status: "error",
+          drug_query: String(drugQuery || ""),
+          labels_matched: 0,
+          selected_label: null,
+          notes: ["Unexpected error during openFDA drug-label summary retrieval."],
+          error: compactErrorMessage(error?.message || "unknown error"),
+        },
+      };
+    }
   }
 );
 
@@ -6475,6 +7287,218 @@ server.registerTool(
           errorMessage: String(error?.message || "unknown error"),
         }),
       };
+    }
+  }
+);
+
+// ============================================
+// TOOL 34: UniProt protein search
+// ============================================
+server.registerTool(
+  "search_uniprot_proteins",
+  {
+    description:
+      "Search UniProtKB for protein entries by gene/protein text with optional species and reviewed-only filters.",
+    inputSchema: {
+      query: z.string().describe("Gene/protein query text (e.g., EGFR, TYK2, interleukin receptor)"),
+      organismTaxId: z.number().optional().default(9606).describe("NCBI taxonomy ID filter (default: 9606 for human)"),
+      reviewedOnly: z.boolean().optional().default(true).describe("If true, return Swiss-Prot reviewed entries only"),
+      limit: z.number().optional().default(10).describe("Max number of UniProt entries to return"),
+    },
+  },
+  async ({ query, organismTaxId = 9606, reviewedOnly = true, limit = 10 }) => {
+    try {
+      const normalizedQuery = normalizeWhitespace(query || "");
+      if (!normalizedQuery) {
+        return { content: [{ type: "text", text: "Provide a non-empty UniProt query string." }] };
+      }
+      const boundedLimit = Math.max(1, Math.min(25, Math.round(limit)));
+      const boundedTaxId = Math.max(0, toNonNegativeInt(organismTaxId, 9606));
+      const clauses = [`(${normalizedQuery})`];
+      if (boundedTaxId > 0) clauses.push(`organism_id:${boundedTaxId}`);
+      if (reviewedOnly) clauses.push("reviewed:true");
+      const term = clauses.join(" AND ");
+
+      const params = new URLSearchParams({
+        query: term,
+        format: "json",
+        size: String(boundedLimit),
+        fields: "accession,id,protein_name,gene_names,organism_name,length,reviewed,xref_ensembl",
+      });
+      const url = buildUniProtUrl("/uniprotkb/search", params);
+      const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
+      const results = Array.isArray(data?.results) ? data.results : [];
+
+      if (results.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: "No UniProt records matched this query.",
+                keyFields: [
+                  `Query: ${normalizedQuery}`,
+                  `Taxonomy filter: ${boundedTaxId > 0 ? boundedTaxId : "none"}`,
+                  `Reviewed-only: ${reviewedOnly ? "yes" : "no"}`,
+                ],
+                sources: [url],
+                limitations: ["Try broader query terms or disable reviewed-only mode for exploratory searches."],
+              }),
+            },
+          ],
+        };
+      }
+
+      const keyFields = results.map((entry, idx) => {
+        const accession = normalizeWhitespace(entry?.primaryAccession || "");
+        const accessionLink = accession ? `[${accession}](https://www.uniprot.org/uniprotkb/${accession})` : "N/A";
+        const proteinName = extractUniProtProteinName(entry);
+        const symbols = extractUniProtGeneSymbols(entry, 4);
+        const geneLabel = symbols.length > 0 ? symbols.join(", ") : "No gene symbol";
+        const organism =
+          normalizeWhitespace(entry?.organism?.scientificName || entry?.organism?.commonName || "") || "Unknown organism";
+        const length = toNonNegativeInt(entry?.sequence?.length);
+        const ensemblGenes = extractUniProtEnsemblGeneIds(entry, 3);
+        const reviewedLabel = normalizeWhitespace(entry?.entryType || "").toLowerCase().includes("reviewed")
+          ? "reviewed"
+          : "unreviewed";
+        return `${idx + 1}. ${geneLabel} | ${proteinName} | Accession: ${accessionLink} (${reviewedLabel}) | Length: ${
+          length > 0 ? `${length} aa` : "unknown"
+        } | Organism: ${organism}${ensemblGenes.length > 0 ? ` | Ensembl: ${ensemblGenes.join(", ")}` : ""}`;
+      });
+
+      const sourceLinks = [
+        url,
+        ...results
+          .slice(0, 4)
+          .map((entry) => normalizeWhitespace(entry?.primaryAccession || ""))
+          .filter(Boolean)
+          .map((accession) => `https://www.uniprot.org/uniprotkb/${accession}`),
+      ];
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Retrieved ${results.length} UniProt protein record${results.length === 1 ? "" : "s"}.`,
+              keyFields,
+              sources: dedupeArray(sourceLinks),
+              limitations: [
+                "Search matches can include close homologs and alias terms; validate accession and organism before downstream use.",
+                "UniProt entry coverage varies by species and curation level (reviewed vs unreviewed).",
+              ],
+            }),
+          },
+        ],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error in search_uniprot_proteins: ${error.message}` }] };
+    }
+  }
+);
+
+// ============================================
+// TOOL 35: UniProt protein profile
+// ============================================
+server.registerTool(
+  "get_uniprot_protein_profile",
+  {
+    description:
+      "Get a concise UniProt protein profile by accession, including function, localization, sequence facts, and major cross-references.",
+    inputSchema: {
+      accession: z.string().describe("UniProt accession (e.g., P00533 for human EGFR)"),
+    },
+  },
+  async ({ accession }) => {
+    const normalizedAccession = normalizeWhitespace(accession || "").toUpperCase();
+    if (!normalizedAccession) {
+      return { content: [{ type: "text", text: "Provide a UniProt accession (for example, P00533)." }] };
+    }
+
+    const url = buildUniProtUrl(`/uniprotkb/${encodeURIComponent(normalizedAccession)}.json`);
+    try {
+      const record = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
+      const primaryAccession = normalizeWhitespace(record?.primaryAccession || normalizedAccession);
+      const profileUrl = `https://www.uniprot.org/uniprotkb/${primaryAccession}`;
+      const entryId = normalizeWhitespace(record?.uniProtkbId || "");
+      const reviewedLabel = normalizeWhitespace(record?.entryType || "").toLowerCase().includes("reviewed")
+        ? "reviewed (Swiss-Prot)"
+        : "unreviewed (TrEMBL)";
+      const proteinName = extractUniProtProteinName(record);
+      const genes = extractUniProtGeneSymbols(record, 10);
+      const organism =
+        normalizeWhitespace(record?.organism?.scientificName || record?.organism?.commonName || "") || "Unknown organism";
+      const taxonId = toNonNegativeInt(record?.organism?.taxonId);
+      const sequenceLength = toNonNegativeInt(record?.sequence?.length);
+      const sequenceMassDa = toNonNegativeInt(record?.sequence?.molWeight);
+      const proteinExistence = normalizeWhitespace(record?.proteinExistence || "Unknown");
+      const annotationScore = toFiniteNumber(record?.annotationScore, Number.NaN);
+      const functionHighlights = extractUniProtCommentTexts(record, "FUNCTION", 2, 320);
+      const subcellularLocations = extractUniProtSubcellularLocations(record, 8);
+      const diseaseNotes = extractUniProtCommentTexts(record, "DISEASE", 3, 220);
+      const ensemblGeneIds = extractUniProtEnsemblGeneIds(record, 8);
+      const pdbIds = extractUniProtCrossRefs(record, "PDB", 8);
+      const reactomeIds = extractUniProtCrossRefs(record, "Reactome", 8);
+      const featureSummary = summarizeUniProtFeatureTypes(record, 10);
+      const lastUpdate = normalizeWhitespace(record?.entryAudit?.lastAnnotationUpdateDate || "");
+
+      const keyFields = [
+        `Accession: [${primaryAccession}](${profileUrl})`,
+        ...(entryId ? [`UniProt ID: ${entryId}`] : []),
+        `Review status: ${reviewedLabel}`,
+        `Protein: ${proteinName}`,
+        `Genes: ${genes.length > 0 ? genes.join(", ") : "N/A"}`,
+        `Organism: ${organism}${taxonId > 0 ? ` (taxon ${taxonId})` : ""}`,
+        `Protein existence evidence: ${proteinExistence}`,
+        `Sequence: ${sequenceLength > 0 ? `${sequenceLength} aa` : "unknown length"}${sequenceMassDa > 0 ? `, ${sequenceMassDa} Da` : ""}`,
+        `Annotation score: ${Number.isFinite(annotationScore) ? annotationScore.toFixed(1) : "N/A"}`,
+        `Subcellular locations: ${subcellularLocations.length > 0 ? subcellularLocations.join(", ") : "N/A"}`,
+        `Ensembl gene IDs: ${ensemblGeneIds.length > 0 ? ensemblGeneIds.join(", ") : "N/A"}`,
+        `PDB cross-references: ${pdbIds.length > 0 ? pdbIds.join(", ") : "N/A"}`,
+        `Reactome cross-references: ${reactomeIds.length > 0 ? reactomeIds.join(", ") : "N/A"}`,
+        `Feature type summary: ${featureSummary.length > 0 ? featureSummary.join("; ") : "N/A"}`,
+        ...(functionHighlights.length > 0 ? [`Function highlights: ${functionHighlights.join(" | ")}`] : []),
+        ...(diseaseNotes.length > 0 ? [`Disease notes: ${diseaseNotes.join(" | ")}`] : []),
+        ...(lastUpdate ? [`Last annotation update: ${lastUpdate}`] : []),
+      ];
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Retrieved UniProt profile for ${primaryAccession}${entryId ? ` (${entryId})` : ""}.`,
+              keyFields,
+              sources: [url, profileUrl],
+              limitations: [
+                "UniProt captures protein-centric evidence; disease-level interpretation still needs clinical/genetic triangulation.",
+                "Some sections (for example disease notes) are absent for many proteins and species.",
+              ],
+            }),
+          },
+        ],
+      };
+    } catch (error) {
+      const message = String(error?.message || "unknown error");
+      if (message.includes("Request failed (404)")) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: `UniProt accession ${normalizedAccession} was not found.`,
+                keyFields: [`Requested accession: ${normalizedAccession}`],
+                sources: [url],
+                limitations: [
+                  "Check for typos and ensure you are using a UniProt accession (for example P00533), not a gene symbol.",
+                ],
+              }),
+            },
+          ],
+        };
+      }
+      return { content: [{ type: "text", text: `Error in get_uniprot_protein_profile: ${message}` }] };
     }
   }
 );

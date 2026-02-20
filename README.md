@@ -8,7 +8,8 @@ The AI Co-Scientist helps researchers:
 - **Discover drug targets** for diseases using Open Targets data
 - **Evaluate druggability** of potential targets
 - **Find clinical trial evidence** from ClinicalTrials.gov
-- **Search scientific literature** via PubMed
+- **Search scientific literature** via PubMed and Europe PMC preprints
+- **Assess post-marketing safety and regulatory labels** via openFDA
 - **Generate a query-specific execution plan** with explicit tool proposals
 - **Require human plan approval or revision** before evidence tools run
 - **Run iterative evidence refinement loops** with tool-use guardrails
@@ -140,13 +141,14 @@ python agent.py --query "Evaluate LRRK2 as a drug target in Parkinson disease"
 | **Disease & Targets** | `search_diseases`, `search_disease_targets`, `get_target_info`, `search_targets` | Open Targets GraphQL |
 | **Druggability** | `check_druggability`, `get_target_drugs` | Open Targets GraphQL |
 | **Clinical Trials** | `search_clinical_trials`, `get_clinical_trial`, `summarize_clinical_trials_landscape` | ClinicalTrials.gov |
+| **Post-Marketing Safety & Labels** | `summarize_openfda_adverse_events`, `get_openfda_drug_label_summary` | openFDA (FAERS, Drug Label) |
 | **Chemistry Evidence** | `search_chembl_compounds_for_target` | ChEMBL |
 | **Expression & Cell Context** | `summarize_target_expression_context` | Open Targets GraphQL |
 | **Genetic Direction-of-Effect** | `infer_genetic_effect_direction` | GWAS Catalog |
 | **Competitive & Safety Intelligence** | `summarize_target_competitive_landscape`, `summarize_target_safety_liabilities` | Open Targets GraphQL |
 | **Comparative Prioritization** | `compare_targets_multi_axis` (auto mode from goal text, preset, or custom axis weights) | Open Targets GraphQL |
 | **Protein Annotations** | `search_uniprot_proteins`, `get_uniprot_protein_profile` | UniProt REST |
-| **Literature** | `search_pubmed`, `get_pubmed_abstract`, `search_pubmed_advanced`, `get_pubmed_paper_details`, `get_pubmed_author_profile` | PubMed E-utilities |
+| **Literature** | `search_pubmed`, `search_europe_pmc_preprints`, `get_pubmed_abstract`, `search_pubmed_advanced`, `get_pubmed_paper_details`, `get_pubmed_author_profile` | PubMed E-utilities, Europe PMC |
 | **Researcher Discovery** | `search_openalex_works`, `search_openalex_authors`, `rank_researchers_by_activity`, `get_researcher_contact_candidates` | OpenAlex |
 | **Variants & Genomics** | `search_clinvar_variants`, `get_clinvar_variant_details`, `search_gwas_associations`, `get_gene_info` | NCBI ClinVar, GWAS Catalog, NCBI Gene |
 | **Pathway & Networks** | `search_reactome_pathways`, `get_string_interactions` | Reactome, STRING |
@@ -175,6 +177,8 @@ Notes:
 - **[Open Targets Platform](https://platform.opentargets.org/)** - Disease-target associations, druggability data
 - **[ClinicalTrials.gov](https://clinicaltrials.gov/)** - Clinical trial registry
 - **[PubMed/NCBI](https://pubmed.ncbi.nlm.nih.gov/)** - Scientific literature, gene information
+- **[Europe PMC](https://europepmc.org/)** - Biomedical literature and preprints (including medRxiv/bioRxiv)
+- **[openFDA](https://open.fda.gov/apis/)** - FAERS adverse-event reports and FDA drug labeling data
 - **[GWAS Catalog](https://www.ebi.ac.uk/gwas/)** - Variant-trait associations and effect direction signals
 - **[ChEMBL](https://www.ebi.ac.uk/chembl/)** - Compound bioactivity and target chemical evidence
 - **[OLS / EFO / MONDO](https://www.ebi.ac.uk/ols4/)** - Ontology expansion, synonyms, and hierarchy context
