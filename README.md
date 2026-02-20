@@ -121,15 +121,13 @@ python agent.py --query "Evaluate LRRK2 as a drug target in Parkinson disease"
 │   ├── co_scientist/
 │   │   ├── __init__.py     # Exports root_agent used by `adk run co_scientist`
 │   │   └── workflow.py    # Canonical ADK workflow graph + HITL gate
-│   ├── workflow.py         # Legacy/compat helpers still present in repo
-│   ├── task_state_store.py # State helpers used by compatibility paths
 │   ├── .adk/               # ADK local sessions/artifacts (created at runtime)
 │   └── test_*.py           # Lean core regression suite
 │
 ├── research-mcp/           # Research Tools Server (Node.js)
 │   ├── server.js           # MCP tool server
 │   ├── data/               # Local datasets
-│   └── README.md           # Tools documentation
+│   └── test-tools.js       # Optional manual MCP tool test script
 │
 └── README.md               # This file
 ```
@@ -161,12 +159,12 @@ Core regression tests (recommended default):
 
 ```bash
 cd adk-agent
-../.venv/bin/pytest test_adk_native_workflow.py test_task_state_store.py test_report_pdf.py -q
+../.venv/bin/pytest test_adk_native_workflow.py test_report_pdf.py -q
 ```
 
 This suite covers:
 - ADK-native workflow graph invariants
-- task state persistence and report PDF generation
+- report PDF generation
 
 Notes:
 - External network tests were removed from the default suite to keep CI/dev runs deterministic and fast.
