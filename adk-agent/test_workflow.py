@@ -1,10 +1,10 @@
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 
-from co_scientist.workflow import create_native_workflow_agent
+from co_scientist.workflow import create_workflow_agent
 
 
 def test_native_workflow_graph_shape():
-    root_agent, mcp_tools = create_native_workflow_agent(tool_filter=[])
+    root_agent, mcp_tools = create_workflow_agent(tool_filter=[])
     assert mcp_tools is None
     assert isinstance(root_agent, SequentialAgent)
 

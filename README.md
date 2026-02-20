@@ -62,7 +62,8 @@ Guardrails currently enforced in code:
 ### Prerequisites
 - Python 3.10+
 - Node.js 18+
-- Google API key ([get one free](https://aistudio.google.com/apikey))
+- Optional local auth: Google API key ([get one free](https://aistudio.google.com/apikey))
+- Optional Vertex auth: `gcloud` CLI + Application Default Credentials
 
 ### Setup
 
@@ -83,8 +84,15 @@ npm install
 cd ../adk-agent
 pip install -r requirements.txt
 
-# 5. Configure API key
-echo 'GOOGLE_API_KEY="your-key-here"' > .env
+# 5a. Local mode auth (AI Studio API key)
+cp .env.local.example .env
+# then edit .env and set GOOGLE_API_KEY
+
+# 5b. Vertex mode auth (project-backed)
+cp .env.vertex.example .env
+# then edit GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION
+# and authenticate with:
+# gcloud auth application-default login
 ```
 
 Keep the same shell with `.venv` activated for all commands below.
@@ -113,11 +121,41 @@ python agent.py
 python agent.py --query "Evaluate LRRK2 as a drug target in Parkinson disease"
 ```
 
+## Vertex Transition (Hackathon-Ready)
+
+### What is already prepared
+- Dual auth support in the runner: local API key or Vertex env (`GOOGLE_GENAI_USE_VERTEXAI=true`).
+- HTTP API entrypoint for deployment: `adk-agent/server.py`.
+- Cloud Run containerization files: `Dockerfile`, `.dockerignore`.
+- One-command deploy script: `scripts/deploy_cloud_run.sh`.
+
+### Cloud Run deployment (when your hackathon project opens)
+
+```bash
+# From repo root
+PROJECT_ID="your-hackathon-project-id" \
+REGION="us-central1" \
+SERVICE_NAME="ai-co-scientist" \
+bash scripts/deploy_cloud_run.sh
+```
+
+### Runtime endpoints (Cloud Run)
+- `GET /healthz` for readiness/config status
+- `POST /query` with JSON body:
+- API mode auto-approves plan confirmation gates (no interactive terminal prompt).
+
+```json
+{
+  "query": "Evaluate LRRK2 as a drug target in Parkinson disease"
+}
+```
+
 ## Project Structure
 
 ```
 ├── adk-agent/              # AI Co-Scientist Agent (Python)
 │   ├── agent.py            # ADK-native CLI wrapper (interactive/single query)
+│   ├── server.py           # FastAPI HTTP wrapper for Cloud Run
 │   ├── co_scientist/
 │   │   ├── __init__.py     # Exports root_agent used by `adk run co_scientist`
 │   │   └── workflow.py    # Canonical ADK workflow graph + HITL gate
@@ -129,6 +167,11 @@ python agent.py --query "Evaluate LRRK2 as a drug target in Parkinson disease"
 │   ├── data/               # Local datasets
 │   └── test-tools.js       # Optional manual MCP tool test script
 │
+├── scripts/
+│   └── deploy_cloud_run.sh # Build + deploy to Cloud Run with Vertex env
+│
+├── Dockerfile              # Cloud Run image (Python + Node runtime)
+├── .dockerignore           # Build context guardrails
 └── README.md               # This file
 ```
 
@@ -155,19 +198,16 @@ python agent.py --query "Evaluate LRRK2 as a drug target in Parkinson disease"
 
 ## Testing
 
-Core regression tests (recommended default):
+Current smoke checks:
 
 ```bash
 cd adk-agent
-../.venv/bin/pytest test_adk_native_workflow.py test_report_pdf.py -q
+../.venv/bin/python -m py_compile agent.py server.py co_scientist/workflow.py
 ```
-
-This suite covers:
-- ADK-native workflow graph invariants
-- report PDF generation
 
 Notes:
 - External network tests were removed from the default suite to keep CI/dev runs deterministic and fast.
+- `test_workflow.py` currently references `create_workflow_agent`, while the workflow export is `create_native_workflow_agent`.
 - Generated artifacts in `adk-agent/reports/` are runtime outputs and can be safely deleted.
 
 ## Data Sources

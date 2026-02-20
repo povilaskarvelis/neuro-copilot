@@ -32,8 +32,51 @@ logging.getLogger("google_genai.types").setLevel(logging.ERROR)
 
 MCP_SERVER_DIR = Path(__file__).resolve().parent.parent / "research-mcp"
 REQUEST_CONFIRMATION_FUNCTION_NAME = "adk_request_confirmation"
+VERTEX_ENABLE_ENV = "GOOGLE_GENAI_USE_VERTEXAI"
+VERTEX_REQUIRED_ENVS = ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION")
+TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 ConfirmationHandler = Callable[[object], Awaitable[dict]]
+
+
+def _is_truthy_env(value: str) -> bool:
+    return value.strip().lower() in TRUTHY_ENV_VALUES
+
+
+def _is_vertex_mode_enabled() -> bool:
+    return _is_truthy_env(str(os.environ.get(VERTEX_ENABLE_ENV, "")))
+
+
+def validate_runtime_configuration() -> tuple[bool, str]:
+    if _is_vertex_mode_enabled():
+        missing = [name for name in VERTEX_REQUIRED_ENVS if not str(os.environ.get(name, "")).strip()]
+        if missing:
+            return (
+                False,
+                (
+                    "Vertex AI mode is enabled but missing required env vars: "
+                    + ", ".join(missing)
+                ),
+            )
+    else:
+        api_key = str(os.environ.get("GOOGLE_API_KEY", "")).strip()
+        if not api_key or api_key == "your-api-key-here":
+            return (
+                False,
+                (
+                    "Missing model auth. Configure GOOGLE_API_KEY for local mode, "
+                    "or set GOOGLE_GENAI_USE_VERTEXAI=true with GOOGLE_CLOUD_PROJECT "
+                    "and GOOGLE_CLOUD_LOCATION."
+                ),
+            )
+
+    if not (MCP_SERVER_DIR / "server.js").exists():
+        return (
+            False,
+            f"MCP server not found at {MCP_SERVER_DIR}. Make sure research-mcp/server.js exists.",
+        )
+
+    return True, ""
 
 
 def _extract_request_confirmation_call(event) -> object | None:
@@ -255,18 +298,17 @@ async def run_native_interactive_async() -> None:
     print("AI Co-Scientist (ADK-native workflow mode)")
     print("=" * 60)
 
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key or api_key == "your-api-key-here":
-        print("\nERROR: GOOGLE_API_KEY not configured")
-        print("\nTo fix this:")
-        print("1. Open .env file in the adk-agent folder")
-        print("2. Replace 'your-api-key-here' with your API key")
-        print("3. Get a key at: https://aistudio.google.com/apikey")
-        return
-
-    if not (MCP_SERVER_DIR / "server.js").exists():
-        print(f"\nERROR: MCP server not found at {MCP_SERVER_DIR}")
-        print("\nMake sure research-mcp/server.js exists")
+    is_valid, error_message = validate_runtime_configuration()
+    if not is_valid:
+        print(f"\nERROR: {error_message}")
+        print("\nTo fix this for local mode:")
+        print("1. Open .env in the adk-agent folder")
+        print("2. Set GOOGLE_API_KEY to a valid key")
+        print("3. Get one at: https://aistudio.google.com/apikey")
+        print("\nTo fix this for Vertex mode:")
+        print("1. Set GOOGLE_GENAI_USE_VERTEXAI=true")
+        print("2. Set GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION")
+        print("3. Authenticate with `gcloud auth application-default login`")
         return
 
     workflow_agent, mcp_tools = create_native_workflow_agent()
@@ -321,6 +363,22 @@ def run_native_interactive() -> None:
 
 async def run_single_query_native_async(query: str) -> str:
     """Run one query using ADK workflow agents only."""
+    return await run_single_query_native_with_confirmation_async(
+        query,
+        confirmation_handler=_prompt_for_confirmation,
+    )
+
+
+async def run_single_query_native_with_confirmation_async(
+    query: str,
+    *,
+    confirmation_handler: ConfirmationHandler | None,
+) -> str:
+    """Run one query with caller-selected confirmation behavior."""
+    is_valid, error_message = validate_runtime_configuration()
+    if not is_valid:
+        raise RuntimeError(error_message)
+
     session_service = InMemorySessionService()
     workflow_agent, mcp_tools = create_native_workflow_agent()
     runner = Runner(
@@ -339,7 +397,7 @@ async def run_single_query_native_async(query: str) -> str:
             session.id,
             "researcher",
             query,
-            confirmation_handler=_prompt_for_confirmation,
+            confirmation_handler=confirmation_handler,
         )
     finally:
         if mcp_tools is not None:

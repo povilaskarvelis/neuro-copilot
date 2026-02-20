@@ -1,0 +1,14 @@
+.git
+.gitignore
+.DS_Store
+.pytest_cache
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+adk-agent/.env
+adk-agent/.adk
+adk-agent/reports
+node_modules
+research-mcp/node_modules
