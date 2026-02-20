@@ -9,72 +9,52 @@ The AI Co-Scientist helps researchers:
 - **Evaluate druggability** of potential targets
 - **Find clinical trial evidence** from ClinicalTrials.gov
 - **Search scientific literature** via PubMed
-- **Generate dynamic, query-specific plans** from model reasoning + available tools
-- **Run stateful workflows** with resumable task IDs and HITL checkpoints
-- **Synthesize final reports** directly from final-step model output
+- **Generate a query-specific execution plan** with explicit tool proposals
+- **Require human plan approval or revision** before evidence tools run
+- **Run iterative evidence refinement loops** with tool-use guardrails
+- **Synthesize structured final reports** with citations, limitations, and next actions
 
 ## Architecture
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                AI Co-Scientist Orchestrator                   │
-│           (Google ADK + Gemini + dynamic planner)             │
-└──────────────────────────┬────────────────────────────────────┘
-                           │ Step execution + HITL checkpoint
-┌──────────────────────────▼────────────────────────────────────┐
-│                Task Workflow State (JSON store)               │
-│      • task_id • step status • checkpoint history • resume    │
-└──────────────────────────┬────────────────────────────────────┘
-                           │ MCP Protocol
-┌──────────────────────────▼────────────────────────────────────┐
-│                    Research MCP Server                         │
-│   Domain tools for targets, trials, literature, genomics, etc. │
-└───────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    U["User (ADK Web or CLI)"] --> R["ADK Runner + Session State"]
+    R --> W["SequentialAgent workflow<br/>clarifier -> plan_approval_loop -> evidence_refinement_loop -> report_synthesizer"]
+    W --> C["ADK tool confirmation<br/>request_plan_confirmation"]
+    C --> U
+    W --> M["MCPToolset -> research-mcp/server.js"]
 ```
 
 ## Dynamic Workflow (Detailed)
 
-The flow below highlights where LLM reasoning is required versus deterministic runtime guardrails.
+Source of truth: `adk-agent/co_scientist/workflow.py`.
 
 ```mermaid
 flowchart TD
-    A["User submits a research question<br/>files: adk-agent/agent.py, adk-agent/ui_server.py"] --> B{{"Clarifier checks for ambiguity or malformed query<br/>files: adk-agent/agent.py (CLARIFIER_INSTRUCTION), adk-agent/co_scientist/planning/intent.py"}}
-    B --> C1{"Clarification needed before running tools?<br/>files: adk-agent/agent.py, adk-agent/co_scientist/planning/intent.py"}
-    C1 -->|Yes| C2["Pause and ask a short clarification question<br/>files: adk-agent/agent.py, adk-agent/ui_server.py"]
-    C2 --> C3["Attach user clarification to objective<br/>files: adk-agent/agent.py, adk-agent/co_scientist/planning/intent.py"]
-    C1 -->|No| C
-    C3 --> C
-    C{{"Route request + normalize objective<br/>files: adk-agent/co_scientist/planning/intent.py, adk-agent/co_scientist/planning/workflow_planning.py"}}
-    C --> D{{"Planner drafts query-specific subgoal graph<br/>files: adk-agent/agent.py (PLANNER_PROMPT), adk-agent/co_scientist/planning/workflow_planning.py"}}
-    D --> E["Convert subgoals to executable steps + save plan metadata<br/>files: adk-agent/co_scientist/planning/workflow_planning.py, adk-agent/workflow.py, adk-agent/task_state_store.py"]
-    E --> E1["Run first scope step (step_1)<br/>files: adk-agent/co_scientist/runtime/execution.py, adk-agent/workflow.py (step_prompt role=planner)"]
-    E1 --> F["Open initial execution checkpoint (pre_evidence_execution)<br/>files: adk-agent/agent.py, adk-agent/co_scientist/runtime/quality_gates.py, adk-agent/co_scientist/runtime/event_orchestrator.py"]
-    F --> G{"User action at checkpoint<br/>files: adk-agent/agent.py, adk-agent/ui_server.py"}
-    G -->|Start or Continue| H["Run next planned step + persist state<br/>files: adk-agent/agent.py, adk-agent/co_scientist/runtime/execution.py, adk-agent/task_state_store.py"]
-    G -->|Revise once| I{{"Parse feedback intent + replan remaining steps<br/>files: adk-agent/agent.py (REVISION_FEEDBACK_PARSER_INSTRUCTION), adk-agent/co_scientist/planning/revision.py, adk-agent/co_scientist/planning/workflow_planning.py"}}
-    I --> F
-    G -->|Stop CLI| Z["Mark task blocked/paused until resumed<br/>files: adk-agent/agent.py, adk-agent/task_state_store.py"]
+    U["User question"] --> C["clarifier (LlmAgent)<br/>normalize objective + constraints"]
+    C --> P["planner (LlmAgent)<br/>emit PlanDraft JSON (steps + planned_tools)"]
+    P --> R["plan_reviewer (LlmAgent)<br/>forced tool call: request_plan_confirmation"]
+    R --> H{"Human decision"}
+    H -->|revise| P
+    H -->|approve| E["evidence_refinement_loop (LoopAgent)"]
+    R -->|pending confirmation| B["Execution blocked until plan approval"]
+    B --> H
 
-    H --> J{{"Model executes current step prompt + chooses allowed tools<br/>files: adk-agent/workflow.py (step_prompt), adk-agent/agent.py (EXECUTOR_PROMPT + AGENT_INSTRUCTION), adk-agent/co_scientist/__init__.py (ADK AGENT_INSTRUCTION)"}}
-    J --> K["Run MCP tools + capture traces + validate response contracts<br/>files: adk-agent/co_scientist/runtime/execution.py, research-mcp/server.js"]
-    K --> L["Recompute quality gates (coverage, citations, gaps, confidence)<br/>files: adk-agent/co_scientist/runtime/quality_gates.py"]
-    L --> M{"Open another checkpoint now?<br/>files: adk-agent/co_scientist/runtime/quality_gates.py, adk-agent/co_scientist/runtime/event_orchestrator.py"}
-    M -->|Yes| F
-    M -->|No| N{"Are there remaining steps?<br/>files: adk-agent/agent.py"}
-    N -->|Yes| H
-    N -->|No| O{{"Model writes final recommendation/report (synthesis)<br/>files: adk-agent/agent.py (REPORT_SYNTHESIZER_PROMPT), adk-agent/workflow.py"}}
-    O --> P["Persist final report markdown + expose PDF export<br/>files: adk-agent/co_scientist/presentation/cli_output.py, adk-agent/ui_server.py, adk-agent/report_pdf.py"]
-    P --> Q["Render same report in UI and CLI<br/>files: adk-agent/ui_server.py, adk-agent/agent.py, adk-agent/co_scientist/presentation/cli_output.py"]
+    E --> X["evidence_executor (LlmAgent)<br/>run approved MCP tools only"]
+    X --> Y{"evidence_critic (LlmAgent)<br/>sufficient evidence?"}
+    Y -->|no| X
+    Y -->|yes| S["report_synthesizer (LlmAgent)<br/>final structured answer"]
 
     classDef llm fill:#eef2f7,stroke:#5f6b7a,stroke-width:1.5px,color:#1f2933;
     classDef guard fill:#f3f4f6,stroke:#6b7280,stroke-width:1.5px,color:#1f2933;
-    class B,C,D,I,J,O llm;
-    class C1,C2,C3,E,E1,F,H,K,L,M,N,P,Q,Z guard;
+    class C,P,R,X,Y,S llm;
+    class H,B,E guard;
 ```
 
-Legend:
-- **LLM nodes** = model-required reasoning/synthesis steps.
-- **Guardrail nodes** = deterministic runtime orchestration, persistence, and HITL control flow.
+Guardrails currently enforced in code:
+- `_prepare_plan_gate_for_new_query` resets approval state for each new query.
+- `_block_until_plan_approved` blocks evidence and synthesis until approval.
+- `_guard_evidence_tool_execution` blocks tools not present in `approved_tools`.
 
 ## Quick Start
 
@@ -90,80 +70,59 @@ Legend:
 git clone <repo-url>
 cd <repo>
 
-# 2. Install MCP server dependencies
+# 2. Create and activate a project virtualenv
+python -m venv .venv
+source .venv/bin/activate
+
+# 3. Install MCP server dependencies
 cd research-mcp
 npm install
 
-# 3. Install agent dependencies
+# 4. Install agent dependencies
 cd ../adk-agent
 pip install -r requirements.txt
 
-# 4. Configure API key
+# 5. Configure API key
 echo 'GOOGLE_API_KEY="your-key-here"' > .env
 ```
 
+Keep the same shell with `.venv` activated for all commands below.
+
 ### Run
+
+Primary (ADK-native CLI):
+
+```bash
+cd adk-agent
+adk run co_scientist
+```
+
+Primary (ADK-native Web UI):
+
+```bash
+cd adk-agent
+adk web .
+```
+
+Optional lightweight wrapper (still ADK-native under the hood):
 
 ```bash
 cd adk-agent
 python agent.py
+python agent.py --query "Evaluate LRRK2 as a drug target in Parkinson disease"
 ```
-
-Optional web UI on top of the same task store/CLI workflow:
-
-```bash
-cd adk-agent
-python -m pip install -r requirements.txt
-python ui_server.py
-```
-
-Then open `http://127.0.0.1:8080` in your browser.
-
-Then ask questions like:
-- *"Find promising drug targets for Parkinson's disease"*
-- *"Evaluate LRRK2 as a drug target"*
-- *"What clinical trials exist for Alzheimer's treatments?"*
-
-In co-investigator mode, each request now:
-1. builds a dynamic plan for the specific objective,
-2. executes evidence steps with adaptive checkpointing,
-3. supports one revision opportunity after initial plan creation,
-4. runs straight through to synthesis/reporting (no forced checkpoint right before synthesis),
-5. saves report artifacts to `adk-agent/reports/<task_id>.md` and `adk-agent/reports/<task_id>.pdf`.
-
-Web UI thread model:
-- The sidebar groups runs by conversation thread (not by single task only).
-- Each follow-up creates a new iteration task in the same conversation.
-- Follow-ups can branch from any selected prior report card.
-- Every iteration has a separate research log in main chat.
-- Suggested next actions are shown in main chat only (the report panel omits the `Next Actions` section).
-
-PDF rendering behavior:
-- Uses a high-fidelity HTML/CSS pipeline via headless Chrome/Chromium when available.
-- Falls back to internal ReportLab rendering when Chrome/Chromium is unavailable.
-
-Final report behavior:
-- UI and terminal both use the same canonical report source.
-- Final report is the model's final-step report markdown (rendered in UI, plain in terminal).
-
-Terminal commands:
-- `status`: show current or latest workflow status
-- `resume [task_id]`: resume a saved task
-- `history [task_id]`: show recent saved revisions for rollback
-- `rollback <offset|revision_id> [task_id]`: restore a task to an earlier revision
-- `help`: show command help
 
 ## Project Structure
 
 ```
 ├── adk-agent/              # AI Co-Scientist Agent (Python)
-│   ├── agent.py            # Runtime orchestration + execution loop
-│   ├── workflow.py         # Task model, planning helpers, report rendering
-│   ├── ui_server.py        # FastAPI server for web UI
-│   ├── ui/                 # Frontend app
-│   ├── task_state_store.py # JSON persistence for workflow state
-│   ├── co_scientist/       # Runtime/planning/domain modules
-│   ├── reports/            # Runtime-generated report artifacts (safe to clear)
+│   ├── agent.py            # ADK-native CLI wrapper (interactive/single query)
+│   ├── co_scientist/
+│   │   ├── __init__.py     # Exports root_agent used by `adk run co_scientist`
+│   │   └── workflow.py    # Canonical ADK workflow graph + HITL gate
+│   ├── workflow.py         # Legacy/compat helpers still present in repo
+│   ├── task_state_store.py # State helpers used by compatibility paths
+│   ├── .adk/               # ADK local sessions/artifacts (created at runtime)
 │   └── test_*.py           # Lean core regression suite
 │
 ├── research-mcp/           # Research Tools Server (Node.js)
@@ -186,6 +145,7 @@ Terminal commands:
 | **Genetic Direction-of-Effect** | `infer_genetic_effect_direction` | GWAS Catalog |
 | **Competitive & Safety Intelligence** | `summarize_target_competitive_landscape`, `summarize_target_safety_liabilities` | Open Targets GraphQL |
 | **Comparative Prioritization** | `compare_targets_multi_axis` (auto mode from goal text, preset, or custom axis weights) | Open Targets GraphQL |
+| **Protein Annotations** | `search_uniprot_proteins`, `get_uniprot_protein_profile` | UniProt REST |
 | **Literature** | `search_pubmed`, `get_pubmed_abstract`, `search_pubmed_advanced`, `get_pubmed_paper_details`, `get_pubmed_author_profile` | PubMed E-utilities |
 | **Researcher Discovery** | `search_openalex_works`, `search_openalex_authors`, `rank_researchers_by_activity`, `get_researcher_contact_candidates` | OpenAlex |
 | **Variants & Genomics** | `search_clinvar_variants`, `get_clinvar_variant_details`, `search_gwas_associations`, `get_gene_info` | NCBI ClinVar, GWAS Catalog, NCBI Gene |
@@ -199,13 +159,11 @@ Core regression tests (recommended default):
 
 ```bash
 cd adk-agent
-pytest test_agentic_phase_flow.py test_ui_server_hitl.py test_agentic_workflow_eval.py test_agentic_invariants.py test_task_state_store.py test_report_pdf.py -q
+../.venv/bin/pytest test_adk_native_workflow.py test_task_state_store.py test_report_pdf.py -q
 ```
 
 This suite covers:
-- agentic phase transitions and checkpoint behavior
-- UI runtime/HITL flow and report availability
-- dynamic planner/workflow invariants
+- ADK-native workflow graph invariants
 - task state persistence and report PDF generation
 
 Notes:
