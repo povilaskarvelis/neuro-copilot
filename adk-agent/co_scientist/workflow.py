@@ -92,23 +92,23 @@ __TOOL_CATALOG__
 Rules:
 - Build a concrete execution plan before any evidence collection begins.
 - Break the objective into ordered, atomic subtasks.
+- Prioritize high-signal subtasks that reduce uncertainty first.
 - Each subtask must have:
   - a short goal,
   - the intended evidence source/tool family,
   - a clear completion condition.
-- Prioritize high-signal subtasks that reduce uncertainty first.
+
 __BQ_POLICY__
 - Do not call tools.
 
+The output should be very succinct. 
 Output format:
-Objective: <one sentence>
-Subtasks:
-1) <subtask>
-2) <subtask>
-3) <subtask>
-Stop criteria:
-- <criterion>
-- <criterion>
+To answer your query I will:
+1) <goal> using <tool>
+2) <goal> using <tool>
+3) <goal> using <tool>
+...
+
 """
 
 
@@ -129,7 +129,8 @@ __BQ_POLICY__
 - Include source identifiers when available (PMID, DOI, NCT, OpenAlex IDs).
 
 Return only:
-Short updates on your progress and evidence gathered. """
+Short updates on your progress and evidence gathered. 
+"""
 
 
 EVIDENCE_CRITIC_INSTRUCTION = """
