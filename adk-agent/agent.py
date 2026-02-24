@@ -365,7 +365,7 @@ async def run_native_interactive_async() -> None:
         print("3. Authenticate with `gcloud auth application-default login`")
         return
 
-    workflow_agent, mcp_tools = create_workflow_agent()
+    workflow_agent, mcp_tools = create_workflow_agent(require_plan_approval=True)
     session_service = InMemorySessionService()
     runner = Runner(
         agent=workflow_agent,
@@ -434,7 +434,7 @@ async def run_single_query_native_with_confirmation_async(
         raise RuntimeError(error_message)
 
     session_service = InMemorySessionService()
-    workflow_agent, mcp_tools = create_workflow_agent()
+    workflow_agent, mcp_tools = create_workflow_agent(require_plan_approval=True)
     runner = Runner(
         agent=workflow_agent,
         app_name="co_scientist_native_single_query",

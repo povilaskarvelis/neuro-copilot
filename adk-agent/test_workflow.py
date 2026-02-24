@@ -28,11 +28,70 @@ def test_native_workflow_graph_shape():
     assert evidence_executor.tools == []
     assert evidence_executor.before_model_callback is not None
     assert evidence_executor.after_model_callback is not None
+    assert evidence_executor.before_agent_callback is None
 
     report_agent = root_agent.sub_agents[2]
     assert isinstance(report_agent, LlmAgent)
     assert report_agent.before_model_callback is not None
     assert report_agent.after_model_callback is not None
+    assert report_agent.before_agent_callback is None
+
+
+def test_native_workflow_graph_shape_with_hitl():
+    root_agent, mcp_tools = create_workflow_agent(
+        tool_filter=[], require_plan_approval=True,
+    )
+    assert mcp_tools is None
+    assert isinstance(root_agent, SequentialAgent)
+    top_level_names = [sub_agent.name for sub_agent in root_agent.sub_agents]
+    assert top_level_names == [
+        "planner",
+        "evidence_executor",
+        "report_synthesizer",
+    ]
+    for sub_agent in root_agent.sub_agents:
+        assert sub_agent.before_model_callback is not None
+    executor = root_agent.sub_agents[1]
+    synth = root_agent.sub_agents[2]
+    assert executor.before_agent_callback is not None
+    assert synth.before_agent_callback is not None
+
+
+def test_plan_approval_command_detection():
+    assert workflow._is_plan_approval_command("approve")
+    assert workflow._is_plan_approval_command("  Approved  ")
+    assert workflow._is_plan_approval_command("LGTM")
+    assert workflow._is_plan_approval_command("/approve")
+    assert workflow._is_plan_approval_command("yes")
+    assert not workflow._is_plan_approval_command("approve this plan")
+    assert not workflow._is_plan_approval_command("no")
+    assert not workflow._is_plan_approval_command("revise: more steps")
+
+
+def test_continue_execution_command_detection():
+    assert workflow._is_continue_execution_command("continue")
+    assert workflow._is_continue_execution_command("  Next  ")
+    assert workflow._is_continue_execution_command("/continue")
+    assert workflow._is_continue_execution_command("go")
+    assert workflow._is_continue_execution_command("approve")
+    assert workflow._is_continue_execution_command("yes")
+    assert not workflow._is_continue_execution_command("continue please")
+    assert not workflow._is_continue_execution_command("what is this")
+
+
+def test_extract_revision_feedback():
+    assert workflow._extract_revision_feedback("revise: more clinical trials") == "more clinical trials"
+    assert workflow._extract_revision_feedback("Revise: add genetic analysis") == "add genetic analysis"
+    assert workflow._extract_revision_feedback("revision: focus on safety") == "focus on safety"
+    assert workflow._extract_revision_feedback("revise:") is None
+    assert workflow._extract_revision_feedback("approve") is None
+    assert workflow._extract_revision_feedback("hello world") is None
+
+
+def test_render_plan_approval_prompt():
+    prompt = workflow._render_plan_approval_prompt()
+    assert "approve" in prompt.lower()
+    assert "revise" in prompt.lower()
 
 
 def test_finalize_command_detection_exact_matches():

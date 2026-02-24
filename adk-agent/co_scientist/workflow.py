@@ -7,6 +7,7 @@ but maintains structured step state in ADK session state via callbacks.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -17,9 +18,13 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import McpToolset
+from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.mcp_tool.mcp_toolset import StdioConnectionParams
+from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 from mcp.client.stdio import StdioServerParameters
+
+logger = logging.getLogger(__name__)
 
 
 MCP_SERVER_DIR = Path(__file__).resolve().parents[2] / "research-mcp"
@@ -39,6 +44,7 @@ BQ_PRIORITY_TOOLS = [
 
 STATE_WORKFLOW_TASK = "workflow_task_state"
 STATE_WORKFLOW_TASK_LEGACY_APP = "app:workflow_task_state"
+STATE_PRIOR_RESEARCH = "co_scientist_prior_research"
 STATE_FINALIZE_REQUESTED = "temp:co_scientist_finalize_requested"
 STATE_AUTO_SYNTH_REQUESTED = "temp:co_scientist_auto_synth_requested"
 STATE_TURN_ABORT_REASON = "temp:co_scientist_turn_abort_reason"
@@ -49,12 +55,31 @@ STATE_PLANNER_RENDERED = "temp:co_scientist_planner_rendered"
 STATE_EXECUTOR_RENDERED = "temp:co_scientist_executor_rendered"
 STATE_EXECUTOR_ACTIVE_STEP_ID = "temp:co_scientist_executor_active_step_id"
 STATE_EXECUTOR_PREV_STEP_STATUS = "temp:co_scientist_executor_prev_step_status"
+STATE_PLAN_PENDING_APPROVAL = "co_scientist_plan_pending_approval"
 
 FINALIZE_COMMANDS = {
     "finalize",
     "summarize now",
     "final summary",
     "/finalize",
+}
+
+PLAN_APPROVAL_COMMANDS = {
+    "approve",
+    "approved",
+    "yes",
+    "proceed",
+    "go ahead",
+    "/approve",
+    "looks good",
+    "lgtm",
+}
+
+CONTINUE_EXECUTION_COMMANDS = {
+    "continue",
+    "next",
+    "go",
+    "/continue",
 }
 
 PLAN_SCHEMA = "plan_internal.v1"
@@ -105,6 +130,48 @@ KNOWN_MCP_TOOLS = [
     "read_local_dataset",
 ]
 
+TOOL_SOURCE_NAMES: dict[str, str] = {
+    "list_bigquery_tables": "BigQuery",
+    "run_bigquery_select_query": "BigQuery",
+    "benchmark_dataset_overview": "Benchmark Datasets",
+    "sample_pubmedqa_examples": "PubMedQA",
+    "sample_bioasq_examples": "BioASQ",
+    "check_gpqa_access": "GPQA",
+    "search_diseases": "Open Targets Platform",
+    "expand_disease_context": "Open Targets Platform",
+    "search_targets": "Open Targets Platform",
+    "search_disease_targets": "Open Targets Platform",
+    "get_target_info": "Open Targets Platform",
+    "check_druggability": "Open Targets Platform",
+    "get_target_drugs": "Open Targets Platform",
+    "summarize_target_expression_context": "Open Targets Platform",
+    "summarize_target_competitive_landscape": "Open Targets Platform",
+    "summarize_target_safety_liabilities": "Open Targets Platform",
+    "compare_targets_multi_axis": "Open Targets Platform",
+    "search_clinical_trials": "ClinicalTrials.gov",
+    "get_clinical_trial": "ClinicalTrials.gov",
+    "summarize_clinical_trials_landscape": "ClinicalTrials.gov",
+    "search_pubmed": "PubMed",
+    "search_pubmed_advanced": "PubMed",
+    "get_pubmed_abstract": "PubMed",
+    "get_pubmed_paper_details": "PubMed",
+    "get_pubmed_author_profile": "PubMed",
+    "search_openalex_works": "OpenAlex",
+    "search_openalex_authors": "OpenAlex",
+    "rank_researchers_by_activity": "OpenAlex",
+    "get_researcher_contact_candidates": "OpenAlex",
+    "search_chembl_compounds_for_target": "ChEMBL",
+    "search_gwas_associations": "GWAS Catalog",
+    "infer_genetic_effect_direction": "GWAS Catalog",
+    "search_clinvar_variants": "ClinVar",
+    "get_clinvar_variant_details": "ClinVar",
+    "search_reactome_pathways": "Reactome",
+    "get_string_interactions": "STRING",
+    "get_gene_info": "NCBI Gene",
+    "list_local_datasets": "Local Datasets",
+    "read_local_dataset": "Local Datasets",
+}
+
 
 PLANNER_INSTRUCTION_TEMPLATE = """
 You are the internal planner for biomedical investigation.
@@ -149,9 +216,11 @@ Available MCP tools:
 __TOOL_CATALOG__
 
 Rules:
-- Execute the pending plan steps provided in the injected execution context, in order.
-- Continue through all pending steps in this turn unless a step is blocked.
-- If a step is blocked, stop further planned steps and report the blocked step plus completed prior step results.
+- Execute ALL pending plan steps provided in the injected execution context, in order.
+- You MUST call at least one tool for EACH pending step before returning results.
+- Do NOT return the batch result JSON until you have attempted every pending step.
+- If a tool call fails, try an alternative tool or mark the step as blocked.
+- If a step is blocked, continue with the remaining steps (do not stop early).
 - Use MCP tools only when they directly improve evidence quality.
 - Prioritize high-signal evidence before broad expansion.
 - Surface contradictions and unresolved gaps explicitly.
@@ -159,6 +228,8 @@ Rules:
 __BQ_POLICY__
 
 Output requirements:
+- IMPORTANT: Only return the JSON after you have called tools for ALL pending steps.
+- The step_results array MUST contain an entry for every step you were asked to execute.
 - Return ONLY valid JSON (no markdown, no prose) matching this shape:
   {
     "schema": "execution_batch_result.v1",
@@ -179,7 +250,7 @@ Output requirements:
 
 SYNTHESIZER_INSTRUCTION = """
 You are the final biomedical report synthesizer.
-You will receive structured state context (objective, plan steps, step results, and coverage status).
+You will receive structured state context (objective, plan steps, step results, coverage status, and a source_reference mapping).
 
 Rules:
 - Produce a final summary grounded only in the provided evidence/results.
@@ -190,15 +261,28 @@ Rules:
   - the evidence-backed claim,
   - why it matters for the objective (rationale),
   - source identifiers when available.
-- Always include potential next steps, even when the plan is complete (e.g., confirmatory checks, risk reduction, monitoring, or decision-oriented follow-up).
+- Always include 3 potential next steps, even when the plan is complete (e.g., confirmatory checks, risk reduction, monitoring, or decision-oriented follow-up).
+
+Source citation rules:
+- Each step in the context has a `source` field with the database/source name (e.g. "PubMed", "ClinicalTrials.gov").
+- A `source_reference` legend maps internal tool names to database names.
+- When citing findings, use ONLY the database/source name. NEVER mention tool names (like search_pubmed, get_target_info, etc.) in the report.
+  Good: "According to PubMed, three RCTs showed..."
+  Good: "Open Targets Platform data indicates BRCA1 has high genetic association..."
+  Good: "ClinicalTrials.gov lists 12 active Phase II trials..."
+  Bad:  "search_pubmed returned three RCTs..."
+  Bad:  "Using the search_pubmed tool..."
+  Bad:  "PubMed (search_pubmed) data shows..."
+- Include specific identifiers inline when available (PMID, DOI, NCT numbers, etc.).
+- NEVER include raw URLs, API endpoints, or links to JSON output in the report. Only use human-readable source names and identifiers.
 
 Output requirements:
 - Return user-facing Markdown.
-- Include these sections:
-  - `## Final Summary`
-  - `Supporting Evidence`
-  - `Limitations`
-  - `Potential Next Steps`
+- Start with `## Final Summary`.
+- Present findings grouped by step. For each step, state the source explicitly on its own line before the findings, e.g.:
+  **Source:** PubMed
+  Three RCTs (PMID: 12345678, PMID: 23456789) demonstrated...
+- End with `Limitations` and `Potential Next Steps` sections.
 """
 
 
@@ -225,6 +309,46 @@ def _normalize_user_text(text: str) -> str:
 
 def _is_finalize_command(text: str) -> bool:
     return _normalize_user_text(text) in FINALIZE_COMMANDS
+
+
+def _is_plan_approval_command(text: str) -> bool:
+    return _normalize_user_text(text) in PLAN_APPROVAL_COMMANDS
+
+
+def _is_continue_execution_command(text: str) -> bool:
+    normalized = _normalize_user_text(text)
+    return normalized in CONTINUE_EXECUTION_COMMANDS or normalized in PLAN_APPROVAL_COMMANDS
+
+
+def _parse_rollback_command(text: str) -> int | None:
+    """Parse 'rollback', 'rollback N', or 'switch N'. Returns 1-based cycle index or None."""
+    normalized = _normalize_user_text(text)
+    if normalized == "rollback":
+        return -1
+    match = re.match(r"(?:rollback|switch)\s+(\d+)$", normalized)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _extract_revision_feedback(text: str) -> str | None:
+    """Return the feedback portion if user text starts with 'revise:' or 'revision:', else None."""
+    stripped = text.strip()
+    lowered = stripped.lower()
+    for prefix in ("revise:", "revision:"):
+        if lowered.startswith(prefix):
+            feedback = stripped[len(prefix):].strip()
+            return feedback or None
+    return None
+
+
+def _render_plan_approval_prompt() -> str:
+    return (
+        "\n\n---\n"
+        "**Please review the plan above.** Respond with:\n"
+        "- `approve` \u2014 proceed with execution\n"
+        "- `revise: <your feedback>` \u2014 request changes to the plan"
+    )
 
 
 def _extract_user_turn_text(callback_context: CallbackContext) -> str:
@@ -305,7 +429,23 @@ def _compose_non_finalize_turn_output(callback_context: CallbackContext) -> str:
     planner_text = str(callback_context.state.get(STATE_PLANNER_RENDERED, "") or "").strip()
     executor_text = str(callback_context.state.get(STATE_EXECUTOR_RENDERED, "") or "").strip()
     parts = [part for part in (planner_text, executor_text) if part]
-    return "\n\n".join(parts).strip()
+    combined = "\n\n".join(parts).strip()
+
+    task_state = _get_task_state(callback_context)
+    if task_state and str(task_state.get("plan_status", "")) != "completed":
+        completed = _completed_step_count(task_state)
+        total = _total_step_count(task_state)
+        next_id = str(task_state.get("current_step_id") or "")
+        if total > 0 and completed < total:
+            hint = (
+                f"\n\n---\n_Completed {completed} of {total} steps."
+            )
+            if next_id:
+                hint += f" Next: **{next_id}**."
+            hint += " Send `continue` to execute remaining steps, or `finalize` for a partial summary._"
+            combined += hint
+
+    return combined
 
 
 def _json_candidate_from_fenced_block(text: str) -> str | None:
@@ -457,19 +597,13 @@ def _validate_plan_internal(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("steps must contain at least one item")
 
     steps: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
     for idx, step in enumerate(steps_raw, start=1):
         if not isinstance(step, dict):
             raise ValueError(f"steps[{idx - 1}] must be an object")
-        step_id = _as_nonempty_str(step.get("id"), f"steps[{idx - 1}].id")
-        if step_id != f"S{idx}":
-            raise ValueError(f"steps[{idx - 1}].id must be S{idx}")
-        if step_id in seen_ids:
-            raise ValueError(f"Duplicate step id: {step_id}")
-        seen_ids.add(step_id)
+        canonical_id = f"S{idx}"
         steps.append(
             {
-                "id": step_id,
+                "id": canonical_id,
                 "goal": _as_nonempty_str(step.get("goal"), f"steps[{idx - 1}].goal"),
                 "tool_hint": _as_nonempty_str(step.get("tool_hint"), f"steps[{idx - 1}].tool_hint"),
                 "completion_condition": _as_nonempty_str(
@@ -520,6 +654,32 @@ def _initialize_task_state_from_plan(plan: dict[str, Any], *, objective_text: st
 def _get_task_state(callback_context: CallbackContext) -> dict[str, Any] | None:
     state = callback_context.state.get(STATE_WORKFLOW_TASK)
     return state if isinstance(state, dict) else None
+
+
+def _archive_current_task(callback_context: CallbackContext) -> None:
+    """Push a deep copy of the current task state onto the history stack."""
+    task_state = _get_task_state(callback_context)
+    if not task_state:
+        return
+    has_results = any(
+        str(s.get("status", "")) in ("completed", "blocked")
+        for s in task_state.get("steps", [])
+    )
+    if not has_results:
+        return
+    prior: list[dict[str, Any]] = callback_context.state.get(STATE_PRIOR_RESEARCH) or []
+    if not isinstance(prior, list):
+        prior = []
+    import copy
+    prior.append(copy.deepcopy(task_state))
+    max_archived = 10
+    callback_context.state[STATE_PRIOR_RESEARCH] = prior[-max_archived:]
+
+
+def _get_prior_research(callback_context: CallbackContext) -> list[dict[str, Any]]:
+    """Return the list of archived task states (full history)."""
+    prior = callback_context.state.get(STATE_PRIOR_RESEARCH) or []
+    return prior if isinstance(prior, list) else []
 
 
 def _find_step(task_state: dict[str, Any], step_id: str) -> tuple[int, dict[str, Any]]:
@@ -642,24 +802,40 @@ def _render_executor_batch_progress_markdown(task_state: dict[str, Any], step_re
             step = {}
         status = str(result.get("status", step.get("status", ""))).strip()
         goal = str(step.get("goal", "")).strip()
-        lines.append(f"### {step_id} · `{status}`")
+        lines.append(f"### {step_id} \u00b7 `{status}`")
+        lines.append("")
         if goal:
             lines.append(f"**Goal:** {goal}")
+            lines.append("")
         progress_note = str(result.get("step_progress_note", "")).strip()
         if progress_note:
             lines.append(progress_note)
+            lines.append("")
         result_summary = str(result.get("result_summary", "")).strip()
         if result_summary:
-            lines.append(f"**Findings:** {result_summary}")
+            lines.append("**Key Findings**")
+            lines.append("")
+            lines.append(result_summary)
+            lines.append("")
         evidence_ids = [str(x).strip() for x in result.get("evidence_ids", []) if str(x).strip()]
         if evidence_ids:
-            lines.append("**Evidence IDs:** " + ", ".join(f"`{eid}`" for eid in evidence_ids[:8]))
+            lines.append("**Evidence IDs**")
+            lines.append("")
+            lines.extend(f"- `{eid}`" for eid in evidence_ids[:12])
+            lines.append("")
         open_gaps = [str(x).strip() for x in result.get("open_gaps", []) if str(x).strip()]
         if open_gaps:
-            lines.append("**Open gaps:** " + "; ".join(open_gaps[:4]))
+            lines.append("**Open Gaps**")
+            lines.append("")
+            lines.extend(f"- {gap}" for gap in open_gaps[:6])
+            lines.append("")
         next_searches = [str(x).strip() for x in result.get("suggested_next_searches", []) if str(x).strip()]
         if next_searches:
-            lines.append("**Suggested next:** " + "; ".join(next_searches[:4]))
+            lines.append("**Suggested Next**")
+            lines.append("")
+            lines.extend(f"- {item}" for item in next_searches[:6])
+            lines.append("")
+        lines.append("---")
         lines.append("")
 
     completed = _completed_step_count(task_state)
@@ -742,6 +918,7 @@ def _coverage_note_from_task_state(task_state: dict[str, Any]) -> str:
     return f"_Coverage: {coverage_label} ({completed} of {total} planned steps completed)._"
 
 
+
 def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -> str:
     text = str(raw_markdown or "").strip()
     if not text:
@@ -751,16 +928,11 @@ def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -
         text = "## Final Summary\n\n" + text
 
     lowered = text.lower()
-    if "supporting evidence" not in lowered:
-        fallback_supporting = _fallback_supporting_evidence_from_task_state(task_state)
-        if fallback_supporting:
-            text += "\n\n**Supporting Evidence (Claim + Why It Matters)**\n"
-            text += "\n".join(f"- {item}" for item in fallback_supporting[:20])
 
     if "potential next steps" not in lowered and "next steps" not in lowered and "next actions" not in lowered:
         fallback_next = _fallback_next_actions_from_task_state(task_state)
         if fallback_next:
-            text += "\n\n**Potential Next Steps**\n"
+            text += "\n\n**Potential Next Steps**\n\n"
             text += "\n".join(f"- {item}" for item in fallback_next[:20])
 
     if "_coverage:" not in lowered and "coverage:" not in lowered:
@@ -867,17 +1039,29 @@ def _executor_context_instructions(task_state: dict[str, Any], active_step: dict
         "pending_steps": pending_steps,
         "prior_completed_steps": prior_completed,
     }
+    pending_count = len(pending_steps)
     return [
         "Execution context (authoritative; use this instead of inferring from prior prose):",
         _serialize_pretty_json(payload),
         (
-            "Return ONLY valid JSON matching `execution_batch_result.v1`. "
+            f"There are {pending_count} pending step(s). "
+            "Call tools for EACH pending step before returning. "
+            "Return ONLY valid JSON matching `execution_batch_result.v1` "
+            "with a result entry for every step. "
             "Do not include markdown fences or extra commentary."
         ),
     ]
 
 
-def _synth_context_instructions(task_state: dict[str, Any]) -> list[str]:
+def _resolve_source_label(tool_hint: str) -> str:
+    """Map a tool_hint to its human-readable database/source name."""
+    tool_hint = str(tool_hint or "").strip()
+    if not tool_hint:
+        return ""
+    return TOOL_SOURCE_NAMES.get(tool_hint, tool_hint)
+
+
+def _synth_context_instructions(task_state: dict[str, Any], callback_context: CallbackContext | None = None) -> list[str]:
     payload = {
         "schema": "synthesis_context.v1",
         "objective": task_state.get("objective", ""),
@@ -887,6 +1071,8 @@ def _synth_context_instructions(task_state: dict[str, Any]) -> list[str]:
             {
                 "id": step.get("id"),
                 "goal": step.get("goal"),
+                "tool_hint": step.get("tool_hint", ""),
+                "source": _resolve_source_label(step.get("tool_hint", "")),
                 "status": step.get("status"),
                 "result_summary": step.get("result_summary", ""),
                 "evidence_ids": list(step.get("evidence_ids", []) or [])[:20],
@@ -895,14 +1081,55 @@ def _synth_context_instructions(task_state: dict[str, Any]) -> list[str]:
             for step in task_state.get("steps", [])
         ],
     }
-    return [
+
+    used_sources: dict[str, str] = {}
+    for step in task_state.get("steps", []):
+        hint = str(step.get("tool_hint", "")).strip()
+        if hint and hint not in used_sources:
+            used_sources[hint] = TOOL_SOURCE_NAMES.get(hint, hint)
+    if used_sources:
+        payload["source_reference"] = {
+            tool: source for tool, source in used_sources.items()
+        }
+
+    instructions = [
         "Synthesis context (authoritative; use this instead of inferring from prior prose):",
         _serialize_pretty_json(payload),
-        (
-            "Return user-facing Markdown (not JSON). Include a direct answer, supporting evidence with rationale, "
-            "limitations, potential next steps, and a coverage note (complete vs partial plan)."
-        ),
     ]
+
+    prior: list[dict[str, Any]] = []
+    if callback_context is not None:
+        prior = _get_prior_research(callback_context)
+    if prior:
+        prior_entries = []
+        for cycle_idx, entry in enumerate(prior, start=1):
+            prior_entries.append({
+                "cycle": cycle_idx,
+                "objective": entry.get("objective", ""),
+                "plan_status": entry.get("plan_status", ""),
+                "steps": [
+                    {
+                        "id": s.get("id"),
+                        "goal": s.get("goal"),
+                        "status": s.get("status"),
+                        "result_summary": s.get("result_summary", ""),
+                        "evidence_ids": list(s.get("evidence_ids", []) or [])[:12],
+                        "open_gaps": list(s.get("open_gaps", []) or [])[:5],
+                    }
+                    for s in entry.get("steps", [])
+                ],
+                "synthesis_markdown": (entry.get("latest_synthesis") or {}).get("markdown", ""),
+            })
+        instructions.append(
+            "Prior research cycles from this session (reference and build on where relevant):"
+        )
+        instructions.append(_serialize_pretty_json(prior_entries))
+
+    instructions.append(
+        "Return user-facing Markdown (not JSON). Include a direct answer, supporting evidence with rationale, "
+        "limitations, potential next steps, and a coverage note (complete vs partial plan)."
+    )
+    return instructions
 
 
 def _validate_step_execution_result(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1032,75 +1259,264 @@ def _validate_final_synthesis(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _planner_before_model_callback(*, callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
-    _clear_turn_temp_state(callback_context)
-    user_text = _extract_user_turn_text(callback_context)
-    is_finalize = _is_finalize_command(user_text)
-    callback_context.state[STATE_FINALIZE_REQUESTED] = bool(is_finalize)
+def _make_planner_before_model_callback(*, require_approval: bool):
+    """Factory: returns a planner before-model callback.
 
-    if is_finalize:
-        return _make_text_response("")
+    When ``require_approval`` is True, the callback recognises ``approve``,
+    ``revise: <feedback>`` and ``continue``-style commands so the workflow
+    can pause after planning and resume after human review.
+    """
 
-    task_state = _get_task_state(callback_context)
-    normalized = _normalize_user_text(user_text)
-    if task_state and str(task_state.get("objective_fingerprint", "")) == normalized:
-        return _make_text_response("")
+    def _callback(*, callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
+        _clear_turn_temp_state(callback_context)
+        user_text = _extract_user_turn_text(callback_context)
+        is_finalize = _is_finalize_command(user_text)
+        callback_context.state[STATE_FINALIZE_REQUESTED] = bool(is_finalize)
 
-    if task_state and normalized and str(task_state.get("objective_fingerprint", "")) != normalized:
-        callback_context.state[STATE_WORKFLOW_TASK] = None
+        if is_finalize:
+            return _make_text_response("")
 
-    llm_request.config = llm_request.config or types.GenerateContentConfig()
-    llm_request.config.response_mime_type = "application/json"
-    llm_request.append_instructions([_planner_json_instruction_suffix()])
-    return None
+        # --- History command ---
+        if _normalize_user_text(user_text) in ("history", "/history", "list cycles"):
+            prior = _get_prior_research(callback_context)
+            current = _get_task_state(callback_context)
+            if not prior and not current:
+                callback_context.state[STATE_TURN_ABORT_REASON] = "command_handled"
+                return _make_text_response("No research history yet.")
+            lines = ["## Research History", ""]
+            for i, entry in enumerate(prior, start=1):
+                obj = str(entry.get("objective", "")).strip() or "(no objective)"
+                status = str(entry.get("plan_status", ""))
+                c = sum(1 for s in entry.get("steps", []) if str(s.get("status", "")) == "completed")
+                t = len(entry.get("steps", []))
+                lines.append(f"{i}. **{obj}** — {status} ({c}/{t} steps) — `switch {i}` to restore")
+            if current:
+                obj = str(current.get("objective", "")).strip() or "(no objective)"
+                status = str(current.get("plan_status", ""))
+                c = sum(1 for s in current.get("steps", []) if str(s.get("status", "")) == "completed")
+                t = len(current.get("steps", []))
+                lines.append(f"\n**Active:** {obj} — {status} ({c}/{t} steps)")
+            callback_context.state[STATE_TURN_ABORT_REASON] = "command_handled"
+            return _make_text_response("\n".join(lines))
 
+        # --- Rollback / switch ---
+        rollback_idx = _parse_rollback_command(user_text)
+        if rollback_idx is not None:
+            prior = _get_prior_research(callback_context)
+            if not prior:
+                callback_context.state[STATE_TURN_ABORT_REASON] = "command_handled"
+                return _make_text_response("No prior research cycles to roll back to.")
+            if rollback_idx == -1:
+                target_idx = len(prior) - 1
+            else:
+                target_idx = rollback_idx - 1
+            if target_idx < 0 or target_idx >= len(prior):
+                callback_context.state[STATE_TURN_ABORT_REASON] = "command_handled"
+                return _make_text_response(
+                    f"Invalid cycle number. Available: 1\u2013{len(prior)}."
+                )
+            _archive_current_task(callback_context)
+            restored = prior.pop(target_idx)
+            callback_context.state[STATE_PRIOR_RESEARCH] = prior
+            callback_context.state[STATE_WORKFLOW_TASK] = restored
+            obj = str(restored.get("objective", "")).strip()
+            completed = sum(
+                1 for s in restored.get("steps", [])
+                if str(s.get("status", "")) == "completed"
+            )
+            total = len(restored.get("steps", []))
+            plan_status = str(restored.get("plan_status", ""))
+            rendered = (
+                f"## Restored Research Cycle {target_idx + 1}\n\n"
+                f"**Objective:** {obj}\n\n"
+                f"**Status:** {plan_status} ({completed}/{total} steps completed)\n\n"
+                "Send `finalize` to regenerate the report, or `continue` to resume execution."
+            )
+            callback_context.state[STATE_TURN_ABORT_REASON] = "command_handled"
+            return _make_text_response(rendered)
 
-def _planner_after_model_callback(*, callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
-    if _llm_response_has_function_call(llm_response):
+        # --- HITL approval gate ---
+        if require_approval and bool(callback_context.state.get(STATE_PLAN_PENDING_APPROVAL, False)):
+            if _is_plan_approval_command(user_text):
+                callback_context.state[STATE_PLAN_PENDING_APPROVAL] = False
+                return _make_text_response("")
+
+            revision_feedback = _extract_revision_feedback(user_text)
+            if revision_feedback is not None:
+                task_state = _get_task_state(callback_context)
+                original_objective = task_state.get("objective", "") if task_state else ""
+                _archive_current_task(callback_context)
+                callback_context.state[STATE_WORKFLOW_TASK] = None
+                callback_context.state[STATE_PLAN_PENDING_APPROVAL] = False
+                llm_request.config = llm_request.config or types.GenerateContentConfig()
+                llm_request.config.response_mime_type = "application/json"
+                llm_request.append_instructions([
+                    f"Revise the previous plan for this objective: {original_objective}",
+                    f"User revision feedback: {revision_feedback}",
+                    "Generate an updated plan that addresses the feedback.",
+                    _planner_json_instruction_suffix(),
+                ])
+                return None
+
+            callback_context.state[STATE_PLAN_PENDING_APPROVAL] = False
+            _archive_current_task(callback_context)
+            callback_context.state[STATE_WORKFLOW_TASK] = None
+
+        # --- HITL: let continuation commands pass through to executor ---
+        if require_approval:
+            task_state = _get_task_state(callback_context)
+            if task_state:
+                plan_status = str(task_state.get("plan_status", ""))
+                if plan_status in ("ready", "blocked") and _is_continue_execution_command(user_text):
+                    return _make_text_response("")
+
+        # --- Original logic ---
+        task_state = _get_task_state(callback_context)
+        normalized = _normalize_user_text(user_text)
+        if task_state and str(task_state.get("objective_fingerprint", "")) == normalized:
+            return _make_text_response("")
+
+        if task_state and normalized and str(task_state.get("objective_fingerprint", "")) != normalized:
+            _archive_current_task(callback_context)
+            callback_context.state[STATE_WORKFLOW_TASK] = None
+
+        llm_request.config = llm_request.config or types.GenerateContentConfig()
+        llm_request.config.response_mime_type = "application/json"
+        llm_request.append_instructions([_planner_json_instruction_suffix()])
         return None
 
-    text = _llm_response_text(llm_response)
-    if bool(getattr(llm_response, "partial", False)):
-        _buffer_partial_text(callback_context, STATE_PLANNER_BUFFER, text)
-        return _replace_llm_response_text(llm_response, "")
+    return _callback
 
-    parsed, parse_error = _consume_buffered_json_object(
-        callback_context,
-        buffer_key=STATE_PLANNER_BUFFER,
-        llm_response=llm_response,
+
+def _make_planner_after_model_callback(*, require_approval: bool):
+    """Factory: returns a planner after-model callback.
+
+    When ``require_approval`` is True the rendered plan is appended with
+    an approval prompt and ``STATE_PLAN_PENDING_APPROVAL`` is set.
+    """
+
+    def _callback(*, callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
+        if _llm_response_has_function_call(llm_response):
+            return None
+
+        text = _llm_response_text(llm_response)
+        if bool(getattr(llm_response, "partial", False)):
+            _buffer_partial_text(callback_context, STATE_PLANNER_BUFFER, text)
+            return _replace_llm_response_text(llm_response, "")
+
+        parsed, parse_error = _consume_buffered_json_object(
+            callback_context,
+            buffer_key=STATE_PLANNER_BUFFER,
+            llm_response=llm_response,
+        )
+        if parsed is None:
+            callback_context.state[STATE_TURN_ABORT_REASON] = "planner_parse_error"
+            rendered = _render_parse_error_markdown("Planner", parse_error or "Failed to parse plan JSON", text)
+            _set_turn_rendered_output(callback_context, key=STATE_PLANNER_RENDERED, text=rendered)
+            return _replace_llm_response_text(llm_response, rendered)
+
+        objective_text = _extract_user_turn_text(callback_context)
+        try:
+            task_state = _initialize_task_state_from_plan(parsed, objective_text=objective_text)
+        except Exception as exc:  # noqa: BLE001
+            callback_context.state[STATE_TURN_ABORT_REASON] = "planner_validation_error"
+            rendered = _render_parse_error_markdown("Planner", str(exc), text)
+            _set_turn_rendered_output(callback_context, key=STATE_PLANNER_RENDERED, text=rendered)
+            return _replace_llm_response_text(llm_response, rendered)
+
+        callback_context.state[STATE_WORKFLOW_TASK] = task_state
+        rendered = _render_plan_markdown(task_state)
+
+        if require_approval:
+            callback_context.state[STATE_PLAN_PENDING_APPROVAL] = True
+            rendered += _render_plan_approval_prompt()
+
+        _set_turn_rendered_output(callback_context, key=STATE_PLANNER_RENDERED, text=rendered)
+        return _replace_llm_response_text(llm_response, rendered)
+
+    return _callback
+
+
+def _on_model_error(
+    *,
+    callback_context: CallbackContext,
+    llm_request: LlmRequest,
+    error: Exception,
+) -> LlmResponse | None:
+    """Surface model-level errors (rate limits, network, etc.) as visible output."""
+    error_type = type(error).__name__
+    error_msg = str(error)
+    logger.error("Model error in %s: [%s] %s", "agent", error_type, error_msg)
+
+    is_rate_limit = any(
+        hint in error_msg.lower()
+        for hint in ("429", "resource exhausted", "rate limit", "quota")
     )
-    if parsed is None:
-        callback_context.state[STATE_TURN_ABORT_REASON] = "planner_parse_error"
-        rendered = _render_parse_error_markdown("Planner", parse_error or "Failed to parse plan JSON", text)
-        _set_turn_rendered_output(callback_context, key=STATE_PLANNER_RENDERED, text=rendered)
-        return _replace_llm_response_text(llm_response, rendered)
+    if is_rate_limit:
+        user_msg = (
+            "## Execution Paused — Rate Limit\n\n"
+            "The model API returned a rate-limit error. "
+            "Please wait a moment and send `continue` to resume."
+        )
+    else:
+        user_msg = (
+            f"## Execution Error\n\n"
+            f"A model error occurred: **{error_type}**\n\n"
+            f"`{error_msg[:300]}`\n\n"
+            "Send `continue` to retry."
+        )
+    return _make_text_response(user_msg)
 
-    try:
-        task_state = _initialize_task_state_from_plan(parsed, objective_text=_extract_user_turn_text(callback_context))
-    except Exception as exc:  # noqa: BLE001
-        callback_context.state[STATE_TURN_ABORT_REASON] = "planner_validation_error"
-        rendered = _render_parse_error_markdown("Planner", str(exc), text)
-        _set_turn_rendered_output(callback_context, key=STATE_PLANNER_RENDERED, text=rendered)
-        return _replace_llm_response_text(llm_response, rendered)
 
-    callback_context.state[STATE_WORKFLOW_TASK] = task_state
-    rendered = _render_plan_markdown(task_state)
-    _set_turn_rendered_output(callback_context, key=STATE_PLANNER_RENDERED, text=rendered)
-    return _replace_llm_response_text(llm_response, rendered)
+def _on_tool_error(
+    tool: BaseTool,
+    args: dict[str, Any],
+    tool_context: ToolContext,
+    error: Exception,
+) -> dict | None:
+    """Surface tool-level errors as a result the LLM can see and adapt to."""
+    error_type = type(error).__name__
+    error_msg = str(error)
+    tool_name = getattr(tool, "name", "unknown_tool")
+    logger.error("Tool error in %s: [%s] %s", tool_name, error_type, error_msg)
+
+    return {
+        "error": True,
+        "error_type": error_type,
+        "message": f"Tool '{tool_name}' failed: {error_msg[:500]}",
+        "suggestion": "Try an alternative tool or skip this step.",
+    }
+
+
+def _hitl_skip_agent(*, callback_context: CallbackContext) -> types.Content | None:
+    """before_agent_callback shared by executor and synth when HITL is active.
+
+    Returns Content (skipping the agent entirely) when the plan is still
+    awaiting human approval.  Returns None to let the agent run normally.
+    """
+    if bool(callback_context.state.get(STATE_PLAN_PENDING_APPROVAL, False)):
+        return types.Content(role="model", parts=[types.Part.from_text(text="")])
+    return None
 
 
 def _executor_before_model_callback(*, callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
     if bool(callback_context.state.get(STATE_FINALIZE_REQUESTED, False)):
+        logger.info("[executor:before] skipping — finalize requested")
         return _make_text_response("")
-    if str(callback_context.state.get(STATE_TURN_ABORT_REASON, "")).strip():
+    abort = str(callback_context.state.get(STATE_TURN_ABORT_REASON, "")).strip()
+    if abort:
+        logger.info("[executor:before] skipping — abort reason: %s", abort)
         return _make_text_response("")
 
     task_state = _get_task_state(callback_context)
     if not task_state:
+        logger.warning("[executor:before] skipping — no task state")
         return _make_text_response("")
 
     current_step_id = str(task_state.get("current_step_id") or "").strip()
-    if not current_step_id or str(task_state.get("plan_status", "")) == "completed":
+    plan_status = str(task_state.get("plan_status", ""))
+    if not current_step_id or plan_status == "completed":
+        logger.info("[executor:before] all steps complete (plan_status=%s)", plan_status)
         rendered = _render_all_steps_complete_message()
         _set_turn_rendered_output(callback_context, key=STATE_EXECUTOR_RENDERED, text=rendered)
         return _make_text_response(rendered)
@@ -1108,6 +1524,7 @@ def _executor_before_model_callback(*, callback_context: CallbackContext, llm_re
     try:
         _, active_step = _find_step(task_state, current_step_id)
     except Exception as exc:  # noqa: BLE001
+        logger.error("[executor:before] bad task state: %s", exc)
         callback_context.state[STATE_TURN_ABORT_REASON] = "executor_state_error"
         rendered = f"## Execution\n\nInvalid task state: {exc}"
         _set_turn_rendered_output(callback_context, key=STATE_EXECUTOR_RENDERED, text=rendered)
@@ -1121,9 +1538,16 @@ def _executor_before_model_callback(*, callback_context: CallbackContext, llm_re
         task_state["steps"] = task_state.get("steps", [])
         callback_context.state[STATE_WORKFLOW_TASK] = task_state
 
+    pending_count = sum(
+        1 for s in task_state.get("steps", [])
+        if str(s.get("status", "")).strip() in {"pending", "in_progress"}
+    )
+    logger.info(
+        "[executor:before] active_step=%s, pending=%d, injecting context",
+        current_step_id, pending_count,
+    )
+
     llm_request.config = llm_request.config or types.GenerateContentConfig()
-    # Gemini tool/function calling is incompatible with forcing application/json response MIME.
-    # Keep executor JSON output prompt-enforced instead, since this agent uses MCP tools.
     llm_request.config.response_mime_type = None
     llm_request.append_instructions(_executor_context_instructions(task_state, active_step))
     return None
@@ -1131,6 +1555,7 @@ def _executor_before_model_callback(*, callback_context: CallbackContext, llm_re
 
 def _executor_after_model_callback(*, callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
     if _llm_response_has_function_call(llm_response):
+        logger.debug("[executor:after] response has function_call — continuing tool loop")
         callback_context.state[STATE_EXECUTOR_BUFFER] = ""
         return None
 
@@ -1140,7 +1565,10 @@ def _executor_after_model_callback(*, callback_context: CallbackContext, llm_res
         return _replace_llm_response_text(llm_response, "")
 
     if not text and not str(callback_context.state.get(STATE_EXECUTOR_BUFFER, "") or ""):
+        logger.warning("[executor:after] empty text response and no buffer — returning None")
         return None
+
+    logger.info("[executor:after] received text response (%d chars), parsing JSON", len(text))
 
     parsed, parse_error = _consume_buffered_json_object(
         callback_context,
@@ -1168,6 +1596,10 @@ def _executor_after_model_callback(*, callback_context: CallbackContext, llm_res
         callback_context.state[STATE_WORKFLOW_TASK] = task_state
 
     if parsed is None or task_state is None:
+        logger.warning(
+            "[executor:after] parse failed (task_state=%s, parse_error=%s), text[:200]=%s",
+            "present" if task_state else "MISSING", parse_error, text[:200],
+        )
         _restore_step_status_on_failure()
         _clear_executor_run_temps()
         callback_context.state[STATE_TURN_ABORT_REASON] = "executor_parse_error"
@@ -1178,6 +1610,7 @@ def _executor_after_model_callback(*, callback_context: CallbackContext, llm_res
     try:
         applied_results = _apply_execution_batch_result_to_task_state(task_state, parsed)
     except Exception as exc:  # noqa: BLE001
+        logger.error("[executor:after] validation error: %s", exc)
         _restore_step_status_on_failure()
         _clear_executor_run_temps()
         callback_context.state[STATE_TURN_ABORT_REASON] = "executor_validation_error"
@@ -1185,8 +1618,16 @@ def _executor_after_model_callback(*, callback_context: CallbackContext, llm_res
         _set_turn_rendered_output(callback_context, key=STATE_EXECUTOR_RENDERED, text=rendered)
         return _replace_llm_response_text(llm_response, rendered)
 
+    completed = _completed_step_count(task_state)
+    total = _total_step_count(task_state)
+    new_plan_status = str(task_state.get("plan_status", ""))
+    logger.info(
+        "[executor:after] applied %d step results, %d/%d complete, plan_status=%s, auto_synth=%s",
+        len(applied_results), completed, total, new_plan_status, new_plan_status == "completed",
+    )
+
     callback_context.state[STATE_WORKFLOW_TASK] = task_state
-    callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = str(task_state.get("plan_status", "")) == "completed"
+    callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = new_plan_status == "completed"
     _clear_executor_run_temps()
     rendered = _render_executor_batch_progress_markdown(task_state, applied_results)
     _set_turn_rendered_output(callback_context, key=STATE_EXECUTOR_RENDERED, text=rendered)
@@ -1196,11 +1637,20 @@ def _executor_after_model_callback(*, callback_context: CallbackContext, llm_res
 def _synth_before_model_callback(*, callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
     wants_finalize = bool(callback_context.state.get(STATE_FINALIZE_REQUESTED, False))
     wants_auto_synth = bool(callback_context.state.get(STATE_AUTO_SYNTH_REQUESTED, False))
-    if not wants_finalize and not wants_auto_synth:
-        return _make_text_response(_compose_non_finalize_turn_output(callback_context))
+    abort_reason = str(callback_context.state.get(STATE_TURN_ABORT_REASON, "")).strip()
 
-    if str(callback_context.state.get(STATE_TURN_ABORT_REASON, "")).strip():
-        return _make_text_response(_compose_non_finalize_turn_output(callback_context))
+    if not wants_finalize and not wants_auto_synth:
+        text = _compose_non_finalize_turn_output(callback_context)
+        logger.info(
+            "[synth:before] non-finalize path (finalize=%s, auto_synth=%s, abort=%s), output_len=%d",
+            wants_finalize, wants_auto_synth, abort_reason or "none", len(text),
+        )
+        return _make_text_response(text)
+
+    if abort_reason:
+        text = _compose_non_finalize_turn_output(callback_context)
+        logger.info("[synth:before] abort path (%s), output_len=%d", abort_reason, len(text))
+        return _make_text_response(text)
 
     task_state = _get_task_state(callback_context)
     if not task_state:
@@ -1209,7 +1659,7 @@ def _synth_before_model_callback(*, callback_context: CallbackContext, llm_reque
     callback_context.state[STATE_SYNTH_BUFFER] = ""
     llm_request.config = llm_request.config or types.GenerateContentConfig()
     llm_request.config.response_mime_type = None
-    llm_request.append_instructions(_synth_context_instructions(task_state))
+    llm_request.append_instructions(_synth_context_instructions(task_state, callback_context))
     return None
 
 
@@ -1300,8 +1750,15 @@ def create_workflow_agent(
     model: str | None = None,
     max_plan_iterations: int | None = None,
     prefer_bigquery: bool | None = None,
+    require_plan_approval: bool = False,
 ) -> tuple[SequentialAgent, McpToolset | None]:
-    """Create an ADK-native workflow graph and return (root_agent, mcp_toolset)."""
+    """Create an ADK-native workflow graph and return (root_agent, mcp_toolset).
+
+    Args:
+        require_plan_approval: When True, the workflow pauses after plan
+            generation and waits for the user to ``approve`` or
+            ``revise: <feedback>`` before executing the plan.
+    """
     del max_plan_iterations
 
     runtime_model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
@@ -1319,6 +1776,8 @@ def create_workflow_agent(
     else:
         executor_tool_hints = base_tool_hints
 
+    hitl_agent_gate = _hitl_skip_agent if require_plan_approval else None
+
     planner = LlmAgent(
         name="planner",
         model=runtime_model,
@@ -1328,8 +1787,12 @@ def create_workflow_agent(
         ),
         tools=[],
         disallow_transfer_to_parent=True,
-        before_model_callback=_planner_before_model_callback,
-        after_model_callback=_planner_after_model_callback,
+        before_model_callback=_make_planner_before_model_callback(
+            require_approval=require_plan_approval,
+        ),
+        after_model_callback=_make_planner_after_model_callback(
+            require_approval=require_plan_approval,
+        ),
     )
     evidence_executor = LlmAgent(
         name="evidence_executor",
@@ -1339,16 +1802,21 @@ def create_workflow_agent(
             prefer_bigquery=use_bigquery_priority,
         ),
         tools=executor_tools,
+        before_agent_callback=hitl_agent_gate,
         before_model_callback=_executor_before_model_callback,
         after_model_callback=_executor_after_model_callback,
+        on_model_error_callback=_on_model_error,
+        on_tool_error_callback=_on_tool_error,
     )
     report_synthesizer = LlmAgent(
         name="report_synthesizer",
         model=runtime_model,
         instruction=SYNTHESIZER_INSTRUCTION,
         tools=[],
+        before_agent_callback=hitl_agent_gate,
         before_model_callback=_synth_before_model_callback,
         after_model_callback=_synth_after_model_callback,
+        on_model_error_callback=_on_model_error,
     )
 
     root = SequentialAgent(
