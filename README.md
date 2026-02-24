@@ -116,6 +116,24 @@ The reasoning trace captures the full decision chain per step ("searched X becau
 - **Source citations** — final reports cite human-readable database names (PubMed, ClinicalTrials.gov, etc.), never raw tool names or JSON URLs.
 - **Research history** — up to 10 prior research cycles are archived with full state; rollback restores any previous cycle.
 
+## Example Queries
+
+```
+Is PCSK9 likely to succeed in clinical trials for cardiovascular disease?
+```
+```
+Find researchers who have published on idiopathic pulmonary fibrosis (IPF) treatment in the last 3 years
+```
+```
+Evaluate LRRK2 as a drug target for Parkinson disease — what is the genetic evidence, druggability, and competitive landscape?
+```
+```
+Compare BRCA1 and BRCA2 as therapeutic targets in ovarian cancer across genetic association, safety, and pipeline activity
+```
+```
+What are the known safety liabilities of targeting JAK1 in rheumatoid arthritis, and how do they compare to IL-6 inhibition?
+```
+
 ## Quick Start
 
 ### Prerequisites
