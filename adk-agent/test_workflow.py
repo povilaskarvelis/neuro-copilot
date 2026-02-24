@@ -1,4 +1,4 @@
-from google.adk.agents import LlmAgent, SequentialAgent
+from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 
 import co_scientist.workflow as workflow
 from co_scientist.workflow import create_workflow_agent
@@ -12,23 +12,26 @@ def test_native_workflow_graph_shape():
     top_level_names = [sub_agent.name for sub_agent in root_agent.sub_agents]
     assert top_level_names == [
         "planner",
-        "evidence_executor",
+        "react_loop",
         "report_synthesizer",
     ]
-    assert "plan_approval_loop" not in top_level_names
-    assert "evidence_refinement_loop" not in top_level_names
 
     planner_agent = root_agent.sub_agents[0]
     assert isinstance(planner_agent, LlmAgent)
     assert planner_agent.before_model_callback is not None
     assert planner_agent.after_model_callback is not None
 
-    evidence_executor = root_agent.sub_agents[1]
-    assert isinstance(evidence_executor, LlmAgent)
-    assert evidence_executor.tools == []
-    assert evidence_executor.before_model_callback is not None
-    assert evidence_executor.after_model_callback is not None
-    assert evidence_executor.before_agent_callback is None
+    react_loop = root_agent.sub_agents[1]
+    assert isinstance(react_loop, LoopAgent)
+    assert react_loop.max_iterations == 25
+    assert len(react_loop.sub_agents) == 1
+    assert react_loop.before_agent_callback is None
+
+    step_executor = react_loop.sub_agents[0]
+    assert isinstance(step_executor, LlmAgent)
+    assert step_executor.tools == []
+    assert step_executor.before_model_callback is not None
+    assert step_executor.after_model_callback is not None
 
     report_agent = root_agent.sub_agents[2]
     assert isinstance(report_agent, LlmAgent)
@@ -46,14 +49,15 @@ def test_native_workflow_graph_shape_with_hitl():
     top_level_names = [sub_agent.name for sub_agent in root_agent.sub_agents]
     assert top_level_names == [
         "planner",
-        "evidence_executor",
+        "react_loop",
         "report_synthesizer",
     ]
-    for sub_agent in root_agent.sub_agents:
-        assert sub_agent.before_model_callback is not None
-    executor = root_agent.sub_agents[1]
+
+    react_loop = root_agent.sub_agents[1]
+    assert isinstance(react_loop, LoopAgent)
+    assert react_loop.before_agent_callback is not None
+
     synth = root_agent.sub_agents[2]
-    assert executor.before_agent_callback is not None
     assert synth.before_agent_callback is not None
 
 
@@ -173,3 +177,37 @@ def test_coverage_status_complete_vs_partial():
     assert workflow._compute_coverage_status(task_state) == "partial_plan"
     task_state["steps"][1]["status"] = "completed"
     assert workflow._compute_coverage_status(task_state) == "complete_plan"
+
+
+def test_react_step_rendering_includes_trace():
+    task_state = {
+        "objective": "test",
+        "plan_status": "ready",
+        "current_step_id": "S2",
+        "steps": [
+            {"id": "S1", "status": "completed", "goal": "Find papers"},
+            {"id": "S2", "status": "pending", "goal": "Check trials"},
+        ],
+    }
+    result = {
+        "step_id": "S1",
+        "status": "completed",
+        "step_progress_note": "Done.",
+        "result_summary": "Found 5 papers.",
+        "evidence_ids": ["PMID:111"],
+        "open_gaps": [],
+    }
+    rendered = workflow._render_react_step_progress(
+        task_state, result, "Searched PubMed for LRRK2, found 5 relevant RCTs."
+    )
+    assert "Reasoning:" in rendered
+    assert "LRRK2" in rendered
+    assert "PMID:111" in rendered
+    assert "1/2 steps complete" in rendered
+
+
+def test_resolve_source_label():
+    assert workflow._resolve_source_label("search_pubmed") == "PubMed"
+    assert workflow._resolve_source_label("search_clinical_trials") == "ClinicalTrials.gov"
+    assert workflow._resolve_source_label("unknown_tool") == "unknown_tool"
+    assert workflow._resolve_source_label("") == ""

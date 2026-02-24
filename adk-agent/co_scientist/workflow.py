@@ -1,8 +1,10 @@
 """
 ADK-native orchestration graph for the Co-Scientist agent.
 
-This workflow keeps a flat agent graph (planner -> executor -> synthesizer),
-but maintains structured step state in ADK session state via callbacks.
+Architecture: SequentialAgent[planner → LoopAgent[step_executor] → synthesizer].
+The LoopAgent implements a ReAct (Reason-Act-Observe) cycle, executing one plan
+step per iteration with explicit reasoning traces. Step state is maintained in
+ADK session state via callbacks.
 """
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from google.adk.agents import LlmAgent, SequentialAgent
+from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
@@ -54,6 +56,8 @@ STATE_SYNTH_BUFFER = "temp:co_scientist_synth_stream_buffer"
 STATE_PLANNER_RENDERED = "temp:co_scientist_planner_rendered"
 STATE_EXECUTOR_RENDERED = "temp:co_scientist_executor_rendered"
 STATE_EXECUTOR_ACTIVE_STEP_ID = "temp:co_scientist_executor_active_step_id"
+STATE_REACT_PARSE_RETRIES = "temp:co_scientist_react_parse_retries"
+MAX_REACT_PARSE_RETRIES = 2
 STATE_EXECUTOR_PREV_STEP_STATUS = "temp:co_scientist_executor_prev_step_status"
 STATE_PLAN_PENDING_APPROVAL = "co_scientist_plan_pending_approval"
 
@@ -84,7 +88,6 @@ CONTINUE_EXECUTION_COMMANDS = {
 
 PLAN_SCHEMA = "plan_internal.v1"
 STEP_RESULT_SCHEMA = "step_execution_result.v1"
-EXECUTION_BATCH_SCHEMA = "execution_batch_result.v1"
 FINAL_SYNTHESIS_SCHEMA = "final_synthesis.v1"
 WORKFLOW_TASK_SCHEMA = "workflow_task_state.v1"
 
@@ -208,43 +211,42 @@ Output requirements:
 """
 
 
-EVIDENCE_EXECUTOR_INSTRUCTION_TEMPLATE = """
-You execute biomedical evidence collection and validation.
-Use a ReAct-style workflow internally: decide the next action, use MCP tools, observe results, and reassess.
+STEP_EXECUTOR_INSTRUCTION_TEMPLATE = """
+You execute ONE plan step at a time using biomedical research tools.
+Follow a strict Reason-Act-Observe cycle:
+
+1. REASON: Read the current step goal and think about what information you need and which tool/query is best.
+2. ACT: Call the appropriate MCP tool.
+3. OBSERVE: Review the tool results. If insufficient or the completion condition is not met, reason again and try a different query or tool.
+4. CONCLUDE: When the step's completion condition is met (or the step is blocked), return your result.
 
 Available MCP tools:
 __TOOL_CATALOG__
 
 Rules:
-- Execute ALL pending plan steps provided in the injected execution context, in order.
-- You MUST call at least one tool for EACH pending step before returning results.
-- Do NOT return the batch result JSON until you have attempted every pending step.
-- If a tool call fails, try an alternative tool or mark the step as blocked.
-- If a step is blocked, continue with the remaining steps (do not stop early).
-- Use MCP tools only when they directly improve evidence quality.
+- Focus ONLY on the current step provided in the execution context.
+- You MUST call at least one tool before returning a result.
+- If a tool call fails or returns insufficient data, try an alternative tool or query.
+- If no tool can satisfy the step, mark it as blocked with a clear reason.
 - Prioritize high-signal evidence before broad expansion.
 - Surface contradictions and unresolved gaps explicitly.
 - Include source identifiers when available (PMID, DOI, NCT, OpenAlex IDs).
 __BQ_POLICY__
 
 Output requirements:
-- IMPORTANT: Only return the JSON after you have called tools for ALL pending steps.
-- The step_results array MUST contain an entry for every step you were asked to execute.
 - Return ONLY valid JSON (no markdown, no prose) matching this shape:
   {
-    "schema": "execution_batch_result.v1",
-    "step_results": [
-      {
-        "step_id": "S1",
-        "status": "completed" | "blocked",
-        "step_progress_note": "<1-2 sentence progress update>",
-        "result_summary": "<concise findings summary>",
-        "evidence_ids": ["PMID:...", "NCT:..."],
-        "open_gaps": ["..."],
-        "suggested_next_searches": ["..."]
-      }
-    ]
+    "schema": "step_execution_result.v1",
+    "step_id": "S1",
+    "reasoning_trace": "<your reasoning: what you searched, why, what you observed, and your conclusion>",
+    "status": "completed" | "blocked",
+    "step_progress_note": "<1-2 sentence progress update>",
+    "result_summary": "<concise findings summary>",
+    "evidence_ids": ["PMID:...", "NCT:..."],
+    "open_gaps": ["..."],
+    "suggested_next_searches": ["..."]
   }
+- The reasoning_trace MUST describe your Reason-Act-Observe chain: what you searched, why you chose that approach, what the results showed, and how you reached your conclusion.
 """
 
 
@@ -280,6 +282,7 @@ Output requirements:
 - Return user-facing Markdown.
 - Start with `## Final Summary`.
 - Present findings grouped by step. For each step, state the source explicitly on its own line before the findings, e.g.:
+  
   **Source:** PubMed
   Three RCTs (PMID: 12345678, PMID: 23456789) demonstrated...
 - End with `Limitations` and `Potential Next Steps` sections.
@@ -419,10 +422,23 @@ def _clear_turn_temp_state(callback_context: CallbackContext) -> None:
     callback_context.state[STATE_EXECUTOR_RENDERED] = ""
     callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = ""
     callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = ""
+    callback_context.state[STATE_REACT_PARSE_RETRIES] = 0
 
 
 def _set_turn_rendered_output(callback_context: CallbackContext, *, key: str, text: str) -> None:
     callback_context.state[key] = str(text or "")
+
+
+def _append_executor_rendered(callback_context: CallbackContext, text: str) -> None:
+    """Accumulate executor rendered output across LoopAgent iterations."""
+    existing = str(callback_context.state.get(STATE_EXECUTOR_RENDERED, "") or "").strip()
+    new_text = str(text or "").strip()
+    if not new_text:
+        return
+    if existing:
+        callback_context.state[STATE_EXECUTOR_RENDERED] = existing + "\n\n" + new_text
+    else:
+        callback_context.state[STATE_EXECUTOR_RENDERED] = new_text
 
 
 def _compose_non_finalize_turn_output(callback_context: CallbackContext) -> str:
@@ -792,62 +808,50 @@ def _render_executor_progress_markdown(task_state: dict[str, Any], step_result: 
     return "\n".join(lines).strip()
 
 
-def _render_executor_batch_progress_markdown(task_state: dict[str, Any], step_results: list[dict[str, Any]]) -> str:
-    lines = ["## Execution Progress", ""]
-    for result in step_results:
-        step_id = str(result.get("step_id", "")).strip()
-        try:
-            _, step = _find_step(task_state, step_id)
-        except Exception:  # noqa: BLE001
-            step = {}
-        status = str(result.get("status", step.get("status", ""))).strip()
-        goal = str(step.get("goal", "")).strip()
-        lines.append(f"### {step_id} \u00b7 `{status}`")
+
+def _render_react_step_progress(task_state: dict[str, Any], result: dict[str, Any], reasoning_trace: str) -> str:
+    """Render progress for a single ReAct step iteration."""
+    step_id = str(result.get("step_id", "")).strip()
+    try:
+        _, step = _find_step(task_state, step_id)
+    except Exception:  # noqa: BLE001
+        step = {}
+    status = str(result.get("status", step.get("status", ""))).strip()
+    goal = str(step.get("goal", "")).strip()
+
+    lines = [f"### {step_id} · `{status}`", ""]
+    if goal:
+        lines.extend([f"**Goal:** {goal}", ""])
+    if reasoning_trace:
+        lines.extend([f"**Reasoning:** {reasoning_trace}", ""])
+    progress_note = str(result.get("step_progress_note", "")).strip()
+    if progress_note:
+        lines.extend([progress_note, ""])
+    result_summary = str(result.get("result_summary", "")).strip()
+    if result_summary:
+        lines.extend(["**Key Findings**", "", result_summary, ""])
+    evidence_ids = [str(x).strip() for x in result.get("evidence_ids", []) if str(x).strip()]
+    if evidence_ids:
+        lines.extend(["**Evidence IDs**", ""])
+        lines.extend(f"- `{eid}`" for eid in evidence_ids[:12])
         lines.append("")
-        if goal:
-            lines.append(f"**Goal:** {goal}")
-            lines.append("")
-        progress_note = str(result.get("step_progress_note", "")).strip()
-        if progress_note:
-            lines.append(progress_note)
-            lines.append("")
-        result_summary = str(result.get("result_summary", "")).strip()
-        if result_summary:
-            lines.append("**Key Findings**")
-            lines.append("")
-            lines.append(result_summary)
-            lines.append("")
-        evidence_ids = [str(x).strip() for x in result.get("evidence_ids", []) if str(x).strip()]
-        if evidence_ids:
-            lines.append("**Evidence IDs**")
-            lines.append("")
-            lines.extend(f"- `{eid}`" for eid in evidence_ids[:12])
-            lines.append("")
-        open_gaps = [str(x).strip() for x in result.get("open_gaps", []) if str(x).strip()]
-        if open_gaps:
-            lines.append("**Open Gaps**")
-            lines.append("")
-            lines.extend(f"- {gap}" for gap in open_gaps[:6])
-            lines.append("")
-        next_searches = [str(x).strip() for x in result.get("suggested_next_searches", []) if str(x).strip()]
-        if next_searches:
-            lines.append("**Suggested Next**")
-            lines.append("")
-            lines.extend(f"- {item}" for item in next_searches[:6])
-            lines.append("")
-        lines.append("---")
+    open_gaps = [str(x).strip() for x in result.get("open_gaps", []) if str(x).strip()]
+    if open_gaps:
+        lines.extend(["**Open Gaps**", ""])
+        lines.extend(f"- {gap}" for gap in open_gaps[:6])
         lines.append("")
 
     completed = _completed_step_count(task_state)
     total = _total_step_count(task_state)
-    if str(task_state.get("plan_status", "")) == "completed":
-        footer = f"Completed {completed}/{total} steps; generating final summary."
-    elif str(task_state.get("plan_status", "")) == "blocked":
-        footer = f"Completed {completed}/{total} steps; blocked at {task_state.get('current_step_id')}"
+    plan_status = str(task_state.get("plan_status", ""))
+    if plan_status == "completed":
+        lines.append(f"_Progress: {completed}/{total} steps complete — generating final summary._")
     else:
-        footer = f"Completed {completed}/{total} steps; next: {task_state.get('current_step_id')}"
-    lines.append(f"_Progress: {footer}_")
-    return "\n".join(line for line in lines if line is not None).strip()
+        next_id = str(task_state.get("current_step_id") or "")
+        lines.append(f"_Progress: {completed}/{total} steps complete. Next: {next_id}_")
+    lines.append("")
+    lines.append("---")
+    return "\n".join(lines).strip()
 
 
 def _fallback_supporting_evidence_from_task_state(task_state: dict[str, Any]) -> list[str]:
@@ -1014,40 +1018,33 @@ def _planner_json_instruction_suffix() -> str:
     )
 
 
-def _executor_context_instructions(task_state: dict[str, Any], active_step: dict[str, Any]) -> list[str]:
+def _react_step_context_instructions(task_state: dict[str, Any], active_step: dict[str, Any]) -> list[str]:
+    """Build context for the ReAct step executor — focuses on ONE step."""
     prior_completed = _compact_completed_step_summaries(task_state)
-    pending_steps = [
-        {
-            "id": step.get("id"),
-            "goal": step.get("goal"),
-            "tool_hint": step.get("tool_hint"),
-            "completion_condition": step.get("completion_condition"),
-        }
-        for step in task_state.get("steps", [])
-        if str(step.get("status", "")).strip() in {"pending", "in_progress"}
-    ]
+    remaining_count = sum(
+        1 for s in task_state.get("steps", [])
+        if str(s.get("status", "")).strip() in {"pending", "in_progress"}
+    )
     payload = {
-        "schema": "executor_plan_context.v1",
+        "schema": "react_step_context.v1",
         "objective": task_state.get("objective", ""),
-        "plan_status": task_state.get("plan_status", "ready"),
-        "active_step": {
+        "current_step": {
             "id": active_step.get("id"),
             "goal": active_step.get("goal"),
             "tool_hint": active_step.get("tool_hint"),
             "completion_condition": active_step.get("completion_condition"),
         },
-        "pending_steps": pending_steps,
+        "remaining_steps_after_this": remaining_count - 1,
         "prior_completed_steps": prior_completed,
     }
-    pending_count = len(pending_steps)
     return [
         "Execution context (authoritative; use this instead of inferring from prior prose):",
         _serialize_pretty_json(payload),
         (
-            f"There are {pending_count} pending step(s). "
-            "Call tools for EACH pending step before returning. "
-            "Return ONLY valid JSON matching `execution_batch_result.v1` "
-            "with a result entry for every step. "
+            f"Execute ONLY step {active_step.get('id')}. "
+            f"There are {remaining_count - 1} more step(s) after this one. "
+            "Call at least one tool, then return ONLY valid JSON matching "
+            "`step_execution_result.v1`. Include your reasoning_trace. "
             "Do not include markdown fences or extra commentary."
         ),
     ]
@@ -1074,6 +1071,7 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
                 "tool_hint": step.get("tool_hint", ""),
                 "source": _resolve_source_label(step.get("tool_hint", "")),
                 "status": step.get("status"),
+                "reasoning_trace": step.get("reasoning_trace", ""),
                 "result_summary": step.get("result_summary", ""),
                 "evidence_ids": list(step.get("evidence_ids", []) or [])[:20],
                 "open_gaps": list(step.get("open_gaps", []) or [])[:10],
@@ -1154,30 +1152,6 @@ def _validate_step_execution_result(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_execution_batch_result(raw: dict[str, Any]) -> dict[str, Any]:
-    if str(raw.get("schema", "")).strip() != EXECUTION_BATCH_SCHEMA:
-        raise ValueError(f"schema must be {EXECUTION_BATCH_SCHEMA}")
-    step_results_raw = raw.get("step_results")
-    if not isinstance(step_results_raw, list) or not step_results_raw:
-        raise ValueError("step_results must be a non-empty list")
-    validated_results: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    blocked_seen = False
-    for idx, item in enumerate(step_results_raw):
-        if not isinstance(item, dict):
-            raise ValueError(f"step_results[{idx}] must be an object")
-        validated = _validate_step_execution_result({"schema": STEP_RESULT_SCHEMA, **item})
-        step_id = validated["step_id"]
-        if step_id in seen_ids:
-            raise ValueError(f"Duplicate step_id in step_results: {step_id}")
-        if blocked_seen:
-            raise ValueError("No step results are allowed after a blocked step")
-        if validated["status"] == "blocked":
-            blocked_seen = True
-        seen_ids.add(step_id)
-        validated_results.append(validated)
-    return {"schema": EXECUTION_BATCH_SCHEMA, "step_results": validated_results}
-
 
 def _apply_step_execution_result_to_task_state(
     task_state: dict[str, Any],
@@ -1209,34 +1183,6 @@ def _apply_step_execution_result_to_task_state(
 
     return validated
 
-
-def _apply_execution_batch_result_to_task_state(
-    task_state: dict[str, Any],
-    batch_result: dict[str, Any],
-) -> list[dict[str, Any]]:
-    validated_batch = _validate_execution_batch_result(batch_result)
-    pending_ids = [
-        str(step.get("id"))
-        for step in task_state.get("steps", [])
-        if str(step.get("status", "")).strip() in {"pending", "in_progress"}
-    ]
-    result_ids = [result["step_id"] for result in validated_batch["step_results"]]
-    if not result_ids:
-        raise ValueError("step_results must contain at least one step result")
-    if pending_ids[: len(result_ids)] != result_ids:
-        raise ValueError(
-            f"step_results must follow pending step order. Expected prefix {pending_ids[:len(result_ids)]}, got {result_ids}"
-        )
-
-    applied_results: list[dict[str, Any]] = []
-    for result in validated_batch["step_results"]:
-        # Temporarily align current_step_id so existing single-step apply validation remains correct.
-        task_state["current_step_id"] = result["step_id"]
-        applied = _apply_step_execution_result_to_task_state(task_state, {"schema": STEP_RESULT_SCHEMA, **result})
-        applied_results.append(applied)
-        if applied["status"] == "blocked":
-            break
-    return applied_results
 
 
 def _validate_final_synthesis(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1499,64 +1445,96 @@ def _hitl_skip_agent(*, callback_context: CallbackContext) -> types.Content | No
     return None
 
 
-def _executor_before_model_callback(*, callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
+def _react_skip_if_done(*, callback_context: CallbackContext) -> types.Content | None:
+    """before_agent_callback for step_executor: skip entirely when no work remains."""
     if bool(callback_context.state.get(STATE_FINALIZE_REQUESTED, False)):
-        logger.info("[executor:before] skipping — finalize requested")
+        return types.Content(role="model", parts=[])
+    if str(callback_context.state.get(STATE_TURN_ABORT_REASON, "")).strip():
+        return types.Content(role="model", parts=[])
+    task_state = _get_task_state(callback_context)
+    if not task_state:
+        return types.Content(role="model", parts=[])
+    plan_status = str(task_state.get("plan_status", ""))
+    current_step = str(task_state.get("current_step_id") or "").strip()
+    if plan_status == "completed" or not current_step:
+        return types.Content(role="model", parts=[])
+    if plan_status == "blocked" and not _next_pending_step_id(task_state):
+        return types.Content(role="model", parts=[])
+    return None
+
+
+def _react_before_model_callback(*, callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
+    """ReAct step executor: inject context for ONE step per LoopAgent iteration."""
+    if bool(callback_context.state.get(STATE_FINALIZE_REQUESTED, False)):
+        logger.info("[react:before] skipping — finalize requested")
         return _make_text_response("")
     abort = str(callback_context.state.get(STATE_TURN_ABORT_REASON, "")).strip()
     if abort:
-        logger.info("[executor:before] skipping — abort reason: %s", abort)
+        logger.info("[react:before] skipping — abort reason: %s", abort)
         return _make_text_response("")
 
     task_state = _get_task_state(callback_context)
     if not task_state:
-        logger.warning("[executor:before] skipping — no task state")
+        logger.warning("[react:before] skipping — no task state")
         return _make_text_response("")
 
     current_step_id = str(task_state.get("current_step_id") or "").strip()
     plan_status = str(task_state.get("plan_status", ""))
+
+    if plan_status == "blocked" and current_step_id:
+        next_id = _next_pending_step_id(task_state)
+        if next_id:
+            logger.info("[react:before] advancing past blocked %s → %s", current_step_id, next_id)
+            task_state["current_step_id"] = next_id
+            task_state["plan_status"] = "ready"
+            callback_context.state[STATE_WORKFLOW_TASK] = task_state
+            current_step_id = next_id
+        else:
+            logger.info("[react:before] all remaining steps blocked or done")
+            return _make_text_response("")
+
     if not current_step_id or plan_status == "completed":
-        logger.info("[executor:before] all steps complete (plan_status=%s)", plan_status)
-        rendered = _render_all_steps_complete_message()
-        _set_turn_rendered_output(callback_context, key=STATE_EXECUTOR_RENDERED, text=rendered)
-        return _make_text_response(rendered)
+        logger.info("[react:before] all steps done (plan_status=%s) — no-op iteration", plan_status)
+        return _make_text_response("")
 
     try:
         _, active_step = _find_step(task_state, current_step_id)
     except Exception as exc:  # noqa: BLE001
-        logger.error("[executor:before] bad task state: %s", exc)
+        logger.error("[react:before] bad task state: %s", exc)
         callback_context.state[STATE_TURN_ABORT_REASON] = "executor_state_error"
         rendered = f"## Execution\n\nInvalid task state: {exc}"
-        _set_turn_rendered_output(callback_context, key=STATE_EXECUTOR_RENDERED, text=rendered)
+        _append_executor_rendered(callback_context, rendered)
         return _make_text_response(rendered)
 
-    existing_active_step_id = str(callback_context.state.get(STATE_EXECUTOR_ACTIVE_STEP_ID, "") or "")
-    if existing_active_step_id != current_step_id:
-        callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = current_step_id
-        callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = str(active_step.get("status", "pending"))
-        active_step["status"] = "in_progress"
-        task_state["steps"] = task_state.get("steps", [])
-        callback_context.state[STATE_WORKFLOW_TASK] = task_state
+    callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = current_step_id
+    callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = str(active_step.get("status", "pending"))
+    active_step["status"] = "in_progress"
+    callback_context.state[STATE_WORKFLOW_TASK] = task_state
 
-    pending_count = sum(
-        1 for s in task_state.get("steps", [])
-        if str(s.get("status", "")).strip() in {"pending", "in_progress"}
-    )
-    logger.info(
-        "[executor:before] active_step=%s, pending=%d, injecting context",
-        current_step_id, pending_count,
-    )
+    retries = int(callback_context.state.get(STATE_REACT_PARSE_RETRIES, 0) or 0)
+    logger.info("[react:before] executing step %s (retry=%d): %s", current_step_id, retries, active_step.get("goal", ""))
 
     llm_request.config = llm_request.config or types.GenerateContentConfig()
     llm_request.config.response_mime_type = None
-    llm_request.append_instructions(_executor_context_instructions(task_state, active_step))
+    instructions = _react_step_context_instructions(task_state, active_step)
+    if retries > 0:
+        instructions.append(
+            "IMPORTANT: Your previous response was NOT valid JSON and could not be parsed. "
+            "You MUST return ONLY a raw JSON object matching `step_execution_result.v1`. "
+            "Do NOT wrap it in markdown fences. Do NOT return prose or markdown."
+        )
+    llm_request.append_instructions(instructions)
     return None
 
 
-def _executor_after_model_callback(*, callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
+def _react_after_model_callback(*, callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
+    """ReAct step executor: parse single-step result, store trace, advance."""
     if _llm_response_has_function_call(llm_response):
-        logger.debug("[executor:after] response has function_call — continuing tool loop")
+        logger.debug("[react:after] response has function_call — continuing tool loop")
         callback_context.state[STATE_EXECUTOR_BUFFER] = ""
+        text_alongside = _llm_response_text(llm_response)
+        if text_alongside.strip():
+            return _replace_llm_response_text(llm_response, "")
         return None
 
     text = _llm_response_text(llm_response)
@@ -1565,10 +1543,10 @@ def _executor_after_model_callback(*, callback_context: CallbackContext, llm_res
         return _replace_llm_response_text(llm_response, "")
 
     if not text and not str(callback_context.state.get(STATE_EXECUTOR_BUFFER, "") or ""):
-        logger.warning("[executor:after] empty text response and no buffer — returning None")
+        logger.debug("[react:after] empty text (no-op iteration)")
         return None
 
-    logger.info("[executor:after] received text response (%d chars), parsing JSON", len(text))
+    logger.info("[react:after] received text (%d chars), parsing step result", len(text))
 
     parsed, parse_error = _consume_buffered_json_object(
         callback_context,
@@ -1580,12 +1558,7 @@ def _executor_after_model_callback(*, callback_context: CallbackContext, llm_res
     active_step_id = str(callback_context.state.get(STATE_EXECUTOR_ACTIVE_STEP_ID, "") or "")
     prev_status = str(callback_context.state.get(STATE_EXECUTOR_PREV_STEP_STATUS, "") or "pending")
 
-    def _clear_executor_run_temps() -> None:
-        callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = ""
-        callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = ""
-
     def _restore_step_status_on_failure() -> None:
-        nonlocal task_state
         if not task_state or not active_step_id:
             return
         try:
@@ -1595,42 +1568,82 @@ def _executor_after_model_callback(*, callback_context: CallbackContext, llm_res
         step["status"] = prev_status or "pending"
         callback_context.state[STATE_WORKFLOW_TASK] = task_state
 
-    if parsed is None or task_state is None:
-        logger.warning(
-            "[executor:after] parse failed (task_state=%s, parse_error=%s), text[:200]=%s",
-            "present" if task_state else "MISSING", parse_error, text[:200],
-        )
+    retries = int(callback_context.state.get(STATE_REACT_PARSE_RETRIES, 0) or 0)
+
+    def _handle_step_error(error_label: str, error_msg: str) -> LlmResponse:
+        """Retry the step or mark it blocked after max retries."""
         _restore_step_status_on_failure()
-        _clear_executor_run_temps()
-        callback_context.state[STATE_TURN_ABORT_REASON] = "executor_parse_error"
-        rendered = _render_parse_error_markdown("Executor", parse_error or "Failed to parse executor JSON", text)
-        _set_turn_rendered_output(callback_context, key=STATE_EXECUTOR_RENDERED, text=rendered)
+        if retries < MAX_REACT_PARSE_RETRIES:
+            callback_context.state[STATE_REACT_PARSE_RETRIES] = retries + 1
+            logger.warning(
+                "[react:after] %s for step %s (retry %d/%d) — will retry",
+                error_label, active_step_id, retries + 1, MAX_REACT_PARSE_RETRIES,
+            )
+            return _replace_llm_response_text(llm_response, "")
+
+        logger.error(
+            "[react:after] %s for step %s — max retries exhausted, marking blocked",
+            error_label, active_step_id,
+        )
+        callback_context.state[STATE_REACT_PARSE_RETRIES] = 0
+        if task_state and active_step_id:
+            try:
+                _, step = _find_step(task_state, active_step_id)
+                step["status"] = "blocked"
+                step["result_summary"] = f"Step failed after {MAX_REACT_PARSE_RETRIES + 1} attempts: {error_msg}"
+                step["reasoning_trace"] = f"Execution failed: {error_label}. {error_msg}"
+                next_id = _next_pending_step_id(task_state)
+                task_state["current_step_id"] = next_id
+                task_state["plan_status"] = "completed" if next_id is None else "blocked"
+                callback_context.state[STATE_WORKFLOW_TASK] = task_state
+            except Exception:  # noqa: BLE001
+                pass
+        rendered = (
+            f"### {active_step_id} · `blocked`\n\n"
+            f"**Reason:** {error_label} — {error_msg}\n\n"
+            f"_Attempted {MAX_REACT_PARSE_RETRIES + 1} times. Moving to next step._\n\n---"
+        )
+        _append_executor_rendered(callback_context, rendered)
         return _replace_llm_response_text(llm_response, rendered)
 
+    if parsed is None or task_state is None:
+        logger.warning("[react:after] parse failed (parse_error=%s)", parse_error)
+        return _handle_step_error("JSON parse error", parse_error or "Failed to parse step result JSON")
+
+    reasoning_trace = str(parsed.pop("reasoning_trace", "") or "").strip()
+
+    if "schema" not in parsed:
+        parsed["schema"] = STEP_RESULT_SCHEMA
+
     try:
-        applied_results = _apply_execution_batch_result_to_task_state(task_state, parsed)
+        validated = _apply_step_execution_result_to_task_state(task_state, parsed)
     except Exception as exc:  # noqa: BLE001
-        logger.error("[executor:after] validation error: %s", exc)
-        _restore_step_status_on_failure()
-        _clear_executor_run_temps()
-        callback_context.state[STATE_TURN_ABORT_REASON] = "executor_validation_error"
-        rendered = _render_parse_error_markdown("Executor", str(exc), text)
-        _set_turn_rendered_output(callback_context, key=STATE_EXECUTOR_RENDERED, text=rendered)
-        return _replace_llm_response_text(llm_response, rendered)
+        logger.error("[react:after] validation error: %s", exc)
+        return _handle_step_error("Validation error", str(exc))
+
+    callback_context.state[STATE_REACT_PARSE_RETRIES] = 0
+
+    if reasoning_trace:
+        _, step = _find_step(task_state, validated["step_id"])
+        step["reasoning_trace"] = reasoning_trace
 
     completed = _completed_step_count(task_state)
     total = _total_step_count(task_state)
     new_plan_status = str(task_state.get("plan_status", ""))
     logger.info(
-        "[executor:after] applied %d step results, %d/%d complete, plan_status=%s, auto_synth=%s",
-        len(applied_results), completed, total, new_plan_status, new_plan_status == "completed",
+        "[react:after] step %s → %s, %d/%d complete, plan_status=%s",
+        validated["step_id"], validated["status"], completed, total, new_plan_status,
     )
 
     callback_context.state[STATE_WORKFLOW_TASK] = task_state
-    callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = new_plan_status == "completed"
-    _clear_executor_run_temps()
-    rendered = _render_executor_batch_progress_markdown(task_state, applied_results)
-    _set_turn_rendered_output(callback_context, key=STATE_EXECUTOR_RENDERED, text=rendered)
+    callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = ""
+    callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = ""
+
+    if new_plan_status == "completed":
+        callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
+
+    rendered = _render_react_step_progress(task_state, validated, reasoning_trace)
+    _append_executor_rendered(callback_context, rendered)
     return _replace_llm_response_text(llm_response, rendered)
 
 
@@ -1688,7 +1701,7 @@ def _synth_after_model_callback(*, callback_context: CallbackContext, llm_respon
     return _replace_llm_response_text(llm_response, final_markdown)
 
 
-def _build_evidence_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
+def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
     tool_catalog = "\n".join(f"- {name}" for name in tool_hints[:80]) or "- No tools available."
     if prefer_bigquery:
         bq_policy = (
@@ -1700,7 +1713,7 @@ def _build_evidence_executor_instruction(tool_hints: list[str], *, prefer_bigque
         bq_policy = "- BigQuery-first policy is disabled for this run."
 
     return (
-        EVIDENCE_EXECUTOR_INSTRUCTION_TEMPLATE
+        STEP_EXECUTOR_INSTRUCTION_TEMPLATE
         .replace("__TOOL_CATALOG__", tool_catalog)
         .replace("__BQ_POLICY__", bq_policy)
     )
@@ -1794,19 +1807,25 @@ def create_workflow_agent(
             require_approval=require_plan_approval,
         ),
     )
-    evidence_executor = LlmAgent(
-        name="evidence_executor",
+    step_executor = LlmAgent(
+        name="step_executor",
         model=runtime_model,
-        instruction=_build_evidence_executor_instruction(
+        instruction=_build_step_executor_instruction(
             executor_tool_hints,
             prefer_bigquery=use_bigquery_priority,
         ),
         tools=executor_tools,
-        before_agent_callback=hitl_agent_gate,
-        before_model_callback=_executor_before_model_callback,
-        after_model_callback=_executor_after_model_callback,
+        before_agent_callback=_react_skip_if_done,
+        before_model_callback=_react_before_model_callback,
+        after_model_callback=_react_after_model_callback,
         on_model_error_callback=_on_model_error,
         on_tool_error_callback=_on_tool_error,
+    )
+    react_loop = LoopAgent(
+        name="react_loop",
+        sub_agents=[step_executor],
+        max_iterations=25,
+        before_agent_callback=hitl_agent_gate,
     )
     report_synthesizer = LlmAgent(
         name="report_synthesizer",
@@ -1821,8 +1840,8 @@ def create_workflow_agent(
 
     root = SequentialAgent(
         name="co_scientist_workflow",
-        description="ADK-native biomedical workflow: planner, executor, synthesis.",
-        sub_agents=[planner, evidence_executor, report_synthesizer],
+        description="ADK-native biomedical workflow: planner, ReAct executor loop, synthesis.",
+        sub_agents=[planner, react_loop, report_synthesizer],
     )
     return root, mcp_toolset
 

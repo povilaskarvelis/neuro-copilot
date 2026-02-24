@@ -20,7 +20,7 @@ The AI Co-Scientist helps researchers:
 ```mermaid
 flowchart TB
     U["User (ADK Web or CLI)"] --> R["ADK Runner + Session State"]
-    R --> W["SequentialAgent co_scientist_workflow<br/>planner → evidence_executor → report_synthesizer"]
+    R --> W["SequentialAgent co_scientist_workflow<br/>planner → react_loop → report_synthesizer"]
     W --> M["MCPToolset → research-mcp/server.js"]
     M --> W
     W --> U
@@ -36,20 +36,30 @@ flowchart TD
 
     P --> AP{"Plan pending approval?"}
     AP -->|yes| H["User reviews plan"]
-    H -->|approve / lgtm| EX
+    H -->|approve / lgtm| LOOP
     H -->|revise + feedback| P
-    AP -->|no / auto| EX
+    AP -->|no / auto| LOOP
 
-    EX["evidence_executor (LlmAgent)<br/>execute plan steps via MCP tools"]
-    EX -->|all steps done| AUTO{"Auto-synthesize?"}
-    EX -->|partial / blocked| WAIT["User prompted:<br/>continue · finalize"]
-    WAIT -->|continue| EX
+    subgraph LOOP["react_loop (LoopAgent, max 25 iterations)"]
+        direction TB
+        CHK{"More steps?"}
+        CHK -->|yes| R["Reason: what to search and why"]
+        R --> A["Act: call MCP tool"]
+        A --> O["Observe: review results"]
+        O --> D{"Step complete?"}
+        D -->|no| R
+        D -->|yes, advance| CHK
+    end
+
+    CHK -->|"all done"| AUTO{"Auto-synthesize?"}
+    CHK -->|"blocked / partial"| WAIT["User prompted:<br/>continue · finalize"]
+    WAIT -->|continue| CHK
     WAIT -->|finalize| SY
 
     AUTO -->|yes| SY
     AUTO -->|no| WAIT
 
-    SY["report_synthesizer (LlmAgent)<br/>final Markdown report with source citations"]
+    SY["report_synthesizer (LlmAgent)<br/>final Markdown report with source citations<br/>+ reasoning traces per step"]
     SY --> DONE["Report displayed to user"]
     DONE -->|follow-up question| P
 
@@ -64,10 +74,25 @@ flowchart TD
     classDef llm fill:#eef2f7,stroke:#5f6b7a,stroke-width:1.5px,color:#1f2933;
     classDef guard fill:#f3f4f6,stroke:#6b7280,stroke-width:1.5px,color:#1f2933;
     classDef cmd fill:#fef9c3,stroke:#ca8a04,stroke-width:1.5px,color:#1f2933;
-    class P,EX,SY llm;
-    class AP,AUTO,H,WAIT guard;
+    classDef react fill:#e0f2fe,stroke:#0284c7,stroke-width:1.5px,color:#1f2933;
+    class P,SY llm;
+    class AP,AUTO,H,WAIT,D guard;
     class CMD,ARCH,DONE2 cmd;
+    class R,A,O,CHK react;
 ```
+
+### ReAct Execution Loop
+
+Each plan step is executed as a **Reason → Act → Observe** cycle inside a `LoopAgent`:
+
+1. **Reason** — the step executor reads the current step goal and decides what tool to call and why
+2. **Act** — calls an MCP tool (e.g., `search_pubmed`, `check_druggability`)
+3. **Observe** — reviews the tool results; if insufficient, reasons again and retries with a different query or tool
+4. **Conclude** — when the step's completion condition is met, returns a structured result with a `reasoning_trace`
+
+The reasoning trace captures the full decision chain per step ("searched X because Y, found Z, concluded W") and is stored alongside step results. The synthesizer uses these traces to ground source citations in the final report.
+
+**Error recovery:** if the executor returns invalid output, the loop retries the step (up to 3 attempts) with a corrective prompt before marking it blocked and advancing.
 
 ## User Commands
 
@@ -84,7 +109,8 @@ flowchart TD
 
 ## Guardrails
 
-- **HITL plan gate** — `before_agent_callback` blocks executor and synthesizer until the plan is approved.
+- **HITL plan gate** — `before_agent_callback` blocks the ReAct loop and synthesizer until the plan is approved.
+- **ReAct retry** — parse/validation errors trigger automatic retry (up to 3 attempts per step) before marking the step blocked.
 - **Error callbacks** — `on_model_error_callback` and `on_tool_error_callback` surface rate-limit and tool failures to the user instead of silently crashing.
 - **Step renumbering** — follow-up plans with non-sequential IDs are canonically renumbered to `S1, S2, ...`.
 - **Source citations** — final reports cite human-readable database names (PubMed, ClinicalTrials.gov, etc.), never raw tool names or JSON URLs.
