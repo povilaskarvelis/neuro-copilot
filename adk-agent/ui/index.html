@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Co-Scientist UI</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260219-30" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div class="brand-block">
+            <h1 class="brand-title">AI Co-Scientist</h1>
+          </div>
+          <div class="sidebar-actions">
+            <button id="newChatBtn" class="ghost-btn">New Chat</button>
+          </div>
+        </div>
+        <div id="tasksList" class="tasks-list"></div>
+      </aside>
+
+      <main class="main-panel">
+        <header class="main-head">
+          <div>
+            <h2 class="product-title">AI Co-Scientist</h2>
+            <p id="taskTitle" class="task-context">New chat</p>
+          </div>
+        </header>
+
+        <div id="notice" class="notice hidden"></div>
+
+        <div id="workspace" class="workspace">
+          <section class="chat-panel">
+            <section id="landingHero" class="landing-hero">
+              <h1 class="landing-question">How can I help with your research?
+
+              </h1>
+            </section>
+            <div id="messages" class="messages"></div>
+            <form id="composerForm" class="composer">
+              <textarea
+                id="promptInput"
+                placeholder="Ask any biomedical question..."
+                rows="3"
+              ></textarea>
+              <button
+                id="sendBtn"
+                type="submit"
+                class="primary-btn send-btn hidden"
+                aria-label="Send"
+                title="Send"
+              >
+                ➤
+              </button>
+            </form>
+          </section>
+
+          <aside id="reportPanel" class="report-panel hidden" aria-live="polite">
+            <header class="report-head">
+              <h3 id="reportTitle" class="report-title">Research Report</h3>
+              <button id="exportPdfBtn" type="button" class="ghost-btn hidden">Export PDF</button>
+            </header>
+            <div id="reportStatus" class="report-status hidden"></div>
+            <div id="reportContent" class="report-content markdown-body"></div>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <script src="/static/app.js?v=20260219-30" defer></script>
+  </body>
+</html>

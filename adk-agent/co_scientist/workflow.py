@@ -1403,7 +1403,7 @@ def _make_planner_before_model_callback(*, require_approval: bool):
             task_state = _get_task_state(callback_context)
             if task_state:
                 plan_status = str(task_state.get("plan_status", ""))
-                if plan_status in ("ready", "blocked") and _is_continue_execution_command(user_text):
+                if plan_status in ("ready", "blocked", "in_progress") and _is_continue_execution_command(user_text):
                     return _make_text_response("")
 
         # --- Original logic ---
