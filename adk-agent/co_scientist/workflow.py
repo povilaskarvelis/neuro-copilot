@@ -1548,9 +1548,9 @@ def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -
     lowered = text.lower()
 
     # References: inject before Potential Next Steps so _strip_next_steps_section in ui_server preserves them
+    # Only use IDs that appear inline in the body — every numbered reference must have an in-text citation.
     inline_ids = _extract_inline_ids_from_text(text)
-    task_ids = _collect_all_evidence_ids(task_state)
-    all_ids = _merge_reference_ids(inline_ids, task_ids)
+    all_ids = inline_ids
     ref_map = _build_ref_map(all_ids)
     if "## References" not in text:
         refs = _build_references_section(all_ids)
@@ -1627,10 +1627,10 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
         lines.append("")
 
     # Collect IDs, build ref_map, then render References and hyperlink inline mentions
+    # Only use IDs that appear inline in the body — every numbered reference must have an in-text citation.
     current_text = "\n".join(lines)
     inline_ids = _extract_inline_ids_from_text(current_text)
-    task_ids = _collect_all_evidence_ids(task_state)
-    all_ids = _merge_reference_ids(inline_ids, task_ids)
+    all_ids = inline_ids
     ref_map = _build_ref_map(all_ids)
     refs = _build_references_section(all_ids)
     if refs:
