@@ -14,6 +14,9 @@ import os
 from pathlib import Path
 import re
 from typing import Any
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.adk.agents.callback_context import CallbackContext
@@ -949,6 +952,397 @@ def _render_react_step_progress(task_state: dict[str, Any], result: dict[str, An
     return "\n".join(lines).strip()
 
 
+# ---------------------------------------------------------------------------
+# Citation / reference helpers
+# ---------------------------------------------------------------------------
+
+_INLINE_ID_RE = re.compile(
+    r"\bPMID\s*:?\s*(?P<pmid>\d{6,8})\b"
+    r"|\bDOI\s*:?\s*(?P<doi>10\.\S+?)(?=[,;\s\)\]>]|$)"
+    r"|\b(?P<nct>NCT\d{8})\b"
+    r"|\bOpenAlex\s*:?\s*(?P<openalex>W\d+)\b"
+    r"|\b(?P<pmc>PMC\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _evidence_id_to_url(eid: str) -> str | None:
+    """Return a human-readable URL for a known evidence identifier, or None."""
+    raw = re.sub(r"\s*:\s*", ":", eid.strip())
+    m = re.fullmatch(r"(?i)PMID:(\d{4,9})", raw)
+    if m:
+        return f"https://pubmed.ncbi.nlm.nih.gov/{m.group(1)}/"
+    m = re.fullmatch(r"(?i)DOI:(10\..+)", raw)
+    if m:
+        return f"https://doi.org/{m.group(1)}"
+    m = re.fullmatch(r"(?i)(?:NCT:)?(NCT\d{8})", raw)
+    if m:
+        return f"https://clinicaltrials.gov/study/{m.group(1)}"
+    m = re.fullmatch(r"(?i)OpenAlex:(W\d+)", raw)
+    if m:
+        return f"https://openalex.org/{m.group(1)}"
+    m = re.fullmatch(r"(?i)(?:PMC:)?(PMC\d+)", raw)
+    if m:
+        return f"https://www.ncbi.nlm.nih.gov/pmc/articles/{m.group(1)}/"
+    return None
+
+
+def _extract_inline_ids_from_text(text: str) -> list[str]:
+    """Scan a markdown string for inline source identifiers and return them in order."""
+    seen: set[str] = set()
+    ids: list[str] = []
+    for m in _INLINE_ID_RE.finditer(text):
+        if m.group("pmid"):
+            normalized = f"PMID:{m.group('pmid')}"
+        elif m.group("doi"):
+            normalized = f"DOI:{m.group('doi')}"
+        elif m.group("nct"):
+            normalized = m.group("nct").upper()
+        elif m.group("openalex"):
+            normalized = f"OpenAlex:{m.group('openalex')}"
+        elif m.group("pmc"):
+            normalized = m.group("pmc").upper()
+        else:
+            continue
+        key = normalized.lower()
+        if key not in seen:
+            seen.add(key)
+            ids.append(normalized)
+    return ids
+
+
+def _collect_all_evidence_ids(task_state: dict[str, Any]) -> list[str]:
+    """Return a deduplicated list of evidence IDs from all completed steps."""
+    seen: set[str] = set()
+    ids: list[str] = []
+    for step in task_state.get("steps", []):
+        for eid in step.get("evidence_ids", []) or []:
+            normalized = re.sub(r"\s*:\s*", ":", str(eid).strip())
+            if normalized and normalized.lower() not in seen:
+                seen.add(normalized.lower())
+                ids.append(normalized)
+    return ids
+
+
+def _build_ref_map(ids: list[str]) -> dict[str, int]:
+    """Map colon-normalised lowercase EID → 1-based reference number."""
+    return {
+        re.sub(r"\s*:\s*", ":", eid.strip()).lower(): i
+        for i, eid in enumerate(ids, start=1)
+    }
+
+
+# ---------------------------------------------------------------------------
+# Live metadata fetching for APA citations
+# ---------------------------------------------------------------------------
+
+_CITATION_META_CACHE: dict[str, dict] = {}
+_CITATION_FETCH_TIMEOUT = 6  # seconds
+
+
+def _http_get_json(url: str) -> dict | None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "ai-co-scientist/1.0 (citation-builder)"})
+        with urllib.request.urlopen(req, timeout=_CITATION_FETCH_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fetch_pubmed_meta(pmid: str) -> dict | None:
+    """Fetch article metadata from NCBI esummary. Returns a flat dict or None."""
+    cache_key = f"pmid:{pmid}"
+    if cache_key in _CITATION_META_CACHE:
+        return _CITATION_META_CACHE[cache_key]
+    url = (
+        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+        f"?db=pubmed&id={urllib.parse.quote(pmid)}&retmode=json"
+    )
+    data = _http_get_json(url)
+    if not data:
+        _CITATION_META_CACHE[cache_key] = {}
+        return None
+    result = (data.get("result") or {}).get(pmid)
+    if not result:
+        _CITATION_META_CACHE[cache_key] = {}
+        return None
+    # Extract DOI from articleids
+    doi = ""
+    for aid in result.get("articleids") or []:
+        if str(aid.get("idtype", "")).lower() == "doi":
+            doi = str(aid.get("value", "")).strip()
+            break
+    if not doi:
+        doi = str(result.get("elocationid", "")).strip()
+        if doi and not doi.startswith("10."):
+            doi = ""
+    meta = {
+        "authors": [str(a.get("name", "")).strip() for a in (result.get("authors") or []) if a.get("authtype") == "Author"],
+        "title": str(result.get("title", "")).rstrip(".").strip(),
+        "journal": str(result.get("source", "")).strip(),
+        "year": str(result.get("pubdate", "")).split()[0],
+        "volume": str(result.get("volume", "")).strip(),
+        "issue": str(result.get("issue", "")).strip(),
+        "pages": str(result.get("pages", "")).strip(),
+        "doi": doi,
+        "pmid": pmid,
+    }
+    _CITATION_META_CACHE[cache_key] = meta
+    return meta
+
+
+def _fetch_crossref_meta(doi: str) -> dict | None:
+    """Fetch article metadata from CrossRef. Returns a flat dict or None."""
+    cache_key = f"doi:{doi.lower()}"
+    if cache_key in _CITATION_META_CACHE:
+        return _CITATION_META_CACHE[cache_key]
+    url = f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='/')}"
+    data = _http_get_json(url)
+    if not data:
+        _CITATION_META_CACHE[cache_key] = {}
+        return None
+    msg = data.get("message") or {}
+    raw_authors = msg.get("author") or []
+    authors = []
+    for a in raw_authors:
+        family = str(a.get("family", "")).strip()
+        given = str(a.get("given", "")).strip()
+        if family:
+            authors.append(f"{family} {given}" if given else family)
+    date_parts = ((msg.get("published") or msg.get("published-print") or msg.get("published-online") or {}).get("date-parts") or [[]])[0]
+    year = str(date_parts[0]) if date_parts else ""
+    titles = msg.get("title") or []
+    title = str(titles[0]).rstrip(".") if titles else ""
+    journals = msg.get("container-title") or []
+    journal = str(journals[0]) if journals else ""
+    meta = {
+        "authors": authors,
+        "title": title,
+        "journal": journal,
+        "year": year,
+        "volume": str(msg.get("volume", "")).strip(),
+        "issue": str(msg.get("issue", "")).strip(),
+        "pages": str(msg.get("page", "")).strip(),
+        "doi": str(msg.get("DOI", doi)).strip(),
+        "pmid": "",
+    }
+    _CITATION_META_CACHE[cache_key] = meta
+    return meta
+
+
+def _format_apa_authors(names: list[str]) -> str:
+    """Convert a list of 'LastName Initials' or 'LastName First' strings to APA author string."""
+    if not names:
+        return ""
+    formatted: list[str] = []
+    for name in names[:6]:
+        parts = name.rsplit(" ", 1)
+        if len(parts) == 2:
+            last, first = parts
+            # Convert initials like 'JD' or full name 'John' to 'J. D.' or 'J.'
+            if first.isupper() or (len(first) <= 3 and first.replace(" ", "").isupper()):
+                initials = ". ".join(first.upper()) + "."
+                formatted.append(f"{last}, {initials}")
+            else:
+                initial = first[0].upper() + "."
+                formatted.append(f"{last}, {initial}")
+        else:
+            formatted.append(name)
+    if len(names) > 7:
+        return ", ".join(formatted) + ", . . ."
+    if len(formatted) > 1:
+        return ", ".join(formatted[:-1]) + ", & " + formatted[-1]
+    return formatted[0]
+
+
+def _build_apa_citation(meta: dict, pmid: str = "", doi: str = "") -> str:
+    """Render a full APA 7th-edition citation string from a metadata dict."""
+    author_str = _format_apa_authors(meta.get("authors") or [])
+    year = meta.get("year") or "n.d."
+    title = meta.get("title") or ""
+    journal = meta.get("journal") or ""
+    volume = meta.get("volume") or ""
+    issue = meta.get("issue") or ""
+    pages = meta.get("pages") or ""
+    doi_val = meta.get("doi") or doi
+    pmid_val = meta.get("pmid") or pmid
+
+    parts: list[str] = []
+    if author_str:
+        parts.append(f"{author_str} ({year}).")
+    elif year:
+        parts.append(f"({year}).")
+    if title:
+        parts.append(f"{title}.")
+    if journal:
+        journal_part = f"*{journal}*"
+        if volume:
+            journal_part += f", *{volume}*"
+            if issue:
+                journal_part += f"({issue})"
+        if pages:
+            journal_part += f", {pages}"
+        journal_part += "."
+        parts.append(journal_part)
+    if doi_val:
+        doi_url = f"https://doi.org/{doi_val}"
+        parts.append(f"[{doi_url}]({doi_url})")
+    if pmid_val:
+        pmid_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid_val}/"
+        parts.append(f"PMID: [{pmid_val}]({pmid_url})")
+    return " ".join(parts)
+
+
+def _format_reference_apa(i: int, eid: str) -> str:
+    """Format a single reference in full APA 7th-edition style, fetching live metadata."""
+    raw = re.sub(r"\s*:\s*", ":", eid.strip())
+    anchor = f'<a id="ref-{i}"></a>'
+
+    # PMID — fetch from PubMed; fall back to CrossRef via DOI if available
+    m = re.fullmatch(r"(?i)PMID:(\d{4,9})", raw)
+    if m:
+        pmid = m.group(1)
+        pmid_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+        meta = _fetch_pubmed_meta(pmid)
+        if meta:
+            if meta.get("title"):
+                return f"{anchor}{i}. {_build_apa_citation(meta, pmid=pmid)}"
+            if meta.get("doi"):
+                cr_meta = _fetch_crossref_meta(meta["doi"])
+                if cr_meta and cr_meta.get("title"):
+                    cr_meta["pmid"] = pmid
+                    return f"{anchor}{i}. {_build_apa_citation(cr_meta, pmid=pmid)}"
+        return f"{anchor}{i}. PMID: [{pmid}]({pmid_url})"
+
+    # DOI — fetch from CrossRef
+    m = re.fullmatch(r"(?i)DOI:(10\..+)", raw)
+    if m:
+        doi = m.group(1)
+        doi_url = f"https://doi.org/{doi}"
+        meta = _fetch_crossref_meta(doi)
+        if meta and meta.get("title"):
+            return f"{anchor}{i}. {_build_apa_citation(meta, doi=doi)}"
+        return f"{anchor}{i}. [{doi_url}]({doi_url})"
+
+    # NCT — ClinicalTrials.gov
+    m = re.fullmatch(r"(?i)(?:NCT:)?(NCT\d{8})", raw)
+    if m:
+        nct = m.group(1).upper()
+        url = f"https://clinicaltrials.gov/study/{nct}"
+        return f"{anchor}{i}. U.S. National Library of Medicine. (n.d.). *ClinicalTrials.gov*. [{nct}]({url})"
+
+    # OpenAlex
+    m = re.fullmatch(r"(?i)OpenAlex:(W\d+)", raw)
+    if m:
+        wid = m.group(1)
+        url = f"https://openalex.org/{wid}"
+        return f"{anchor}{i}. *OpenAlex*. [{wid}]({url})"
+
+    # PMC
+    m = re.fullmatch(r"(?i)(?:PMC:)?(PMC\d+)", raw)
+    if m:
+        pmc = m.group(1).upper()
+        url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc}/"
+        return f"{anchor}{i}. National Library of Medicine. (n.d.). *PubMed Central*. [{pmc}]({url})"
+
+    url = _evidence_id_to_url(eid)
+    if url:
+        return f"{anchor}{i}. [{eid}]({url})"
+    return f"{anchor}{i}. {eid}"
+
+
+def _build_references_section(ids: list[str]) -> str:
+    """Format a Markdown ## References section in APA 7th-edition style."""
+    if not ids:
+        return ""
+    lines = ["## References", ""]
+    for i, eid in enumerate(ids, start=1):
+        lines.append(_format_reference_apa(i, eid))
+    return "\n".join(lines)
+
+
+_PROTECT_RE = re.compile(
+    r"```[\s\S]*?```"       # fenced code blocks
+    r"|`[^`\n]+`"           # inline code
+    r"|\[([^\]]+)\]\([^)]+\)",  # existing markdown links
+    re.DOTALL,
+)
+
+
+def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> str:
+    """Replace bare inline ID mentions with links in the body text.
+
+    When ref_map is provided, links point to the local #ref-N anchor so readers
+    can click through to the APA entry at the bottom of the document.
+    Otherwise falls back to the external URL for the identifier.
+    Skips the ## References section (already formatted) and avoids double-linking.
+    """
+    # Split off the References section — leave it untouched.
+    refs_split = re.split(r"(?m)^## References\b", text, maxsplit=1)
+    body = refs_split[0]
+    refs_tail = ("\n## References" + refs_split[1]) if len(refs_split) > 1 else ""
+
+    # Protect code spans/blocks and existing links with null-byte placeholders.
+    placeholders: list[str] = []
+
+    def _protect(m: re.Match) -> str:  # type: ignore[type-arg]
+        idx = len(placeholders)
+        placeholders.append(m.group(0))
+        return f"\x00P{idx}\x00"
+
+    protected = _PROTECT_RE.sub(_protect, body)
+
+    def _replace_id(m: re.Match) -> str:  # type: ignore[type-arg]
+        if m.group("pmid"):
+            normalized = f"PMID:{m.group('pmid')}"
+            display = f"PMID: {m.group('pmid')}"
+        elif m.group("doi"):
+            normalized = f"DOI:{m.group('doi')}"
+            display = f"DOI: {m.group('doi')}"
+        elif m.group("nct"):
+            normalized = m.group("nct").upper()
+            display = normalized
+        elif m.group("openalex"):
+            normalized = f"OpenAlex:{m.group('openalex')}"
+            display = f"OpenAlex: {m.group('openalex')}"
+        elif m.group("pmc"):
+            normalized = m.group("pmc").upper()
+            display = normalized
+        else:
+            return m.group(0)
+        ref_key = re.sub(r"\s*:\s*", ":", normalized).lower()
+        if ref_map and ref_key in ref_map:
+            n = ref_map[ref_key]
+            return f"[{n}](#ref-{n})"
+        url = _evidence_id_to_url(normalized)
+        if not url:
+            return m.group(0)
+        return f"[{display}]({url})"
+
+    linked = _INLINE_ID_RE.sub(_replace_id, protected)
+
+    # Restore placeholders.
+    for idx, original in enumerate(placeholders):
+        linked = linked.replace(f"\x00P{idx}\x00", original)
+
+    return linked + refs_tail
+
+
+def _merge_reference_ids(inline_ids: list[str], task_ids: list[str]) -> list[str]:
+    """Merge inline-extracted IDs (first) with task-state IDs, deduplicating."""
+    seen: set[str] = set()
+    combined: list[str] = []
+    for eid in inline_ids + task_ids:
+        key = re.sub(r"\s*:\s*", ":", eid).lower()
+        if key not in seen:
+            seen.add(key)
+            combined.append(eid)
+    return combined
+
+
+# ---------------------------------------------------------------------------
+
+
 def _fallback_supporting_evidence_from_task_state(task_state: dict[str, Any]) -> list[str]:
     items: list[str] = []
     for step in task_state.get("steps", []):
@@ -1021,19 +1415,48 @@ def _coverage_note_from_task_state(task_state: dict[str, Any]) -> str:
 def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -> str:
     text = str(raw_markdown or "").strip()
     if not text:
-        text = "## Final Summary\n\nNo final summary was produced."
+        text = "# AI Co-Scientist Report\n\n## Summary\n\nNo final summary was produced."
 
-    if "## Final Summary" not in text and "# Final Summary" not in text:
-        text = "## Final Summary\n\n" + text
+    has_title = "# AI Co-Scientist Report" in text
+    has_old_heading = "## Final Summary" in text or "# Final Summary" in text
+    if not has_title and not has_old_heading:
+        text = "# AI Co-Scientist Report\n\n## Summary\n\n" + text
+    elif has_old_heading and not has_title:
+        # Upgrade legacy heading
+        text = text.replace("## Final Summary", "## Summary").replace("# Final Summary", "## Summary")
+        text = "# AI Co-Scientist Report\n\n" + text
 
     lowered = text.lower()
 
+    # References: inject before Potential Next Steps so _strip_next_steps_section in ui_server preserves them
+    inline_ids = _extract_inline_ids_from_text(text)
+    task_ids = _collect_all_evidence_ids(task_state)
+    all_ids = _merge_reference_ids(inline_ids, task_ids)
+    ref_map = _build_ref_map(all_ids)
+    if "## References" not in text:
+        refs = _build_references_section(all_ids)
+        if refs:
+            next_steps_pattern = re.compile(
+                r"(\n#{1,3}\s+(?:Potential\s+)?Next\s+(?:Steps?|Actions?)\b)",
+                re.IGNORECASE,
+            )
+            m = next_steps_pattern.search(text)
+            if m:
+                text = text[: m.start()] + "\n\n" + refs + text[m.start() :]
+            else:
+                text += "\n\n" + refs
+
+    # Hyperlink bare inline IDs — link to local #ref-N anchors when available
+    text = _hyperlink_inline_ids(text, ref_map)
+
+    lowered = text.lower()
     if "potential next steps" not in lowered and "next steps" not in lowered and "next actions" not in lowered:
         fallback_next = _fallback_next_actions_from_task_state(task_state)
         if fallback_next:
-            text += "\n\n**Potential Next Steps**\n\n"
-            text += "\n".join(f"- {item}" for item in fallback_next[:20])
+            text += "\n\n## Potential Next Steps\n\n"
+            text += "\n".join(f"{i}. {item}" for i, item in enumerate(fallback_next[:20], start=1))
 
+    lowered = text.lower()
     if "_coverage:" not in lowered and "coverage:" not in lowered:
         text += "\n\n" + _coverage_note_from_task_state(task_state)
 
@@ -1041,42 +1464,86 @@ def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -
 
 
 def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict[str, Any]) -> str:
-    lines = ["## Final Summary", ""]
+    objective = str(task_state.get("objective", "")).strip()
+    coverage = str(synthesis.get("coverage_status", "partial_plan"))
+    completed = _completed_step_count(task_state)
+    total = _total_step_count(task_state)
+    coverage_label = "Complete" if coverage == "complete_plan" else "Partial"
+
+    lines = ["# AI Co-Scientist Report", ""]
+
+    # Research question + coverage callout
+    if objective:
+        lines += [
+            f"> **Research Question:** {objective}",
+            ">",
+            f"> **Coverage:** {coverage_label} \u2014 {completed} of {total} planned steps completed",
+            "",
+            "---",
+            "",
+        ]
+
+    # Summary
+    lines += ["## Summary", ""]
     direct_answer = str(synthesis.get("direct_answer", "")).strip()
     if direct_answer:
         lines.append(direct_answer)
+        lines.append("")
+
+    # Supporting Evidence
     supporting = [str(x).strip() for x in synthesis.get("supporting_evidence", []) if str(x).strip()]
     if not supporting:
         supporting = _fallback_supporting_evidence_from_task_state(task_state)
     if supporting:
-        lines.append("")
-        lines.append("**Supporting Evidence (Claim + Why It Matters)**")
-        lines.extend(f"- {item}" for item in supporting[:20])
+        lines += ["## Supporting Evidence", ""]
+        for i, item in enumerate(supporting[:20], start=1):
+            lines.append(f"**{i}.** {item}")
+            lines.append("")
+
+    # Limitations
     limitations = [str(x).strip() for x in synthesis.get("limitations", []) if str(x).strip()]
     if limitations:
-        lines.append("")
-        lines.append("**Limitations**")
+        lines += ["## Limitations", ""]
         lines.extend(f"- {item}" for item in limitations[:20])
+        lines.append("")
+
+    # Collect IDs, build ref_map, then render References and hyperlink inline mentions
+    current_text = "\n".join(lines)
+    inline_ids = _extract_inline_ids_from_text(current_text)
+    task_ids = _collect_all_evidence_ids(task_state)
+    all_ids = _merge_reference_ids(inline_ids, task_ids)
+    ref_map = _build_ref_map(all_ids)
+    refs = _build_references_section(all_ids)
+    if refs:
+        lines += refs.split("\n")
+        lines.append("")
+
+    # Hyperlink inline IDs — internal anchors to #ref-N where available
+    body_so_far = "\n".join(lines)
+    body_so_far = _hyperlink_inline_ids(body_so_far, ref_map)
+    lines = body_so_far.split("\n")
+
+    # Next Steps (after References so _strip_next_steps_section in ui_server won't remove References)
     next_actions = [str(x).strip() for x in synthesis.get("next_actions", []) if str(x).strip()]
     if not next_actions:
         next_actions = _fallback_next_actions_from_task_state(task_state)
     if next_actions:
+        lines += ["## Potential Next Steps", ""]
+        for i, item in enumerate(next_actions[:20], start=1):
+            lines.append(f"{i}. {item}")
         lines.append("")
-        lines.append("**Potential Next Steps**")
-        lines.extend(f"- {item}" for item in next_actions[:20])
 
-    coverage = str(synthesis.get("coverage_status", "partial_plan"))
-    completed = _completed_step_count(task_state)
-    total = _total_step_count(task_state)
-    coverage_label = "Complete plan" if coverage == "complete_plan" else "Partial plan"
+    lines.append("---")
+    lines.append("")
     if coverage == "partial_plan":
-        lines.append("")
         lines.append(
-            f"_Coverage: {coverage_label} ({completed} of {total} planned steps completed when final summary was requested)._"
+            f"_Coverage: Partial plan \u2014 {completed} of {total} planned steps completed when final summary was requested._"
         )
     else:
-        lines.append("")
-        lines.append(f"_Coverage: {coverage_label} ({completed} of {total} planned steps completed)._")
+        lines.append(
+            f"_Coverage: Complete plan \u2014 all {total} planned steps completed._"
+        )
+
     return "\n".join(lines).strip()
 
 

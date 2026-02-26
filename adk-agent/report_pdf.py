@@ -42,86 +42,148 @@ CHROME_CANDIDATES = (
 HIGH_FIDELITY_CSS = """
 @page {
   size: Letter;
-  margin: 0.75in;
+  margin: 0.75in 0.75in 0.85in 0.75in;
 }
 html, body {
   margin: 0;
   padding: 0;
 }
 body {
-  font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   font-size: 10.5pt;
-  line-height: 1.45;
-  color: #111827;
+  line-height: 1.55;
+  color: #1e293b;
 }
 article.report {
   max-width: 100%;
 }
-h1, h2, h3 {
+
+/* ── Title / H1 ── */
+h1 {
+  font-size: 24pt;
+  font-weight: 700;
   color: #0f172a;
-  line-height: 1.25;
-  margin-top: 1.0em;
+  border-bottom: 3px solid #3b82f6;
+  padding-bottom: 0.3em;
+  margin-top: 0;
+  margin-bottom: 0.5em;
+  line-height: 1.2;
+}
+
+/* ── Section headings ── */
+h2 {
+  font-size: 14pt;
+  font-weight: 700;
+  color: #1d4ed8;
+  margin-top: 1.4em;
   margin-bottom: 0.4em;
+  padding-bottom: 0.2em;
+  border-bottom: 1.5px solid #bfdbfe;
+  line-height: 1.25;
 }
-h1 { font-size: 22pt; }
-h2 { font-size: 15pt; border-bottom: 1px solid #e2e8f0; padding-bottom: 0.15em; }
-h3 { font-size: 12pt; }
-p { margin: 0.45em 0; }
+h3 {
+  font-size: 11.5pt;
+  font-weight: 600;
+  color: #1e40af;
+  margin-top: 1em;
+  margin-bottom: 0.3em;
+}
+
+/* ── Research question callout block ── */
 blockquote {
-  margin: 0.8em 0;
-  padding: 0.5em 0.8em;
-  border-left: 3px solid #cbd5e1;
-  background: #f8fafc;
-  color: #334155;
+  margin: 1em 0;
+  padding: 0.75em 1em;
+  border-left: 4px solid #3b82f6;
+  background: #eff6ff;
+  color: #1e3a8a;
+  border-radius: 0 6px 6px 0;
+  font-size: 10.5pt;
 }
+blockquote strong {
+  color: #1e3a8a;
+}
+
+/* ── Body text ── */
+p {
+  margin: 0.5em 0;
+}
+
+/* ── Lists ── */
+ul, ol {
+  margin: 0.5em 0 0.5em 1.4em;
+  padding-left: 0.8em;
+}
+li {
+  margin: 0.3em 0;
+  line-height: 1.5;
+}
+
+/* ── Code ── */
 pre {
-  margin: 0.7em 0;
-  padding: 0.65em 0.75em;
+  margin: 0.8em 0;
+  padding: 0.7em 0.9em;
   background: #0f172a;
   color: #e2e8f0;
   border-radius: 6px;
+  font-size: 9pt;
   overflow: auto;
 }
 code {
-  font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
-  font-size: 0.92em;
+  font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 0.9em;
   background: #f1f5f9;
-  padding: 0.08em 0.3em;
-  border-radius: 4px;
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+  color: #0f172a;
 }
 pre code {
   background: transparent;
   padding: 0;
+  color: inherit;
 }
-ul, ol {
-  margin: 0.45em 0 0.45em 1.2em;
-  padding-left: 0.9em;
-}
-ul ul, ul ol, ol ul, ol ol {
-  margin-top: 0.25em;
-  margin-bottom: 0.25em;
-}
-li {
-  margin: 0.25em 0;
-}
+
+/* ── Tables ── */
 table {
   width: 100%;
   border-collapse: collapse;
-  margin: 0.8em 0;
-  font-size: 9.8pt;
-}
-th, td {
-  border: 1px solid #cbd5e1;
-  padding: 0.38em 0.45em;
-  vertical-align: top;
-  text-align: left;
+  margin: 1em 0;
+  font-size: 9.5pt;
 }
 th {
-  background: #f1f5f9;
+  background: #1d4ed8;
+  color: #ffffff;
   font-weight: 600;
+  padding: 0.45em 0.6em;
+  text-align: left;
 }
-a { color: #1d4ed8; text-decoration: underline; word-break: break-all; }
-hr { border: none; border-top: 1px solid #e5e7eb; margin: 1em 0; }
+td {
+  border: 1px solid #cbd5e1;
+  padding: 0.4em 0.6em;
+  vertical-align: top;
+}
+tr:nth-child(even) td {
+  background: #f8fafc;
+}
+
+/* ── Horizontal rule ── */
+hr {
+  border: none;
+  border-top: 1px solid #e2e8f0;
+  margin: 1.2em 0;
+}
+
+/* ── Coverage / footer note ── */
+em {
+  color: #64748b;
+  font-size: 9.5pt;
+}
+
+/* ── Links ── */
+a {
+  color: #1d4ed8;
+  text-decoration: underline;
+  word-break: break-all;
+}
 """
 
 
@@ -698,7 +760,9 @@ def _write_markdown_pdf_legacy(markdown: str, output_path: Path, *, title: str =
         return "PDF export unavailable: reportlab is not installed."
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    clean_markdown = (markdown or "").strip()
+    # Strip HTML anchor tags inserted for Chrome internal links — they render
+    # as literal text in the ReportLab path.
+    clean_markdown = re.sub(r'<a\s[^>]*></a>', '', (markdown or "").strip())
     try:
         doc = SimpleDocTemplate(
             str(output_path),

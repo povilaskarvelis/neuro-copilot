@@ -1265,7 +1265,8 @@ app.mount("/static", StaticFiles(directory=str(UI_DIR)), name="static")
 async def _startup() -> None:
     await runtime.startup()
     if runtime.ready:
-        print("[ui] Server ready at http://127.0.0.1:8080")
+        _port = int(os.environ.get("CO_SCI_UI_PORT", "8080"))
+        print(f"[ui] Server ready at http://127.0.0.1:{_port}")
     else:
         print(f"[ui] Startup warning: {runtime.ready_error}")
 
