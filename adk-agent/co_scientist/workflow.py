@@ -47,6 +47,26 @@ BQ_PRIORITY_TOOLS = [
     "run_bigquery_select_query",
 ]
 
+# Tools that return aggregate scores / structured data but NO individual citable IDs
+# (no PMIDs, DOIs, or NCT numbers). Plans using only these tools must add a
+# complementary literature step so citations can be surfaced.
+CITATION_FREE_TOOLS: frozenset[str] = frozenset({
+    "search_diseases",
+    "expand_disease_context",
+    "search_targets",
+    "search_disease_targets",
+    "get_target_info",
+    "check_druggability",
+    "get_target_drugs",
+    "summarize_target_expression_context",
+    "summarize_target_competitive_landscape",
+    "summarize_target_safety_liabilities",
+    "compare_targets_multi_axis",
+    "search_reactome_pathways",
+    "get_string_interactions",
+    "get_gene_info",
+})
+
 STATE_WORKFLOW_TASK = "workflow_task_state"
 STATE_WORKFLOW_TASK_LEGACY_APP = "app:workflow_task_state"
 STATE_PRIOR_RESEARCH = "co_scientist_prior_research"
@@ -194,6 +214,21 @@ Rules:
 - Use step ids S1, S2, S3, ... in order.
 - Do not call tools.
 
+Citation requirement:
+- A final report without citations is incomplete. Every plan MUST produce at least one step
+  whose tool_hint is a literature or trial source that returns individual citable identifiers
+  (search_pubmed, search_pubmed_advanced, search_openalex_works, search_clinical_trials,
+  get_pubmed_abstract, get_pubmed_paper_details, search_gwas_associations, search_clinvar_variants).
+- If ALL steps use only aggregate or scoring tools (compare_targets_multi_axis, get_target_info,
+  check_druggability, get_target_drugs, summarize_target_expression_context,
+  summarize_target_competitive_landscape, summarize_target_safety_liabilities, search_targets,
+  search_disease_targets, search_diseases, search_reactome_pathways, get_string_interactions,
+  get_gene_info), you MUST append a dedicated literature corroboration step:
+    - tool_hint: search_pubmed (or search_openalex_works or search_clinical_trials)
+    - goal: "Find and record PMIDs / DOIs / NCT numbers for the key claims from the preceding steps."
+    - completion_condition: "At least 3 specific identifiers (PMID, DOI, or NCT) are recorded."
+- Place the literature step AFTER the aggregate steps so it can incorporate their findings.
+
 __BQ_POLICY__
 
 Output requirements:
@@ -234,6 +269,19 @@ Rules:
 - Prioritize high-signal evidence before broad expansion.
 - Surface contradictions and unresolved gaps explicitly.
 - Include source identifiers when available (PMID, DOI, NCT, OpenAlex IDs).
+
+Evidence ID requirements:
+- evidence_ids MUST be populated with real, specific identifiers (PMID:XXXXXXXX, DOI:10.xxxx,
+  NCT########) returned directly by tool calls. Never fabricate identifiers.
+- If the primary tool for this step does not return individual document IDs (e.g.,
+  compare_targets_multi_axis, get_target_info, check_druggability), you MUST make a secondary
+  call to search_pubmed or search_openalex_works using key terms from the findings to harvest
+  supporting PMIDs or DOIs. Add every returned PMID/DOI to evidence_ids.
+- A completed step with an empty evidence_ids array is only acceptable when the step is a
+  pure calculation, data transformation, or planning step with no literature or trial backing.
+- For ClinicalTrials results, record each trial as NCT########.
+- For PubMed results, record each article as PMID:XXXXXXXX.
+- For OpenAlex results, record each work as OpenAlex:WXXXXXXXXXX or its DOI.
 __BQ_POLICY__
 
 Output requirements:
@@ -999,14 +1047,34 @@ def _extract_inline_ids_from_text(text: str) -> list[str]:
     return ids
 
 
+_VALID_EVIDENCE_ID_RE = re.compile(
+    r"(?i)^("
+    r"PMID:\d{4,9}"
+    r"|DOI:10\..+"
+    r"|NCT\d{8}"
+    r"|OpenAlex:W\d+"
+    r"|PMC\d+"
+    r")$"
+)
+
+
 def _collect_all_evidence_ids(task_state: dict[str, Any]) -> list[str]:
-    """Return a deduplicated list of evidence IDs from all completed steps."""
+    """Return a deduplicated list of evidence IDs from all completed steps.
+
+    Only accepts recognised identifier formats (PMID, DOI, NCT, OpenAlex, PMC).
+    Raw URLs or arbitrary strings stored by the executor are silently dropped.
+    """
     seen: set[str] = set()
     ids: list[str] = []
     for step in task_state.get("steps", []):
         for eid in step.get("evidence_ids", []) or []:
             normalized = re.sub(r"\s*:\s*", ":", str(eid).strip())
-            if normalized and normalized.lower() not in seen:
+            if not normalized:
+                continue
+            if not _VALID_EVIDENCE_ID_RE.match(normalized):
+                logger.debug("Skipping non-standard evidence_id from references: %r", normalized)
+                continue
+            if normalized.lower() not in seen:
                 seen.add(normalized.lower())
                 ids.append(normalized)
     return ids
@@ -1026,6 +1094,35 @@ def _build_ref_map(ids: list[str]) -> dict[str, int]:
 
 _CITATION_META_CACHE: dict[str, dict] = {}
 _CITATION_FETCH_TIMEOUT = 6  # seconds
+
+# ---------------------------------------------------------------------------
+# URL link validation
+# ---------------------------------------------------------------------------
+
+_VALIDATED_URL_CACHE: dict[str, bool] = {}
+_URL_VALIDATE_TIMEOUT = 5  # seconds
+
+
+def _validate_url(url: str) -> bool:
+    """Return True if url responds with HTTP 2xx/3xx; False on error, timeout, or 4xx/5xx.
+
+    Results are cached for the process lifetime so repeated checks are free.
+    Uses HEAD to avoid downloading bodies.
+    """
+    if url in _VALIDATED_URL_CACHE:
+        return _VALIDATED_URL_CACHE[url]
+    try:
+        req = urllib.request.Request(
+            url,
+            method="HEAD",
+            headers={"User-Agent": "ai-co-scientist/1.0 (link-validator)"},
+        )
+        with urllib.request.urlopen(req, timeout=_URL_VALIDATE_TIMEOUT) as resp:
+            ok = 200 <= resp.status < 400
+    except Exception:  # noqa: BLE001  (network errors, timeouts, 4xx/5xx)
+        ok = False
+    _VALIDATED_URL_CACHE[url] = ok
+    return ok
 
 
 def _http_get_json(url: str) -> dict | None:
@@ -1200,7 +1297,10 @@ def _format_reference_apa(i: int, eid: str) -> str:
                 if cr_meta and cr_meta.get("title"):
                     cr_meta["pmid"] = pmid
                     return f"{anchor}{i}. {_build_apa_citation(cr_meta, pmid=pmid)}"
-        return f"{anchor}{i}. PMID: [{pmid}]({pmid_url})"
+        # Validate the fallback URL before emitting a clickable link
+        if _validate_url(pmid_url):
+            return f"{anchor}{i}. PMID: [{pmid}]({pmid_url})"
+        return f"{anchor}{i}. PMID: {pmid} _(link could not be verified)_"
 
     # DOI — fetch from CrossRef
     m = re.fullmatch(r"(?i)DOI:(10\..+)", raw)
@@ -1210,32 +1310,43 @@ def _format_reference_apa(i: int, eid: str) -> str:
         meta = _fetch_crossref_meta(doi)
         if meta and meta.get("title"):
             return f"{anchor}{i}. {_build_apa_citation(meta, doi=doi)}"
-        return f"{anchor}{i}. [{doi_url}]({doi_url})"
+        # Validate before emitting bare DOI link
+        if _validate_url(doi_url):
+            return f"{anchor}{i}. [{doi_url}]({doi_url})"
+        return f"{anchor}{i}. DOI: {doi} _(link could not be verified)_"
 
     # NCT — ClinicalTrials.gov
     m = re.fullmatch(r"(?i)(?:NCT:)?(NCT\d{8})", raw)
     if m:
         nct = m.group(1).upper()
         url = f"https://clinicaltrials.gov/study/{nct}"
-        return f"{anchor}{i}. U.S. National Library of Medicine. (n.d.). *ClinicalTrials.gov*. [{nct}]({url})"
+        if _validate_url(url):
+            return f"{anchor}{i}. U.S. National Library of Medicine. (n.d.). *ClinicalTrials.gov*. [{nct}]({url})"
+        return f"{anchor}{i}. U.S. National Library of Medicine. (n.d.). *ClinicalTrials.gov*. {nct} _(link could not be verified)_"
 
     # OpenAlex
     m = re.fullmatch(r"(?i)OpenAlex:(W\d+)", raw)
     if m:
         wid = m.group(1)
         url = f"https://openalex.org/{wid}"
-        return f"{anchor}{i}. *OpenAlex*. [{wid}]({url})"
+        if _validate_url(url):
+            return f"{anchor}{i}. *OpenAlex*. [{wid}]({url})"
+        return f"{anchor}{i}. *OpenAlex*. {wid} _(link could not be verified)_"
 
     # PMC
     m = re.fullmatch(r"(?i)(?:PMC:)?(PMC\d+)", raw)
     if m:
         pmc = m.group(1).upper()
         url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc}/"
-        return f"{anchor}{i}. National Library of Medicine. (n.d.). *PubMed Central*. [{pmc}]({url})"
+        if _validate_url(url):
+            return f"{anchor}{i}. National Library of Medicine. (n.d.). *PubMed Central*. [{pmc}]({url})"
+        return f"{anchor}{i}. National Library of Medicine. (n.d.). *PubMed Central*. {pmc} _(link could not be verified)_"
 
     url = _evidence_id_to_url(eid)
-    if url:
+    if url and _validate_url(url):
         return f"{anchor}{i}. [{eid}]({url})"
+    if url:
+        return f"{anchor}{i}. {eid} _(link could not be verified)_"
     return f"{anchor}{i}. {eid}"
 
 
@@ -1413,6 +1524,26 @@ def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -
         # Upgrade legacy heading
         text = text.replace("## Final Summary", "## Summary").replace("# Final Summary", "## Summary")
         text = "# AI Co-Scientist Report\n\n" + text
+
+    # Inject research question callout beneath the title if not already present.
+    objective = str(task_state.get("objective", "")).strip()
+    if objective and "**Research Question:**" not in text:
+        coverage_status = _compute_coverage_status(task_state)
+        completed = _completed_step_count(task_state)
+        total = _total_step_count(task_state)
+        coverage_label = "Complete" if coverage_status == "complete_plan" else "Partial"
+        callout = (
+            f"\n\n> **Research Question:** {objective}\n"
+            f">\n"
+            f"> **Coverage:** {coverage_label} \u2014 {completed} of {total} planned steps completed\n\n---"
+        )
+        title_pos = text.find("# AI Co-Scientist Report")
+        if title_pos != -1:
+            title_end = text.find("\n", title_pos)
+            if title_end != -1:
+                text = text[:title_end] + callout + text[title_end:]
+            else:
+                text += callout
 
     lowered = text.lower()
 
