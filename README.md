@@ -9,7 +9,7 @@ The AI Co-Scientist helps researchers:
 - **Evaluate druggability** of potential targets
 - **Find clinical trial evidence** from ClinicalTrials.gov
 - **Search scientific literature** via PubMed and Europe PMC preprints
-- **Assess post-marketing safety and regulatory labels** via openFDA
+- **Assess post-marketing safety and regulatory labels** via BigQuery (FDA drug data)
 - **Generate a query-specific execution plan** with explicit tool proposals
 - **Require human plan approval or revision** before evidence tools run
 - **Run iterative evidence refinement loops** with tool-use guardrails
@@ -268,7 +268,7 @@ bash scripts/deploy_cloud_run.sh
 | **Disease & Targets** | `search_diseases`, `search_disease_targets`, `get_target_info`, `search_targets` | Open Targets GraphQL |
 | **Druggability** | `check_druggability`, `get_target_drugs` | Open Targets GraphQL |
 | **Clinical Trials** | `search_clinical_trials`, `get_clinical_trial`, `summarize_clinical_trials_landscape` | ClinicalTrials.gov |
-| **Post-Marketing Safety & Labels** | `summarize_openfda_adverse_events`, `get_openfda_drug_label_summary` | openFDA (FAERS, Drug Label) |
+| **Post-Marketing Safety & Labels** | `run_bigquery_select_query` (fda_drug dataset) | BigQuery (FDA Drug) |
 | **Chemistry Evidence** | `search_chembl_compounds_for_target` | ChEMBL |
 | **Expression & Cell Context** | `summarize_target_expression_context` | Open Targets GraphQL |
 | **Genetic Direction-of-Effect** | `infer_genetic_effect_direction` | GWAS Catalog |
@@ -303,7 +303,7 @@ Notes:
 - **[ClinicalTrials.gov](https://clinicaltrials.gov/)** - Clinical trial registry
 - **[PubMed/NCBI](https://pubmed.ncbi.nlm.nih.gov/)** - Scientific literature, gene information
 - **[Europe PMC](https://europepmc.org/)** - Biomedical literature and preprints (including medRxiv/bioRxiv)
-- **[openFDA](https://open.fda.gov/apis/)** - FAERS adverse-event reports and FDA drug labeling data
+- **[FDA Drug (BigQuery)](https://console.cloud.google.com/bigquery?p=bigquery-public-data&d=fda_drug)** - FAERS adverse-event reports and FDA drug labeling data via BigQuery
 - **[GWAS Catalog](https://www.ebi.ac.uk/gwas/)** - Variant-trait associations and effect direction signals
 - **[ChEMBL](https://www.ebi.ac.uk/chembl/)** - Compound bioactivity and target chemical evidence
 - **[OLS / EFO / MONDO](https://www.ebi.ac.uk/ols4/)** - Ontology expansion, synonyms, and hierarchy context

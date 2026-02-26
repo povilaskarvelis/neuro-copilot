@@ -115,7 +115,7 @@ def test_initialize_and_advance_task_state_one_step_at_a_time():
             {
                 "id": "S1",
                 "goal": "Find genetic evidence",
-                "tool_hint": "search_gwas_associations",
+                "tool_hint": "human_genome_variants",
                 "completion_condition": "At least two relevant associations",
             },
             {
@@ -142,7 +142,7 @@ def test_initialize_and_advance_task_state_one_step_at_a_time():
         "result_summary": "Found multiple Parkinson's associations implicating LRRK2.",
         "evidence_ids": ["PMID:123", "GWAS:study-1"],
         "open_gaps": ["Need effect direction consistency check"],
-        "suggested_next_searches": ["infer_genetic_effect_direction for top variants"],
+        "suggested_next_searches": ["run_bigquery_select_query for top variants"],
     }
     workflow._apply_step_execution_result_to_task_state(task_state, result_s1)
 
@@ -209,7 +209,7 @@ def test_react_step_rendering_includes_trace():
 def test_parse_react_phases_structured():
     trace = (
         "REASON: I need to find IPF publications.\n"
-        "ACT: Called search_pubmed with query 'IPF treatment'.\n"
+        "ACT: Called run_bigquery_select_query with query 'IPF treatment'.\n"
         "OBSERVE: Found 15 results including 3 RCTs.\n"
         "CONCLUDE: Sufficient data for this step."
     )
@@ -220,7 +220,7 @@ def test_parse_react_phases_structured():
     assert "OBSERVE" in phases
     assert "CONCLUDE" in phases
     assert "IPF publications" in phases["REASON"]
-    assert "search_pubmed" in phases["ACT"]
+    assert "run_bigquery_select_query" in phases["ACT"]
 
 
 def test_parse_react_phases_returns_none_for_unstructured():
@@ -235,15 +235,15 @@ def test_render_react_trace_block_with_tools():
         "OBSERVE: Got 10 results.\n"
         "CONCLUDE: Done."
     )
-    lines = workflow._render_react_trace_block(trace, ["search_pubmed", "get_pubmed_abstract"])
+    lines = workflow._render_react_trace_block(trace, ["run_bigquery_select_query", "list_bigquery_tables"])
     text = "\n".join(lines)
     assert "ReAct Trace" in text
     assert "Reason:" in text
     assert "Act:" in text
     assert "Observe:" in text
     assert "Conclude:" in text
-    assert "`search_pubmed`" in text
-    assert "PubMed" in text
+    assert "`run_bigquery_select_query`" in text
+    assert "BigQuery" in text
 
 
 def test_render_react_step_progress_with_structured_trace():
@@ -254,7 +254,7 @@ def test_render_react_step_progress_with_structured_trace():
         "steps": [
             {
                 "id": "S1", "status": "completed", "goal": "Find papers",
-                "tools_called": ["search_pubmed"],
+                "tools_called": ["run_bigquery_select_query"],
             },
             {"id": "S2", "status": "pending", "goal": "Check trials"},
         ],
@@ -267,18 +267,18 @@ def test_render_react_step_progress_with_structured_trace():
         "evidence_ids": ["PMID:111"],
         "open_gaps": [],
     }
-    trace = "REASON: Need IPF data.\nACT: Searched PubMed.\nOBSERVE: Found results.\nCONCLUDE: Step complete."
+    trace = "REASON: Need IPF data.\nACT: Queried BigQuery.\nOBSERVE: Found results.\nCONCLUDE: Step complete."
     rendered = workflow._render_react_step_progress(task_state, result, trace)
     assert "ReAct Trace" in rendered
     assert "> **Reason:**" in rendered
     assert "> **Act:**" in rendered
     assert "> **Observe:**" in rendered
     assert "> **Conclude:**" in rendered
-    assert "`search_pubmed`" in rendered
+    assert "`run_bigquery_select_query`" in rendered
 
 
 def test_resolve_source_label():
-    assert workflow._resolve_source_label("search_pubmed") == "PubMed"
+    assert workflow._resolve_source_label("run_bigquery_select_query") == "BigQuery"
     assert workflow._resolve_source_label("search_clinical_trials") == "ClinicalTrials.gov"
     assert workflow._resolve_source_label("unknown_tool") == "unknown_tool"
     assert workflow._resolve_source_label("") == ""

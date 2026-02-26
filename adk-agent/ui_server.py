@@ -861,16 +861,51 @@ class UiRuntime:
                     task_id=task_id,
                 )
 
-                response_text = await self._run_workflow_turn(
-                    conv_id, query, run_id=run_id,
-                )
+                max_plan_attempts = 2
+                for plan_attempt in range(1, max_plan_attempts + 1):
+                    response_text = await self._run_workflow_turn(
+                        conv_id, query, run_id=run_id,
+                    )
 
-                wf_state = await self._read_workflow_state(conv_id)
-                plan_pending = await self._is_plan_pending_approval(conv_id)
-                task["steps"] = _steps_from_workflow_state(wf_state)
-                task["current_step_index"] = 0
+                    wf_state = await self._read_workflow_state(conv_id)
+                    plan_pending = await self._is_plan_pending_approval(conv_id)
+                    task["steps"] = _steps_from_workflow_state(wf_state)
+                    task["current_step_index"] = 0
 
-                if plan_pending:
+                    planner_failed = not wf_state and not plan_pending
+                    if planner_failed and plan_attempt < max_plan_attempts:
+                        logger.warning(
+                            "[new_task] Planner failed (attempt %d/%d), retrying...",
+                            plan_attempt, max_plan_attempts,
+                        )
+                        await self._append_progress_event(
+                            run_id,
+                            phase="plan",
+                            event_type="plan.retry",
+                            status="progress",
+                            human_line=f"Plan generation failed (attempt {plan_attempt}), retrying...",
+                            task_id=task_id,
+                        )
+                        continue
+                    break
+
+                if planner_failed:
+                    task["status"] = "failed"
+                    task["report_markdown"] = response_text
+                    await self._save_task_with_progress(task, run_id)
+                    await self._update_run(
+                        run_id, status="failed", task_id=task_id,
+                        error="Planner failed to generate a valid research plan.",
+                    )
+                    await self._append_progress_event(
+                        run_id,
+                        phase="plan",
+                        event_type="plan.failed",
+                        status="error",
+                        human_line="Failed to generate research plan. Please try again.",
+                        task_id=task_id,
+                    )
+                elif plan_pending:
                     task["awaiting_hitl"] = True
                     task["status"] = "in_progress"
                     await self._append_progress_event(

@@ -104,8 +104,6 @@ KNOWN_MCP_TOOLS = [
     "search_clinical_trials",
     "get_clinical_trial",
     "summarize_clinical_trials_landscape",
-    # Post-marketing safety aggregations (richer event-level rollups than BQ)
-    "summarize_openfda_adverse_events",
     # Researcher discovery (live index, no BQ equivalent)
     "search_openalex_works",
     "search_openalex_authors",
@@ -139,7 +137,7 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "deepmind_alphafold": "AlphaFold",
     "immune_epitope_db": "IEDB",
     "nlm_rxnorm": "RxNorm",
-    "fda_drug": "FDA Drug Labels",
+    "fda_drug": "FDA Drug (BigQuery)",
     "umiami_lincs": "LINCS L1000",
     "ebi_surechembl": "SureChEMBL",
     "pmc_open_access_commercial": "PubMed Central",
@@ -147,41 +145,20 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "hackathon_data": "CIViC / ClinGen",
     "civic": "CIViC",
     "clingen": "ClinGen",
+    # Remaining MCP tools (live APIs with no BQ equivalent)
     "benchmark_dataset_overview": "Benchmark Datasets",
-    "sample_pubmedqa_examples": "PubMedQA",
-    "sample_bioasq_examples": "BioASQ",
     "check_gpqa_access": "GPQA",
-    "search_diseases": "Open Targets Platform",
-    "expand_disease_context": "Open Targets Platform",
-    "search_targets": "Open Targets Platform",
-    "search_disease_targets": "Open Targets Platform",
-    "get_target_info": "Open Targets Platform",
-    "check_druggability": "Open Targets Platform",
-    "get_target_drugs": "Open Targets Platform",
-    "summarize_target_expression_context": "Open Targets Platform",
-    "summarize_target_competitive_landscape": "Open Targets Platform",
-    "summarize_target_safety_liabilities": "Open Targets Platform",
-    "compare_targets_multi_axis": "Open Targets Platform",
     "search_clinical_trials": "ClinicalTrials.gov",
     "get_clinical_trial": "ClinicalTrials.gov",
     "summarize_clinical_trials_landscape": "ClinicalTrials.gov",
-    "search_pubmed": "PubMed",
-    "search_pubmed_advanced": "PubMed",
-    "get_pubmed_abstract": "PubMed",
-    "get_pubmed_paper_details": "PubMed",
-    "get_pubmed_author_profile": "PubMed",
     "search_openalex_works": "OpenAlex",
     "search_openalex_authors": "OpenAlex",
     "rank_researchers_by_activity": "OpenAlex",
     "get_researcher_contact_candidates": "OpenAlex",
-    "search_chembl_compounds_for_target": "ChEMBL",
-    "search_gwas_associations": "GWAS Catalog",
-    "infer_genetic_effect_direction": "GWAS Catalog",
-    "search_clinvar_variants": "ClinVar",
-    "get_clinvar_variant_details": "ClinVar",
     "search_reactome_pathways": "Reactome",
     "get_string_interactions": "STRING",
-    "get_gene_info": "NCBI Gene",
+    "search_uniprot_proteins": "UniProt",
+    "get_uniprot_protein_profile": "UniProt",
     "list_local_datasets": "Local Datasets",
     "read_local_dataset": "Local Datasets",
 }
@@ -281,13 +258,13 @@ Rules:
 Source citation rules:
 - Each step in the context has a `source` field with the database/source name (e.g. "PubMed", "ClinicalTrials.gov").
 - A `source_reference` legend maps internal tool names to database names.
-- When citing findings, use ONLY the database/source name. NEVER mention tool names (like search_pubmed, get_target_info, etc.) in the report.
-  Good: "According to PubMed, three RCTs showed..."
+- When citing findings, use ONLY the database/source name. NEVER mention tool names (like run_bigquery_select_query, search_clinical_trials, etc.) in the report.
+  Good: "According to PubMed Central (BigQuery), three RCTs showed..."
   Good: "Open Targets Platform data indicates BRCA1 has high genetic association..."
   Good: "ClinicalTrials.gov lists 12 active Phase II trials..."
-  Bad:  "search_pubmed returned three RCTs..."
-  Bad:  "Using the search_pubmed tool..."
-  Bad:  "PubMed (search_pubmed) data shows..."
+  Bad:  "run_bigquery_select_query returned three RCTs..."
+  Bad:  "Using the search_clinical_trials tool..."
+  Bad:  "BigQuery (run_bigquery_select_query) data shows..."
 - Include specific identifiers inline when available (PMID, DOI, NCT numbers, etc.).
 - NEVER include raw URLs, API endpoints, or links to JSON output in the report. Only use human-readable source names and identifiers.
 
@@ -2326,14 +2303,29 @@ def _synth_after_model_callback(*, callback_context: CallbackContext, llm_respon
 BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_tables` and `run_bigquery_select_query`):
 
   === Drug targets, diseases & evidence ===
-  **bigquery-public-data.open_targets_platform** — Comprehensive drug target data:
-    - disease, target, interaction, expression: disease-target associations, tractability/druggability
-    - known_drug, drug_molecule, drug_mechanism_of_action, drug_warning: drugs and safety
-    - evidence_* tables (evidence_gwas_credible_sets, evidence_chembl, evidence_clingen, evidence_reactome,
-      evidence_eva, evidence_intogen, evidence_gene_burden, etc.): all evidence types
-    - openfda_significant_adverse_drug_reactions: post-marketing safety signals
-    - go, mouse_phenotype, literature: gene ontology, phenotypes, literature mining
-    - l2g_prediction, credible_set, colocalisation: genetic evidence and variant-to-gene mapping
+  **bigquery-public-data.open_targets_platform** (61 tables) — Comprehensive drug target data.
+    IMPORTANT: Always run `list_bigquery_tables(dataset="open_targets_platform")` first to see all
+    tables and then `SELECT * FROM open_targets_platform.<table> LIMIT 1` to inspect column names
+    before writing queries. Table and column names are NOT obvious — do NOT guess them.
+
+    Key tables and their primary columns:
+    - **target**: id (Ensembl gene ID, e.g. "ENSG00000012048"), approvedSymbol ("BRCA1"),
+      approvedName, biotype, tractability, safetyLiabilities, pathways, proteinIds
+    - **disease**: id (EFO/MONDO ID, e.g. "EFO_0001075"), name ("ovarian carcinoma"),
+      therapeuticAreas, synonyms, ontology
+    - **evidence**: targetId (Ensembl ID), diseaseId (EFO ID), datasourceId, datatypeId,
+      score, literature, drugId. Filter by targetId + diseaseId, NOT gene symbols.
+    - **known_drug**, **drug_molecule**, **drug_mechanism_of_action**, **drug_warning**: drug data
+    - **evidence_*** (evidence_gwas_credible_sets, evidence_chembl, evidence_clingen, etc.): typed evidence
+    - **openfda_significant_adverse_drug_reactions**: post-marketing safety signals
+    - **go**, **mouse_phenotype**, **literature**: gene ontology, phenotypes, literature mining
+    - **l2g_prediction**, **credible_set**, **colocalisation**: genetic evidence, variant-to-gene mapping
+    - **expression**: tissue/cell expression data
+    - **interaction**, **interaction_evidence**: protein-protein interactions
+
+    Query pattern: To find evidence for a gene + disease, first look up the Ensembl ID from
+    `target` (WHERE approvedSymbol = 'BRCA1') and the EFO ID from `disease` (WHERE name LIKE
+    '%ovarian%'), then query `evidence` using those IDs.
 
   === Chemistry & bioactivity ===
   **bigquery-public-data.ebi_chembl** — Bioactive compounds, target bioactivity (IC50/Ki/EC50), assay data,
@@ -2362,8 +2354,9 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
   === Drug nomenclature & regulatory ===
   **bigquery-public-data.nlm_rxnorm** — RxNorm drug nomenclature, ingredient relationships, and
     clinical drug pathways. Use for standardizing drug names across sources.
-  **bigquery-public-data.fda_drug** — FDA drug labels and enforcement actions. Tables: drug_label,
-    drug_enforcement. Structured alternative to openFDA API for label lookups.
+  **bigquery-public-data.fda_drug** — FDA drug data: adverse event reports (FAERS), drug labels,
+    NDC product listings, enforcement actions. Use for post-marketing safety analysis, label
+    information, and regulatory data.
 
   === Perturbation biology ===
   **bigquery-public-data.umiami_lincs** — LINCS L1000 perturbation signatures: cell lines, small molecules,
@@ -2383,30 +2376,41 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
     - civic_* tables: Cancer variant clinical interpretations (assertions, evidence, variants, molecular profiles)
     - clingen_* tables: Gene-disease validity, variant pathogenicity, dosage sensitivity, actionability
 
+  **How to query**: You can use short dataset names — they are auto-expanded to the full project path.
+  For example, `open_targets_platform.target` is automatically resolved to
+  `bigquery-public-data.open_targets_platform.target`. Both forms work in SQL and list_bigquery_tables.
+
   Start every structured data lookup with BigQuery. Use `list_bigquery_tables` to discover table schemas.
   Write Standard SQL via `run_bigquery_select_query`. Fall back to non-BigQuery MCP tools only for:
     - ClinicalTrials.gov (search_clinical_trials, get_clinical_trial, etc.)
-    - openFDA adverse event aggregations (summarize_openfda_adverse_events — richer rollups than fda_drug tables)
     - OpenAlex researcher discovery (search_openalex_works, search_openalex_authors, etc.)
     - UniProt protein profiles (detailed isoforms, PTMs beyond AlphaFold metadata)
     - Reactome pathway hierarchies (search_reactome_pathways)
     - STRING protein-protein interactions (get_string_interactions)
   Do NOT use external APIs for: gene info (use open_targets_platform.target), disease ontology
-    (use open_targets_platform.disease), drug labels (use fda_drug.drug_label), literature search
-    (use pmc_open_access_commercial or breathe), preprints (use breathe.biorxiv/medrxiv),
+    (use open_targets_platform.disease), drug labels and adverse events (use fda_drug via BigQuery),
+    literature search (use pmc_open_access_commercial or breathe), preprints (use breathe.biorxiv/medrxiv),
     variant annotations (use gnomAD, human_variant_annotation, human_genome_variants)."""
 
 
 BQ_EXECUTOR_POLICY = """- BigQuery-first policy: For any structured data lookup, prefer `list_bigquery_tables` \
-and `run_bigquery_select_query` over non-BQ tools. Available datasets include: \
-open_targets_platform (targets, diseases, drugs, evidence), ebi_chembl (bioactivity), \
+and `run_bigquery_select_query` over non-BQ tools. Short dataset names are auto-expanded to the full \
+project path (e.g. `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`). \
+Available datasets: open_targets_platform (targets, diseases, drugs, evidence), ebi_chembl (bioactivity), \
 gnomAD (variant frequencies), human_genome_variants, human_variant_annotation (Ensembl), \
-deepmind_alphafold (protein structures), immune_epitope_db (IEDB), fda_drug (labels), \
-nlm_rxnorm (drug nomenclature), umiami_lincs (perturbation signatures), ebi_surechembl (patents), \
+deepmind_alphafold (protein structures), immune_epitope_db (IEDB), \
+nlm_rxnorm (drug nomenclature), fda_drug (adverse events, drug labels, NDC, enforcement), \
+umiami_lincs (perturbation signatures), ebi_surechembl (patents), \
 pmc_open_access_commercial (PubMed Central full text), breathe (bioRxiv/arxiv/BioASQ), \
-and project hackathon_data (CIViC, ClinGen). Use `list_bigquery_tables` to discover schemas. \
-Fall back to non-BQ tools only for ClinicalTrials.gov, openFDA aggregations, OpenAlex, \
-UniProt, Reactome pathways, and STRING interactions."""
+and project hackathon_data (CIViC, ClinGen).
+CRITICAL: Before writing any SQL query, you MUST first:
+  1. Call `list_bigquery_tables(dataset="<dataset_name>")` to see all available tables.
+  2. Run `SELECT * FROM <dataset>.<table> LIMIT 1` to inspect actual column names.
+  Do NOT guess table or column names — they are often singular (e.g. "target" not "targets") \
+  and use IDs rather than human-readable names (e.g. targetId is an Ensembl ID like "ENSG00000012048", \
+  diseaseId is an EFO ID like "EFO_0001075"). Look up IDs from reference tables first.
+Fall back to non-BQ tools only for ClinicalTrials.gov, \
+OpenAlex, UniProt, Reactome pathways, and STRING interactions."""
 
 
 def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
@@ -2430,7 +2434,7 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
             "- BigQuery-first policy:\n"
             f"{BQ_DATASET_CATALOG}"
             "\n- tool_hint for BigQuery steps: use the specific dataset name (e.g. open_targets_platform,"
-            " pmc_open_access_commercial, gnomad, ebi_chembl, deepmind_alphafold, fda_drug, hackathon_data)"
+            " pmc_open_access_commercial, gnomad, ebi_chembl, deepmind_alphafold, hackathon_data)"
             " rather than run_bigquery_select_query, so the plan clearly shows which source is being accessed."
         )
     else:
