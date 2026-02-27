@@ -225,14 +225,6 @@ function sanitizeXmlText(value) {
   return value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Request failed (${response.status}): ${url}`);
-  }
-  return response.json();
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -481,24 +473,6 @@ async function fetchJsonWithRetry(url, options = {}) {
   return response.json();
 }
 
-async function fetchText(url) {
-  const response = await fetchWithRetry(url);
-  return response.text();
-}
-
-function isLikelyTransientUpstreamError(error) {
-  const message = String(error?.message || "").toLowerCase();
-  return (
-    message.includes("request failed (5") ||
-    message.includes("request failed (429)") ||
-    message.includes("operation was aborted") ||
-    message.includes("aborted") ||
-    message.includes("fetch failed") ||
-    message.includes("econnreset") ||
-    message.includes("etimedout") ||
-    message.includes("gateway timeout")
-  );
-}
 function renderStructuredResponse({ summary, keyFields = [], sources = [], limitations = [] }) {
   const fields =
     keyFields.length > 0

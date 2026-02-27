@@ -473,15 +473,13 @@ def run_interactive() -> None:
     run_native_interactive()
 
 
-async def run_single_query_async(query: str, *, state_store_path: Path | None = None) -> str:
+async def run_single_query_async(query: str) -> str:
     """Compatibility alias for ADK-native single-query mode."""
-    del state_store_path
     return await run_single_query_native_async(query)
 
 
-def run_single_query(query: str, *, state_store_path: Path | None = None) -> str:
+def run_single_query(query: str) -> str:
     """Compatibility alias for ADK-native single-query mode."""
-    del state_store_path
     return run_single_query_native(query)
 
 

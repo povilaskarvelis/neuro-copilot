@@ -837,28 +837,3 @@ def write_markdown_pdf(markdown: str, output_path: Path, *, title: str = "AI Co-
         return None
 
     return f"{high_fidelity_error} Fallback renderer error: {legacy_error}"
-
-
-def write_markdown_with_pdf(
-    markdown_path: Path,
-    content: str,
-    *,
-    title: str,
-    enable_pdf: bool = True,
-) -> tuple[str, str | None]:
-    """
-    Persist markdown to disk and optionally emit a sidecar PDF.
-
-    Returns:
-        (pdf_path, error). pdf_path is empty when PDF generation is disabled or failed.
-    """
-    normalized = (content or "").rstrip() + "\n"
-    markdown_path.parent.mkdir(parents=True, exist_ok=True)
-    markdown_path.write_text(normalized, encoding="utf-8")
-    if not enable_pdf:
-        return "", "PDF export disabled by --no-pdf."
-    pdf_path = markdown_path.with_suffix(".pdf")
-    pdf_error = write_markdown_pdf(normalized, pdf_path, title=title)
-    if pdf_error:
-        return "", pdf_error
-    return str(pdf_path), None

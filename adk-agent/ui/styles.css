@@ -1,7 +1,5 @@
 :root {
   --bg: #070707;
-  --bg-elev: #0b0b0b;
-  --bg-elev-2: #111111;
   --line: #1f1f1f;
   --line-strong: #2f2f2f;
   --text: #f6f6f6;
@@ -325,19 +323,51 @@ body.expanded .workspace.report-open .report-panel {
 }
 
 .landing-hero {
-  display: block;
-  text-align: left;
-  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  margin-bottom: 72px;
+  padding-top: 20px;
   animation: rise 260ms ease both;
 }
 
-.landing-question {
-  margin: 0;
-  font-size: clamp(1.5rem, 3.6vw, 2.3rem);
+.landing-title {
+  margin: 0 0 12px;
+  font-size: clamp(2rem, 5vw, 3.2rem);
   line-height: 1.08;
-  letter-spacing: -0.01em;
-  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-weight: 700;
   color: #f8f8f8;
+}
+
+.landing-subtitle {
+  margin: 0 0 16px;
+  font-size: clamp(1rem, 2.2vw, 1.25rem);
+  font-weight: 450;
+  color: #b8b8b8;
+  line-height: 1.35;
+  letter-spacing: 0.01em;
+}
+
+.landing-databases {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.db-badge {
+  display: inline-block;
+  border: 1px solid #2a2a2a;
+  border-radius: 999px;
+  padding: 5px 14px;
+  font-size: 0.76rem;
+  font-weight: 500;
+  color: var(--muted);
+  background: #0e0e0e;
+  letter-spacing: 0.02em;
 }
 
 body.expanded .landing-hero {
@@ -454,14 +484,6 @@ body.expanded .messages {
   line-height: 1.25;
 }
 
-.activity-status {
-  font-size: 0.72rem;
-  color: #a7b2c4;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  flex: 0 0 auto;
-}
-
 .activity-summary {
   font-size: 0.8rem;
   color: #cad8e8;
@@ -530,14 +552,6 @@ body.expanded .messages {
 
 .checkpoint-start-btn {
   margin-top: 8px;
-}
-
-.checkpoint-action-message {
-  padding-top: 0;
-}
-
-.checkpoint-action-message .checkpoint-start-btn {
-  margin-top: 2px;
 }
 
 .report-card {
@@ -819,16 +833,6 @@ body.expanded .messages {
   padding: 0.85em 0.95em;
 }
 
-.report-plain-text {
-  margin: 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-  font: inherit;
-  line-height: inherit;
-  color: inherit;
-}
-
 .composer {
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -850,6 +854,7 @@ body.expanded .composer {
 .example-queries {
   display: flex;
   flex-wrap: wrap;
+  justify-content: center;
   gap: 8px;
   margin-top: 12px;
   animation: rise 320ms ease both;

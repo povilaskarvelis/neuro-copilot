@@ -386,17 +386,6 @@ function setActivityExpanded(taskId, expanded) {
   state.activityExpandedByTask[activityExpansionKey(taskId)] = !!expanded;
 }
 
-function getStatusLabel(status) {
-  const normalized = String(status || "").trim();
-  if (normalized === "running" || normalized === "in_progress") return "Running";
-  if (normalized === "completed") return "Complete";
-  if (normalized === "awaiting_hitl") return "Checkpoint";
-  if (normalized === "needs_clarification") return "Needs Input";
-  if (normalized === "failed") return "Failed";
-  if (normalized === "queued") return "Queued";
-  return "Idle";
-}
-
 function reactTraceLines({ trace = "", phases = null } = {}) {
   const lines = [];
   const normalizedTrace = String(trace || "").trim();

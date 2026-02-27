@@ -15,7 +15,6 @@ from pathlib import Path
 import re
 import time
 from typing import Any
-import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -47,26 +46,6 @@ BQ_PRIORITY_TOOLS = [
     "list_bigquery_tables",
     "run_bigquery_select_query",
 ]
-
-# Tools that return aggregate scores / structured data but NO individual citable IDs
-# (no PMIDs, DOIs, or NCT numbers). Plans using only these tools must add a
-# complementary literature step so citations can be surfaced.
-CITATION_FREE_TOOLS: frozenset[str] = frozenset({
-    "search_diseases",
-    "expand_disease_context",
-    "search_targets",
-    "search_disease_targets",
-    "get_target_info",
-    "check_druggability",
-    "get_target_drugs",
-    "summarize_target_expression_context",
-    "summarize_target_competitive_landscape",
-    "summarize_target_safety_liabilities",
-    "compare_targets_multi_axis",
-    "search_reactome_pathways",
-    "get_string_interactions",
-    "get_gene_info",
-})
 
 STATE_WORKFLOW_TASK = "workflow_task_state"
 STATE_WORKFLOW_TASK_LEGACY_APP = "app:workflow_task_state"
@@ -1713,13 +1692,6 @@ def _render_no_plan_to_finalize_message() -> str:
     )
 
 
-def _render_all_steps_complete_message() -> str:
-    return (
-        "## Execution\n\n"
-        "All planned steps are already complete. Reply `finalize` to generate the final summary."
-    )
-
-
 def _planner_json_instruction_suffix() -> str:
     return (
         "Return ONLY valid JSON matching `plan_internal.v1` for this objective. "
@@ -2677,7 +2649,6 @@ def create_workflow_agent(
     *,
     tool_filter: list[str] | None = None,
     model: str | None = None,
-    max_plan_iterations: int | None = None,
     prefer_bigquery: bool | None = None,
     require_plan_approval: bool = False,
 ) -> tuple[SequentialAgent, McpToolset | None]:
@@ -2688,8 +2659,6 @@ def create_workflow_agent(
             generation and waits for the user to ``approve`` or
             ``revise: <feedback>`` before executing the plan.
     """
-    del max_plan_iterations
-
     runtime_model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
 

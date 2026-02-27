@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AI Co-Scientist UI</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260219-30" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260226-32" />
   </head>
   <body>
     <div class="shell">
@@ -32,10 +32,30 @@
 
         <div id="workspace" class="workspace">
           <section class="chat-panel">
-            <section id="landingHero" class="landing-hero">
-              <h1 class="landing-question">How can I help with your research?
-
-              </h1>
+            <section class="landing-hero">
+              <h1 class="landing-title">AI Co-Scientist</h1>
+              <p class="landing-subtitle">Synthesizes evidence across databases to guide pre-clinical decisions</p>
+              <div class="landing-databases">
+                <span class="db-badge">Open Targets</span>
+                <span class="db-badge">ChEMBL</span>
+                <span class="db-badge">ClinicalTrials.gov</span>
+                <span class="db-badge">PubMed</span>
+                <span class="db-badge">OpenAlex</span>
+                <span class="db-badge">UniProt</span>
+                <span class="db-badge">Reactome</span>
+                <span class="db-badge">STRING</span>
+                <span class="db-badge">AlphaFold</span>
+                <span class="db-badge">gnomAD</span>
+                <span class="db-badge">Ensembl VEP</span>
+                <span class="db-badge">1000 Genomes</span>
+                <span class="db-badge">IEDB</span>
+                <span class="db-badge">RxNorm</span>
+                <span class="db-badge">FDA FAERS</span>
+                <span class="db-badge">LINCS L1000</span>
+                <span class="db-badge">SureChEMBL</span>
+                <span class="db-badge">CIViC</span>
+                <span class="db-badge">ClinGen</span>
+              </div>
             </section>
             <div id="messages" class="messages"></div>
             <form id="composerForm" class="composer">
@@ -55,12 +75,12 @@
               </button>
             </form>
             <div id="exampleQueries" class="example-queries">
-              <div class="example-query" data-query="Is PCSK9 likely to succeed in clinical trials for cardiovascular disease?">Is PCSK9 likely to succeed in clinical trials for cardiovascular disease?</div>
-              <div class="example-query" data-query="Find researchers who have published on idiopathic pulmonary fibrosis (IPF) treatment in the last 3 years">Find researchers who have published on IPF treatment in the last 3 years</div>
-              <div class="example-query" data-query="Evaluate LRRK2 as a drug target for Parkinson disease — what is the genetic evidence, druggability, and competitive landscape?">Evaluate LRRK2 as a drug target for Parkinson disease</div>
-              <div class="example-query" data-query="Compare BRCA1 and BRCA2 as therapeutic targets in ovarian cancer across genetic association, safety, and pipeline activity">Compare BRCA1 and BRCA2 as therapeutic targets in ovarian cancer</div>
-              <div class="example-query" data-query="What are the known safety liabilities of targeting JAK1 in rheumatoid arthritis, and how do they compare to IL-6 inhibition?">Safety liabilities of targeting JAK1 in RA vs IL-6 inhibition</div>
-              <div class="example-query" data-query="Identify and rank the top 5 therapeutic molecular targets that you predict are most likely to lead to successful Phase II/III clinical trials for Alzheimer's Disease prior to 2010">Rank top 5 molecular targets for Alzheimer's Disease clinical trials</div>
+              <div class="example-query" data-query="Evaluate LRRK2 as a drug target for Parkinson disease — what is the genetic evidence, druggability, and competitive landscape?">Evaluate LRRK2 as a drug target for Parkinson's</div>
+              <div class="example-query" data-query="Is KRAS G12C structurally druggable? What do predicted protein structures and known interaction partners suggest about tractable binding sites?">Is KRAS G12C structurally druggable?</div>
+              <div class="example-query" data-query="What are the population-level variant frequencies for BRCA1, and which variants are classified as clinically significant?">BRCA1 variant frequencies and clinical significance</div>
+              <div class="example-query" data-query="What post-marketing safety signals exist for JAK inhibitors, and how selective are they across the kinase family?">JAK inhibitor safety signals and kinase selectivity</div>
+              <div class="example-query" data-query="What immune epitopes are known for PD-L1, and which signaling pathways does it participate in?">PD-L1 immune epitopes and signaling pathways</div>
+              <div class="example-query" data-query="Who are the most active researchers working on CAR-T therapy for solid tumors, and what are the recent breakthroughs?">Active researchers and breakthroughs in CAR-T for solid tumors</div>
             </div>
           </section>
 
