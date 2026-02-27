@@ -1174,22 +1174,26 @@ function buildClinicalTrialsLandscapePayload({
 
 
 // ============================================
-// TOOL 5: List BigQuery tables (read-only metadata)
+// TOOL 5: List BigQuery tables (read-only metadata) + schema discovery
 // ============================================
 server.registerTool(
   "list_bigquery_tables",
   {
     description:
-      "Lists tables for a BigQuery dataset. Dataset allowlist can be enforced via BQ_DATASET_ALLOWLIST.",
+      "Lists tables for a BigQuery dataset with column schemas. When `table` is provided, returns the full column schema (name, type, description) for that table — use this to discover column names before writing queries. When `table` is omitted, lists all tables in the dataset.",
     inputSchema: {
       dataset: z
         .string()
         .optional()
-        .describe("Dataset as `project.dataset` or just `dataset` (e.g. 'open_targets_platform'). Short names are resolved against the allowlist. If omitted, uses first allowlisted dataset."),
-      limit: z.number().optional().default(200).describe("Maximum number of tables to return (1-200)."),
+        .describe("Dataset as `project.dataset` or just `dataset` (e.g. 'open_targets_platform', 'deepmind_alphafold'). Short names are resolved against the allowlist. If omitted, uses first allowlisted dataset."),
+      table: z
+        .string()
+        .optional()
+        .describe("Table name to inspect (e.g. 'metadata', 'evidence'). When provided, returns the full column schema for that table instead of the table list."),
+      limit: z.number().optional().default(200).describe("Maximum number of tables to return (1-200). Ignored when `table` is set."),
     },
   },
-  async ({ dataset = "", limit = 200 }) => {
+  async ({ dataset = "", table = "", limit = 200 }) => {
     const boundedLimit = Math.max(1, Math.min(200, Math.round(Number(limit) || 200)));
     const normalizedDataset = normalizeBigQueryDatasetKey(dataset);
     const selectedDataset = normalizedDataset || BQ_ALLOWED_DATASETS[0] || "";
@@ -1223,9 +1227,81 @@ server.registerTool(
       };
     }
 
+    const client = getBigQueryClient();
+    const datasetRef = client.dataset(datasetId, { projectId });
+
+    const requestedTable = normalizeWhitespace(table || "").trim();
+    if (requestedTable) {
+      try {
+        const tableRef = datasetRef.table(requestedTable);
+        const [tableMetadata] = await tableRef.getMetadata();
+        const schemaFields = tableMetadata?.schema?.fields || [];
+        if (!schemaFields.length) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: renderStructuredResponse({
+                  summary: `Table \`${selectedDataset}.${requestedTable}\` exists but has no schema fields.`,
+                  keyFields: [`Dataset: ${selectedDataset}`, `Table: ${requestedTable}`],
+                  sources: [`bigquery://${selectedDataset}.${requestedTable}`],
+                  limitations: ["The table may be empty or use a non-standard schema."],
+                }),
+              },
+            ],
+          };
+        }
+
+        function formatFields(fields, indent = 0) {
+          const lines = [];
+          for (const field of fields) {
+            const name = field.name || "unknown";
+            const type = field.type || "UNKNOWN";
+            const mode = field.mode && field.mode !== "NULLABLE" ? ` (${field.mode})` : "";
+            const desc = field.description ? ` — ${field.description}` : "";
+            const prefix = "  ".repeat(indent);
+            lines.push(`${prefix}- ${name}: ${type}${mode}${desc}`);
+            if (Array.isArray(field.fields) && field.fields.length > 0) {
+              lines.push(...formatFields(field.fields, indent + 1));
+            }
+          }
+          return lines;
+        }
+
+        const schemaLines = formatFields(schemaFields);
+        const numRows = tableMetadata?.numRows ? `Rows: ~${Number(tableMetadata.numRows).toLocaleString()}` : null;
+        const numBytes = tableMetadata?.numBytes ? `Size: ${formatBigQueryBytes(Number(tableMetadata.numBytes))}` : null;
+        const keyFields = [
+          `Dataset: ${selectedDataset}`,
+          `Table: ${requestedTable}`,
+          `Columns: ${schemaFields.length}`,
+        ];
+        if (numRows) keyFields.push(numRows);
+        if (numBytes) keyFields.push(numBytes);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${renderStructuredResponse({
+                summary: `Schema for \`${selectedDataset}.${requestedTable}\` (${schemaFields.length} columns).`,
+                keyFields,
+                sources: [`bigquery://${selectedDataset}.${requestedTable}`],
+                limitations: [
+                  "Use these column names in your SQL queries. Wrap table references in backticks.",
+                ],
+              })}\n\nColumns:\n${schemaLines.join("\n")}`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error fetching schema for ${selectedDataset}.${requestedTable}: ${error.message}` }],
+        };
+      }
+    }
+
     try {
-      const client = getBigQueryClient();
-      const datasetRef = client.dataset(datasetId, { projectId });
       const [tables] = await datasetRef.getTables({ maxResults: boundedLimit, autoPaginate: false });
       if (!tables || tables.length === 0) {
         return {
@@ -1262,7 +1338,7 @@ server.registerTool(
               ],
               sources: [`bigquery://${selectedDataset}`],
               limitations: [
-                "Only metadata is returned. Query table contents via run_bigquery_select_query.",
+                "To see column names for a table, call this tool again with the `table` parameter.",
               ],
             })}\n\nTables:\n${tableList}`,
           },

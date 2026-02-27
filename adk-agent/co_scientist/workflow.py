@@ -118,7 +118,7 @@ KNOWN_MCP_TOOLS = [
 ]
 
 TOOL_DESCRIPTIONS: dict[str, str] = {
-    "list_bigquery_tables": "List tables/columns in a BigQuery dataset",
+    "list_bigquery_tables": "List tables in a BigQuery dataset, or inspect column schema for a specific table",
     "run_bigquery_select_query": "Run SQL on BigQuery public datasets",
     "search_clinical_trials": "Search ClinicalTrials.gov (returns NCT IDs)",
     "get_clinical_trial": "Get details of a specific clinical trial by NCT ID",
@@ -2132,7 +2132,7 @@ def _on_tool_error(
         "search_pubmed": "Try search_openalex_works or search_pubmed_advanced instead.",
         "search_pubmed_advanced": "Try search_pubmed or search_openalex_works instead.",
         "search_clinical_trials": "Try summarize_clinical_trials_landscape or run_bigquery_select_query instead.",
-        "list_bigquery_tables": "Try run_bigquery_select_query with SELECT * FROM <dataset>.<table> LIMIT 1 to inspect schema instead.",
+        "list_bigquery_tables": "Try again with the `table` parameter to get the schema, e.g. list_bigquery_tables(dataset='...', table='...').",
     }
     suggestion = fallback_hints.get(tool_name, "Try an alternative tool or query.")
 
@@ -2549,7 +2549,8 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
   `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`.
   Example: SELECT id, approvedSymbol FROM `open_targets_platform.target` WHERE approvedSymbol = 'BRCA1'.
 
-  Start every structured data lookup with BigQuery. Use `list_bigquery_tables` to discover table schemas.
+  Start every structured data lookup with BigQuery. Use `list_bigquery_tables` to discover tables, \
+and `list_bigquery_tables(dataset="...", table="...")` to inspect column schemas before writing queries.
   Write Standard SQL via `run_bigquery_select_query`. Use non-BigQuery MCP tools for:
     - Literature search: search_pubmed, search_pubmed_advanced, get_pubmed_abstract (PubMed/NCBI)
     - Literature search: search_openalex_works (OpenAlex — broader coverage, preprints)
@@ -2574,8 +2575,9 @@ Short names are auto-expanded: `open_targets_platform.target` → `bigquery-publ
 Example: SELECT id, approvedSymbol FROM `open_targets_platform.target` WHERE approvedSymbol = 'BRCA1'.
 Before writing queries:
   1. Call `list_bigquery_tables(dataset="<dataset_name>")` to see all available tables.
-  2. Run SELECT * FROM `<dataset>.<table>` LIMIT 1 to inspect actual column names.
-  Do NOT guess table or column names — they are often singular (e.g. "target" not "targets") \
+  2. Call `list_bigquery_tables(dataset="<dataset_name>", table="<table_name>")` to get the full column schema (names, types, descriptions).
+  NEVER guess column names — always inspect the schema first. \
+  Column names are often singular (e.g. "target" not "targets") \
   and use IDs rather than human-readable names (e.g. targetId is an Ensembl ID like "ENSG00000012048", \
   diseaseId is an EFO ID like "EFO_0001075"). Look up IDs from reference tables first.
 Fall back to non-BQ tools for: literature search (search_pubmed, search_openalex_works), \
