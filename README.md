@@ -1,30 +1,50 @@
 # AI Co-Scientist
 
-An agentic AI co-investigator for scientific discovery and target evaluation.
+An agentic AI research assistant that synthesizes evidence across biomedical databases to guide pre-clinical decisions.
 
 ## What It Does
 
-The AI Co-Scientist helps researchers:
-- **Discover drug targets** for diseases using Open Targets data
-- **Evaluate druggability** of potential targets
-- **Find clinical trial evidence** from ClinicalTrials.gov
-- **Search scientific literature** via PubMed and Europe PMC preprints
-- **Assess post-marketing safety and regulatory labels** via BigQuery (FDA drug data)
-- **Generate a query-specific execution plan** with explicit tool proposals
-- **Require human plan approval or revision** before evidence tools run
-- **Run iterative evidence refinement loops** with tool-use guardrails
-- **Synthesize structured final reports** with citations, limitations, and next actions
+The AI Co-Scientist helps biomedical researchers evaluate therapeutic targets and research directions before human trials by:
+
+- **Synthesizing evidence across 19 databases** — genomics, literature, clinical trials, protein structure, pathways, safety, and more
+- **Generating query-specific execution plans** with explicit tool and data-source proposals
+- **Requiring human plan approval or revision** before evidence tools run
+- **Running iterative evidence-gathering loops** via a ReAct (Reason → Act → Observe) cycle
+- **Producing structured final reports** with inline citations, limitations, and suggested next steps
+- **Exporting reports as PDF** with full source attribution
+
+### Databases
+
+| Category | Sources |
+|----------|---------|
+| **Genomics & Variants** | Open Targets Platform, gnomAD, 1000 Genomes, Ensembl VEP |
+| **Clinical Trials** | ClinicalTrials.gov |
+| **Literature & Researchers** | PubMed, OpenAlex |
+| **Protein Structure & Function** | AlphaFold, UniProt |
+| **Pathways & Interactions** | Reactome, STRING |
+| **Chemistry & Bioactivity** | ChEMBL, SureChEMBL |
+| **Safety & Regulatory** | FDA FAERS |
+| **Immunology** | IEDB |
+| **Drug Nomenclature** | RxNorm |
+| **Perturbation Signatures** | LINCS L1000 |
+| **Clinical Variant Interpretation** | CIViC, ClinGen |
+
+Genomics, chemistry, safety, and structural databases are accessed via BigQuery public datasets. Literature, clinical trials, protein, pathway, and researcher tools use live REST APIs.
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-    U["User (ADK Web or CLI)"] --> R["ADK Runner + Session State"]
+    U["Browser UI"] --> S["ui_server.py (FastAPI)"]
+    S --> R["ADK Runner + Session State"]
     R --> W["SequentialAgent co_scientist_workflow<br/>planner → react_loop → report_synthesizer"]
     W --> M["MCPToolset → research-mcp/server.js"]
     M --> W
-    W --> U
+    W --> S
+    S --> U
 ```
+
+The custom web UI (`ui/index.html`, `app.js`, `styles.css`) communicates with `ui_server.py`, which manages conversations, run orchestration, and PDF export. Under the hood it uses the Google ADK `Runner` with `InMemorySessionService`.
 
 ## Dynamic Workflow
 
@@ -86,13 +106,45 @@ flowchart TD
 Each plan step is executed as a **Reason → Act → Observe** cycle inside a `LoopAgent`:
 
 1. **Reason** — the step executor reads the current step goal and decides what tool to call and why
-2. **Act** — calls an MCP tool (e.g., `search_pubmed`, `check_druggability`)
+2. **Act** — calls an MCP tool (e.g., `search_pubmed`, `run_bigquery_select_query`)
 3. **Observe** — reviews the tool results; if insufficient, reasons again and retries with a different query or tool
 4. **Conclude** — when the step's completion condition is met, returns a structured result with a `reasoning_trace`
 
-The reasoning trace captures the full decision chain per step ("searched X because Y, found Z, concluded W") and is stored alongside step results. The synthesizer uses these traces to ground source citations in the final report.
+The reasoning trace captures the full decision chain per step and is stored alongside step results. The synthesizer uses these traces to ground source citations in the final report.
 
 **Error recovery:** if the executor returns invalid output, the loop retries the step (up to 3 attempts) with a corrective prompt before marking it blocked and advancing.
+
+## Available Tools
+
+### MCP Tools (Live APIs)
+
+| Category | Tools | Source |
+|----------|-------|--------|
+| **Clinical Trials** | `search_clinical_trials`, `get_clinical_trial`, `summarize_clinical_trials_landscape` | ClinicalTrials.gov |
+| **Literature** | `search_pubmed`, `search_pubmed_advanced`, `get_pubmed_abstract` | PubMed (NCBI E-utilities) |
+| **Researcher Discovery** | `search_openalex_works`, `search_openalex_authors`, `rank_researchers_by_activity`, `get_researcher_contact_candidates` | OpenAlex |
+| **Protein Annotations** | `search_uniprot_proteins`, `get_uniprot_protein_profile` | UniProt REST |
+| **Pathways & Networks** | `search_reactome_pathways`, `get_string_interactions` | Reactome, STRING |
+| **Benchmarks** | `benchmark_dataset_overview`, `check_gpqa_access` | Hugging Face Datasets |
+
+### BigQuery Datasets
+
+All accessed via `list_bigquery_tables` and `run_bigquery_select_query` with read-only row/bytes guardrails.
+
+| Dataset | Contents |
+|---------|----------|
+| **open_targets_platform** | Disease-target associations, genetic evidence, drugs, tractability |
+| **ebi_chembl** | Bioactive compounds, target bioactivity (IC50/Ki/EC50), mechanism of action |
+| **gnomad** | Population variant frequencies across diverse ancestries |
+| **human_genome_variants** | 1000 Genomes Phase 3 variants, Platinum Genomes, Simons Diversity |
+| **human_variant_annotation** | Ensembl variant annotations, SIFT/PolyPhen scores (hg19/hg38) |
+| **deepmind_alphafold** | Predicted protein structures, pLDDT confidence, PDB/CIF URLs |
+| **immune_epitope_db** | Immune epitopes, B-cell assays, MHC ligand binding, T-cell receptor data |
+| **nlm_rxnorm** | Drug nomenclature, ingredient relationships, clinical drug pathways |
+| **fda_drug** | FAERS adverse event reports, drug labels, NDC listings, enforcement actions |
+| **umiami_lincs** | L1000 perturbation signatures: cell lines, small molecules, readouts |
+| **ebi_surechembl** | Chemical structures extracted from patents |
+| **hackathon_data** | CIViC clinical variant interpretations, ClinGen gene-disease validity |
 
 ## User Commands
 
@@ -115,23 +167,27 @@ The reasoning trace captures the full decision chain per step ("searched X becau
 - **Step renumbering** — follow-up plans with non-sequential IDs are canonically renumbered to `S1, S2, ...`.
 - **Source citations** — final reports cite human-readable database names (PubMed, ClinicalTrials.gov, etc.), never raw tool names or JSON URLs.
 - **Research history** — up to 10 prior research cycles are archived with full state; rollback restores any previous cycle.
+- **BigQuery guardrails** — read-only queries with configurable max rows (default 200, hard cap 1000) and bytes-billed limits.
 
 ## Example Queries
 
 ```
-Is PCSK9 likely to succeed in clinical trials for cardiovascular disease?
-```
-```
-Find researchers who have published on idiopathic pulmonary fibrosis (IPF) treatment in the last 3 years
-```
-```
 Evaluate LRRK2 as a drug target for Parkinson disease — what is the genetic evidence, druggability, and competitive landscape?
 ```
 ```
-Compare BRCA1 and BRCA2 as therapeutic targets in ovarian cancer across genetic association, safety, and pipeline activity
+Is KRAS G12C structurally druggable? What do predicted protein structures and known interaction partners suggest about tractable binding sites?
 ```
 ```
-What are the known safety liabilities of targeting JAK1 in rheumatoid arthritis, and how do they compare to IL-6 inhibition?
+What are the population-level variant frequencies for BRCA1, and which variants are classified as clinically significant?
+```
+```
+What post-marketing safety signals exist for JAK inhibitors, and how selective are they across the kinase family?
+```
+```
+What immune epitopes are known for PD-L1, and which signaling pathways does it participate in?
+```
+```
+Who are the most active researchers working on CAR-T therapy for solid tumors, and what are the recent breakthroughs?
 ```
 
 ## Quick Start
@@ -168,8 +224,6 @@ cp .env.local.example .env
 # gcloud auth application-default login
 # optional for gated Hugging Face datasets (e.g., GPQA):
 # set HF_TOKEN in .env
-# optional dataset source overrides:
-# HF_DATASET_PUBMEDQA, HF_DATASET_BIOASQ, HF_DATASET_GPQA
 
 # 5b. Vertex mode auth (project-backed)
 cp .env.vertex.example .env
@@ -182,21 +236,24 @@ Keep the same shell with `.venv` activated for all commands below.
 
 ### Run
 
-Primary (ADK-native CLI):
+**Web UI (primary):**
 
 ```bash
 cd adk-agent
-adk run co_scientist
+python ui_server.py
 ```
 
-Primary (ADK-native Web UI):
+Opens the custom web interface at `http://localhost:8080` with conversation management, real-time activity tracking, report panel, and PDF export.
+
+**ADK CLI / ADK Web UI (alternative):**
 
 ```bash
 cd adk-agent
-adk web .
+adk run co_scientist    # interactive terminal
+adk web .               # ADK built-in web UI
 ```
 
-Optional lightweight wrapper (still ADK-native under the hood):
+**Standalone CLI wrapper:**
 
 ```bash
 cd adk-agent
@@ -204,52 +261,44 @@ python agent.py
 python agent.py --query "Evaluate LRRK2 as a drug target in Parkinson disease"
 ```
 
-## Vertex Transition (Hackathon-Ready)
-
-### What is already prepared
-- Dual auth support in the runner: local API key or Vertex env (`GOOGLE_GENAI_USE_VERTEXAI=true`).
-- HTTP API entrypoint for deployment: `adk-agent/server.py`.
-- Cloud Run containerization files: `Dockerfile`, `.dockerignore`.
-- One-command deploy script: `scripts/deploy_cloud_run.sh`.
-- BigQuery MCP tools: `list_bigquery_tables`, `run_bigquery_select_query` (read-only with row/bytes guardrails).
-- BQ-first planning policy is on by default (`ADK_NATIVE_PREFER_BIGQUERY=1`), configurable per environment.
-- Benchmark dataset tools (non-BQ): `benchmark_dataset_overview`, `sample_pubmedqa_examples`, `sample_bioasq_examples`, `check_gpqa_access`.
-
-### Cloud Run deployment (when your hackathon project opens)
+## Cloud Run Deployment
 
 ```bash
-# From repo root
-PROJECT_ID="your-hackathon-project-id" \
+PROJECT_ID="your-project-id" \
 REGION="us-central1" \
 SERVICE_NAME="ai-co-scientist" \
 bash scripts/deploy_cloud_run.sh
 ```
 
-### Runtime endpoints (Cloud Run)
-- `GET /healthz` for readiness/config status
-- `POST /query` with JSON body:
-- API mode auto-approves plan confirmation gates (no interactive terminal prompt).
+The deploy script builds a container image via Cloud Build, then deploys to Cloud Run with Vertex AI auth and the full BigQuery dataset allowlist pre-configured.
 
-```json
-{
-  "query": "Evaluate LRRK2 as a drug target in Parkinson disease"
-}
-```
+### Runtime endpoints (Cloud Run)
+- `GET /healthz` — readiness and config status
+- `POST /api/query` — submit a research question
+- `GET /api/conversations` — list conversations
+- `GET /api/conversations/{id}` — conversation detail with iterations
+- `GET /api/tasks/{id}/report.pdf` — export report as PDF
 
 ## Project Structure
 
 ```
 ├── adk-agent/              # AI Co-Scientist Agent (Python)
 │   ├── agent.py            # ADK-native CLI wrapper (interactive/single query)
-│   ├── server.py           # FastAPI HTTP wrapper for Cloud Run
+│   ├── ui_server.py        # Custom web UI server (FastAPI, primary entrypoint)
+│   ├── report_pdf.py       # PDF report generation
+│   ├── server.py           # Minimal FastAPI HTTP wrapper (legacy)
 │   ├── co_scientist/
 │   │   ├── __init__.py     # Exports root_agent for `adk run` / `adk web`
 │   │   └── workflow.py     # Workflow graph, HITL, history/rollback, callbacks
+│   ├── ui/
+│   │   ├── index.html      # Landing page and chat interface
+│   │   ├── app.js          # Client-side application logic
+│   │   └── styles.css      # UI styles
 │   ├── .adk/               # ADK local sessions/artifacts (created at runtime)
-│   └── test_*.py           # Core regression suite
+│   └── test_*.py           # Regression tests
 │
 ├── research-mcp/           # Research Tools Server (Node.js)
-│   ├── server.js           # MCP tool server
+│   ├── server.js           # MCP tool server (18 tools)
 │   ├── data/               # Local datasets
 │   └── test-tools.js       # Optional manual MCP tool test script
 │
@@ -261,48 +310,38 @@ bash scripts/deploy_cloud_run.sh
 └── README.md               # This file
 ```
 
-## Available Tools
+## Data Sources
 
-| Category | Tools | API |
-|----------|-------|-----|
-| **Disease & Targets** | `search_diseases`, `search_disease_targets`, `get_target_info`, `search_targets` | Open Targets GraphQL |
-| **Druggability** | `check_druggability`, `get_target_drugs` | Open Targets GraphQL |
-| **Clinical Trials** | `search_clinical_trials`, `get_clinical_trial`, `summarize_clinical_trials_landscape` | ClinicalTrials.gov |
-| **Post-Marketing Safety & Labels** | `run_bigquery_select_query` (fda_drug dataset) | BigQuery (FDA Drug) |
-| **Chemistry Evidence** | `search_chembl_compounds_for_target` | ChEMBL |
-| **Expression & Cell Context** | `summarize_target_expression_context` | Open Targets GraphQL |
-| **Genetic Direction-of-Effect** | `infer_genetic_effect_direction` | GWAS Catalog |
-| **Competitive & Safety Intelligence** | `summarize_target_competitive_landscape`, `summarize_target_safety_liabilities` | Open Targets GraphQL |
-| **Comparative Prioritization** | `compare_targets_multi_axis` (auto mode from goal text, preset, or custom axis weights) | Open Targets GraphQL |
-| **Protein Annotations** | `search_uniprot_proteins`, `get_uniprot_protein_profile` | UniProt REST |
-| **Literature** | `search_pubmed`, `search_europe_pmc_preprints`, `get_pubmed_abstract`, `search_pubmed_advanced`, `get_pubmed_paper_details`, `get_pubmed_author_profile` | PubMed E-utilities, Europe PMC |
-| **Researcher Discovery** | `search_openalex_works`, `search_openalex_authors`, `rank_researchers_by_activity`, `get_researcher_contact_candidates` | OpenAlex |
-| **Variants & Genomics** | `search_clinvar_variants`, `get_clinvar_variant_details`, `search_gwas_associations`, `get_gene_info` | NCBI ClinVar, GWAS Catalog, NCBI Gene |
-| **Pathway & Networks** | `search_reactome_pathways`, `get_string_interactions` | Reactome, STRING |
-| **Ontology Context** | `expand_disease_context` | OLS (EFO/MONDO) |
-| **BigQuery** | `list_bigquery_tables`, `run_bigquery_select_query` | BigQuery |
-| **Benchmarks (No BQ)** | `benchmark_dataset_overview`, `sample_pubmedqa_examples`, `sample_bioasq_examples`, `check_gpqa_access` | Hugging Face datasets-server |
+### Live APIs
+- **[ClinicalTrials.gov](https://clinicaltrials.gov/)** — Clinical trial registry and results
+- **[PubMed / NCBI](https://pubmed.ncbi.nlm.nih.gov/)** — Biomedical literature and abstracts
+- **[OpenAlex](https://openalex.org/)** — Scholarly works, authors, and citation data
+- **[UniProt](https://www.uniprot.org/)** — Protein sequence, function, and annotation
+- **[Reactome](https://reactome.org/)** — Curated biological pathway database
+- **[STRING](https://string-db.org/)** — Protein-protein interaction networks
+
+### BigQuery Public Datasets
+- **[Open Targets Platform](https://platform.opentargets.org/)** — Disease-target associations, genetic evidence, tractability
+- **[ChEMBL](https://www.ebi.ac.uk/chembl/)** — Bioactive compound and target bioactivity data
+- **[gnomAD](https://gnomad.broadinstitute.org/)** — Population variant frequencies
+- **[1000 Genomes](https://www.internationalgenome.org/)** — Phase 3 variants, population structure
+- **[Ensembl VEP](https://www.ensembl.org/vep)** — Variant functional consequence annotations
+- **[AlphaFold](https://alphafold.ebi.ac.uk/)** — Predicted protein structures and confidence scores
+- **[IEDB](https://www.iedb.org/)** — Immune epitope data, B-cell and T-cell assays
+- **[RxNorm](https://www.nlm.nih.gov/research/umls/rxnorm/)** — Drug nomenclature and relationships
+- **[FDA FAERS](https://open.fda.gov/data/faers/)** — Adverse event reports, drug labels, enforcement
+- **[LINCS L1000](https://lincsproject.org/)** — Chemical and genetic perturbation signatures
+- **[SureChEMBL](https://www.surechembl.org/)** — Chemical structures from patent literature
+- **[CIViC](https://civicdb.org/)** — Clinical interpretation of cancer variants
+- **[ClinGen](https://clinicalgenome.org/)** — Gene-disease clinical validity
 
 ## Testing
 
-Current smoke checks:
-
 ```bash
 cd adk-agent
-../.venv/bin/python -m py_compile agent.py server.py co_scientist/workflow.py
+../.venv/bin/python -m py_compile agent.py server.py ui_server.py report_pdf.py co_scientist/workflow.py
 ```
 
 Notes:
 - External network tests were removed from the default suite to keep CI/dev runs deterministic and fast.
 - Generated artifacts in `adk-agent/reports/` are runtime outputs and can be safely deleted.
-
-## Data Sources
-
-- **[Open Targets Platform](https://platform.opentargets.org/)** - Disease-target associations, druggability data
-- **[ClinicalTrials.gov](https://clinicaltrials.gov/)** - Clinical trial registry
-- **[PubMed/NCBI](https://pubmed.ncbi.nlm.nih.gov/)** - Scientific literature, gene information
-- **[Europe PMC](https://europepmc.org/)** - Biomedical literature and preprints (including medRxiv/bioRxiv)
-- **[FDA Drug (BigQuery)](https://console.cloud.google.com/bigquery?p=bigquery-public-data&d=fda_drug)** - FAERS adverse-event reports and FDA drug labeling data via BigQuery
-- **[GWAS Catalog](https://www.ebi.ac.uk/gwas/)** - Variant-trait associations and effect direction signals
-- **[ChEMBL](https://www.ebi.ac.uk/chembl/)** - Compound bioactivity and target chemical evidence
-- **[OLS / EFO / MONDO](https://www.ebi.ac.uk/ols4/)** - Ontology expansion, synonyms, and hierarchy context
