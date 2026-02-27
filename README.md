@@ -144,7 +144,7 @@ All accessed via `list_bigquery_tables` and `run_bigquery_select_query` with rea
 | **fda_drug** | FAERS adverse event reports, drug labels, NDC listings, enforcement actions |
 | **umiami_lincs** | L1000 perturbation signatures: cell lines, small molecules, readouts |
 | **ebi_surechembl** | Chemical structures extracted from patents |
-| **hackathon_data** | CIViC clinical variant interpretations, ClinGen gene-disease validity |
+| **hackathon_data** | CIViC clinical variant interpretations, ClinGen gene-disease validity, GTEx tissue expression |
 
 ## User Commands
 

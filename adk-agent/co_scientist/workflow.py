@@ -154,7 +154,7 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "fda_drug": "FDA Drug (BigQuery)",
     "umiami_lincs": "LINCS L1000",
     "ebi_surechembl": "SureChEMBL",
-    "hackathon_data": "CIViC / ClinGen",
+    "hackathon_data": "CIViC / ClinGen / GTEx",
     "civic": "CIViC",
     "clingen": "ClinGen",
     # PubMed (NCBI E-utilities)
@@ -2544,6 +2544,7 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
   **hackathon_data** (project dataset) — Contains:
     - civic_* tables: Cancer variant clinical interpretations (assertions, evidence, variants, molecular profiles)
     - clingen_* tables: Gene-disease validity, variant pathogenicity, dosage sensitivity, actionability
+    - gtex_* tables: GTEx tissue expression sample attributes and subject phenotypes
 
   **How to query**: Always wrap table names in backticks in SQL. Short names are auto-expanded:
   `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`.
@@ -2569,7 +2570,7 @@ gnomAD (variant frequencies), human_genome_variants, human_variant_annotation (E
 deepmind_alphafold (protein structures), immune_epitope_db (IEDB), \
 nlm_rxnorm (drug nomenclature), fda_drug (adverse events, drug labels, NDC, enforcement), \
 umiami_lincs (perturbation signatures), ebi_surechembl (patents), \
-and project hackathon_data (CIViC, ClinGen).
+and project hackathon_data (CIViC, ClinGen, GTEx).
 CRITICAL SQL syntax: Always wrap table references in backticks in your SQL queries. \
 Short names are auto-expanded: `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`. \
 Example: SELECT id, approvedSymbol FROM `open_targets_platform.target` WHERE approvedSymbol = 'BRCA1'.
