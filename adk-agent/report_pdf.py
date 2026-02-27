@@ -47,12 +47,16 @@ HIGH_FIDELITY_CSS = """
 html, body {
   margin: 0;
   padding: 0;
+  background: #0b0f19;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
 }
 body {
   font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   font-size: 10.5pt;
-  line-height: 1.55;
-  color: #1e293b;
+  line-height: 1.6;
+  color: #e2e8f0;
+  background: #0b0f19;
 }
 article.report {
   max-width: 100%;
@@ -60,81 +64,88 @@ article.report {
 
 /* ── Title / H1 ── */
 h1 {
-  font-size: 24pt;
+  font-size: 26pt;
   font-weight: 700;
-  color: #0f172a;
-  border-bottom: 3px solid #3b82f6;
-  padding-bottom: 0.3em;
+  color: #ffffff;
+  border-bottom: 3px solid #6366f1;
+  padding-bottom: 0.35em;
   margin-top: 0;
-  margin-bottom: 0.5em;
+  margin-bottom: 0.6em;
   line-height: 1.2;
+  letter-spacing: -0.01em;
 }
 
 /* ── Section headings ── */
 h2 {
-  font-size: 14pt;
+  font-size: 14.5pt;
   font-weight: 700;
-  color: #1d4ed8;
-  margin-top: 1.4em;
-  margin-bottom: 0.4em;
+  color: #a5b4fc;
+  margin-top: 1.5em;
+  margin-bottom: 0.45em;
   padding-bottom: 0.2em;
-  border-bottom: 1.5px solid #bfdbfe;
+  border-bottom: 1.5px solid #312e81;
   line-height: 1.25;
 }
 h3 {
   font-size: 11.5pt;
   font-weight: 600;
-  color: #1e40af;
-  margin-top: 1em;
+  color: #818cf8;
+  margin-top: 1.1em;
   margin-bottom: 0.3em;
 }
 
 /* ── Research question callout block ── */
 blockquote {
   margin: 1em 0;
-  padding: 0.75em 1em;
-  border-left: 4px solid #3b82f6;
-  background: #eff6ff;
-  color: #1e3a8a;
-  border-radius: 0 6px 6px 0;
+  padding: 0.8em 1.1em;
+  border-left: 4px solid #6366f1;
+  background: #1e1b4b;
+  color: #c7d2fe;
+  border-radius: 0 8px 8px 0;
   font-size: 10.5pt;
 }
 blockquote strong {
-  color: #1e3a8a;
+  color: #e0e7ff;
 }
 
 /* ── Body text ── */
 p {
   margin: 0.5em 0;
+  color: #cbd5e1;
 }
 
 /* ── Lists ── */
 ul, ol {
   margin: 0.5em 0 0.5em 1.4em;
   padding-left: 0.8em;
+  color: #cbd5e1;
 }
 li {
-  margin: 0.3em 0;
-  line-height: 1.5;
+  margin: 0.35em 0;
+  line-height: 1.55;
+}
+li::marker {
+  color: #818cf8;
 }
 
 /* ── Code ── */
 pre {
   margin: 0.8em 0;
-  padding: 0.7em 0.9em;
-  background: #0f172a;
-  color: #e2e8f0;
-  border-radius: 6px;
+  padding: 0.8em 1em;
+  background: #020617;
+  color: #a5f3fc;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
   font-size: 9pt;
   overflow: auto;
 }
 code {
   font-family: "SFMono-Regular", Menlo, Consolas, monospace;
   font-size: 0.9em;
-  background: #f1f5f9;
-  padding: 0.1em 0.35em;
-  border-radius: 3px;
-  color: #0f172a;
+  background: #1e293b;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  color: #a5f3fc;
 }
 pre code {
   background: transparent;
@@ -150,37 +161,42 @@ table {
   font-size: 9.5pt;
 }
 th {
-  background: #1d4ed8;
-  color: #ffffff;
+  background: #312e81;
+  color: #e0e7ff;
   font-weight: 600;
-  padding: 0.45em 0.6em;
+  padding: 0.5em 0.7em;
   text-align: left;
+  border: 1px solid #3730a3;
 }
 td {
-  border: 1px solid #cbd5e1;
-  padding: 0.4em 0.6em;
+  border: 1px solid #1e293b;
+  padding: 0.45em 0.65em;
   vertical-align: top;
+  color: #cbd5e1;
 }
 tr:nth-child(even) td {
-  background: #f8fafc;
+  background: #0f172a;
+}
+tr:nth-child(odd) td {
+  background: #111827;
 }
 
 /* ── Horizontal rule ── */
 hr {
   border: none;
-  border-top: 1px solid #e2e8f0;
-  margin: 1.2em 0;
+  border-top: 1px solid #1e293b;
+  margin: 1.3em 0;
 }
 
 /* ── Coverage / footer note ── */
 em {
-  color: #64748b;
+  color: #94a3b8;
   font-size: 9.5pt;
 }
 
 /* ── Links ── */
 a {
-  color: #1d4ed8;
+  color: #818cf8;
   text-decoration: underline;
   word-break: break-all;
 }
@@ -221,7 +237,7 @@ def _format_inline_markdown(text: str) -> str:
         def repl(match: re.Match[str]) -> str:
             label = escape(match.group(1).strip())
             href = _escape_attr(match.group(2).strip())
-            return _store(f'<font color="blue"><u><link href="{href}">{label}</link></u></font>')
+            return _store(f'<font color="#818cf8"><u><link href="{href}">{label}</link></u></font>')
 
         return pattern.sub(repl, raw)
 
@@ -341,6 +357,7 @@ def _build_html_document(markdown_text: str, *, title: str) -> str:
         "<head>\n"
         "  <meta charset=\"utf-8\" />\n"
         "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n"
+        "  <meta name=\"color-scheme\" content=\"dark\" />\n"
         f"  <title>{safe_title}</title>\n"
         f"  <style>{HIGH_FIDELITY_CSS}</style>\n"
         "</head>\n"
@@ -534,6 +551,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             fontSize=10.5,
             leading=14,
             spaceAfter=4,
+            textColor=colors.HexColor("#cbd5e1"),
         ),
         "h1": ParagraphStyle(
             "report_h1",
@@ -542,6 +560,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             fontSize=18,
             leading=22,
             spaceAfter=10,
+            textColor=colors.HexColor("#ffffff"),
         ),
         "h2": ParagraphStyle(
             "report_h2",
@@ -550,6 +569,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             fontSize=14,
             leading=18,
             spaceAfter=8,
+            textColor=colors.HexColor("#a5b4fc"),
         ),
         "h3": ParagraphStyle(
             "report_h3",
@@ -558,6 +578,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             fontSize=12,
             leading=16,
             spaceAfter=6,
+            textColor=colors.HexColor("#818cf8"),
         ),
         "code": ParagraphStyle(
             "report_code",
@@ -568,6 +589,8 @@ def _styles() -> dict[str, ParagraphStyle]:
             leftIndent=10,
             rightIndent=10,
             spaceAfter=6,
+            textColor=colors.HexColor("#a5f3fc"),
+            backColor=colors.HexColor("#020617"),
         ),
         "quote": ParagraphStyle(
             "report_quote",
@@ -577,7 +600,8 @@ def _styles() -> dict[str, ParagraphStyle]:
             leading=13,
             leftIndent=14,
             rightIndent=8,
-            textColor=colors.HexColor("#4b5563"),
+            textColor=colors.HexColor("#c7d2fe"),
+            backColor=colors.HexColor("#1e1b4b"),
             borderPadding=6,
             spaceAfter=6,
         ),
@@ -673,8 +697,12 @@ def _add_table(lines: list[str], start_idx: int, story: list, styles: dict[str, 
     table.setStyle(
         TableStyle(
             [
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#1e293b")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#312e81")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#e0e7ff")),
+                ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#cbd5e1")),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#111827")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#111827"), colors.HexColor("#0f172a")]),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
@@ -764,6 +792,13 @@ def _write_markdown_pdf_legacy(markdown: str, output_path: Path, *, title: str =
     # as literal text in the ReportLab path.
     clean_markdown = re.sub(r'<a\s[^>]*></a>', '', (markdown or "").strip())
     try:
+        def _dark_bg_canvas(canvas, doc):
+            """Draw a dark background on every page for the legacy renderer."""
+            canvas.saveState()
+            canvas.setFillColor(colors.HexColor("#0b0f19"))
+            canvas.rect(0, 0, LETTER[0], LETTER[1], fill=True, stroke=False)
+            canvas.restoreState()
+
         doc = SimpleDocTemplate(
             str(output_path),
             pagesize=LETTER,
@@ -774,7 +809,7 @@ def _write_markdown_pdf_legacy(markdown: str, output_path: Path, *, title: str =
             bottomMargin=54,
         )
         story = _markdown_story(clean_markdown)
-        doc.build(story)
+        doc.build(story, onFirstPage=_dark_bg_canvas, onLaterPages=_dark_bg_canvas)
     except Exception as exc:
         if output_path.exists():
             output_path.unlink(missing_ok=True)
