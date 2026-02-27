@@ -27,7 +27,6 @@ const HF_DATASET_PUBMEDQA = String(process.env.HF_DATASET_PUBMEDQA || "qiaojin/P
 const HF_DATASET_BIOASQ = String(process.env.HF_DATASET_BIOASQ || "kroshan/BioASQ").trim();
 const HF_DATASET_GPQA = String(process.env.HF_DATASET_GPQA || "Idavidrein/gpqa").trim();
 const HF_TOKEN = String(process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN || "").trim();
-const DATA_DIR = path.resolve(__dirname, "data");
 const OPENALEX_MAILTO = process.env.OPENALEX_MAILTO || process.env.CONTACT_EMAIL || "";
 const BQ_PROJECT_ID = String(process.env.BQ_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || "").trim();
 const BQ_LOCATION = String(process.env.BQ_LOCATION || process.env.GOOGLE_CLOUD_LOCATION || "US").trim() || "US";
@@ -533,6 +532,12 @@ function normalizeDoiValue(rawDoi) {
   const stripped = value.replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "").trim();
   return stripped.replace(/^doi:\s*/i, "").trim();
 }
+function buildDoiMarkdown(rawDoi) {
+  const doi = normalizeDoiValue(rawDoi);
+  if (!doi) return "";
+  return `[DOI:${doi}](https://doi.org/${doi})`;
+}
+
 function buildOpenAlexWorkCitation(work) {
   const title = normalizeWhitespace(work?.display_name || "Untitled");
   const year = toNonNegativeInt(work?.publication_year, 0);
@@ -546,26 +551,6 @@ function buildOpenAlexWorkCitation(work) {
   const yearPart = year > 0 ? year : "n.d.";
   const links = [doiMarkdown, openAlexLabel].filter(Boolean).join(" ");
   return `${authorLabel} (${yearPart}). ${title}.${venuePart}${links ? ` ${links}` : ""}`.trim();
-}
-async function listDataFiles() {
-  try {
-    const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
-    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return [];
-    }
-    throw error;
-  }
-}
-
-function resolveDataPath(filename) {
-  const safeName = path.basename(filename);
-  const resolved = path.resolve(DATA_DIR, safeName);
-  if (!resolved.startsWith(DATA_DIR)) {
-    throw new Error("Invalid filename. Only files in ./data are allowed.");
-  }
-  return resolved;
 }
 
 function parseBigQueryDatasetAllowlist(rawValue, defaultProjectId = "") {
@@ -1213,65 +1198,6 @@ function buildClinicalTrialsLandscapePayload({
   );
 }
 
-// ============================================
-// TOOL 3: List local datasets (./data)
-// ============================================
-server.registerTool(
-  "list_local_datasets",
-  {
-    description: "Lists files in the local ./data directory",
-  },
-  async () => {
-    const files = await listDataFiles();
-    if (files.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "No local datasets found. Add files to ./data (e.g., CSV, TSV, JSON).",
-          },
-        ],
-      };
-    }
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Local datasets:\n${files.map((file) => `- ${file}`).join("\n")}`,
-        },
-      ],
-    };
-  }
-);
-
-// ============================================
-// TOOL 4: Read a local dataset file (safe path)
-// ============================================
-server.registerTool(
-  "read_local_dataset",
-  {
-    description: "Reads the first N lines from a local dataset in ./data",
-    inputSchema: {
-      filename: z.string().describe("Filename inside ./data"),
-      maxLines: z.number().optional().default(200).describe("Max number of lines to return"),
-    },
-  },
-  async ({ filename, maxLines = 200 }) => {
-    const resolved = resolveDataPath(filename);
-    const contents = await fs.readFile(resolved, "utf-8");
-    const lines = contents.split(/\r?\n/).slice(0, maxLines);
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: lines.join("\n"),
-        },
-      ],
-    };
-  }
-);
 
 // ============================================
 // TOOL 5: List BigQuery tables (read-only metadata)
@@ -1653,7 +1579,7 @@ server.registerTool(
   "search_clinical_trials",
   {
     description:
-      "Searches ClinicalTrials.gov for clinical trials. Find trials by disease, drug, target/gene, or sponsor. Returns trial status, phase, and key details.",
+      "Searches ClinicalTrials.gov for clinical trials. Find trials by disease, drug, target/gene, or sponsor. Returns trial status, phase, and key details. Supports pagination up to 200 results.",
     inputSchema: {
       query: z
         .string()
@@ -1662,49 +1588,68 @@ server.registerTool(
         .string()
         .optional()
         .describe("Filter by status: 'RECRUITING', 'COMPLETED', 'ACTIVE_NOT_RECRUITING', 'TERMINATED', or leave empty for all"),
-      limit: z.number().optional().default(10).describe("Max number of results"),
+      limit: z.number().optional().describe("Max results to return. Omit to let the system choose a reasonable default based on the query. Hard cap: 200."),
     },
   },
-  async ({ query, status, limit = 10 }) => {
-    const params = new URLSearchParams({
-      "query.term": query,
-      pageSize: String(limit),
-      format: "json",
-    });
-
-    if (status) {
-      params.append("filter.overallStatus", status);
-    }
-
-    const url = `${CLINICAL_TRIALS_API}/studies?${params.toString()}`;
-    
-    let studies = [];
+  async ({ query, status, limit }) => {
+    const boundedLimit = limit ? Math.max(1, Math.min(200, Math.round(limit))) : 50;
+    const boundedPages = Math.ceil(boundedLimit / 100);
+    const studies = [];
     let resultCount = 0;
     let hasMorePages = false;
+    let nextPageToken = "";
+
     try {
-      const response = await fetch(url);
-      
-      if (!response.ok) {
-        return {
-          content: [{ type: "text", text: `ClinicalTrials.gov API error (${response.status}). Try a different search term.` }],
-        };
+      for (let page = 0; page < boundedPages && studies.length < boundedLimit; page++) {
+        const pageSize = Math.min(100, boundedLimit - studies.length);
+        const params = new URLSearchParams({
+          "query.term": query,
+          pageSize: String(pageSize),
+          format: "json",
+        });
+
+        if (status) {
+          params.append("filter.overallStatus", status);
+        }
+        if (nextPageToken) {
+          params.append("pageToken", nextPageToken);
+        }
+
+        const url = `${CLINICAL_TRIALS_API}/studies?${params.toString()}`;
+        const response = await fetch(url);
+
+        if (!response.ok) {
+          if (studies.length > 0) break;
+          return {
+            content: [{ type: "text", text: `ClinicalTrials.gov API error (${response.status}). Try a different search term.` }],
+          };
+        }
+
+        const text = await response.text();
+        if (!text || text.trim() === '') {
+          if (studies.length > 0) break;
+          return {
+            content: [{ type: "text", text: `ClinicalTrials.gov returned empty response for: "${query}". Try broader search terms.` }],
+          };
+        }
+
+        const data = JSON.parse(text);
+        const pageStudies = data?.studies ?? [];
+        if (Number.isFinite(data?.totalCount)) {
+          resultCount = data.totalCount;
+        }
+        studies.push(...pageStudies);
+        nextPageToken = data?.nextPageToken || "";
+        if (!nextPageToken || pageStudies.length === 0) break;
       }
-      
-      const text = await response.text();
-      if (!text || text.trim() === '') {
-        return {
-          content: [{ type: "text", text: `ClinicalTrials.gov returned empty response for: "${query}". Try broader search terms.` }],
-        };
-      }
-      
-      const data = JSON.parse(text);
-      studies = data?.studies ?? [];
-      resultCount = Number.isFinite(data?.totalCount) ? data.totalCount : studies.length;
-      hasMorePages = Boolean(data?.nextPageToken);
+      hasMorePages = Boolean(nextPageToken);
+      if (!resultCount) resultCount = studies.length;
     } catch (error) {
-      return {
-        content: [{ type: "text", text: `Error searching clinical trials: ${error.message}. Try again or use different search terms.` }],
-      };
+      if (studies.length === 0) {
+        return {
+          content: [{ type: "text", text: `Error searching clinical trials: ${error.message}. Try again or use different search terms.` }],
+        };
+      }
     }
 
     if (studies.length === 0) {
@@ -1747,7 +1692,7 @@ server.registerTool(
       content: [
         {
           type: "text",
-          text: `Clinical trials for "${query}":\nFound ${resultCount} trials${hasMorePages ? "\nNote: Additional pages of results are available from ClinicalTrials.gov." : ""}\n\n${formatted}\n\nUse get_clinical_trial with the NCT ID for full details including results.`,
+          text: `Clinical trials for "${query}":\nShowing ${studies.length} of ${resultCount} total trials${hasMorePages ? " (more available — increase limit or maxPages)" : ""}${status ? `\nStatus filter: ${status}` : ""}\n\n${formatted}\n\nUse get_clinical_trial with the NCT ID for full details including results.`,
         },
       ],
     };
@@ -1918,6 +1863,229 @@ function parsePubmedAuthors(xml) {
     return { name, affiliations };
   });
 }
+// ============================================
+// TOOL: Search PubMed
+// ============================================
+const PUBMED_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
+const PUBMED_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
+const PUBMED_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi";
+
+function parsePubmedArticleSummary(xml) {
+  const articles = [];
+  const docSums = [...xml.matchAll(/<DocSum>([\s\S]*?)<\/DocSum>/g)];
+  for (const [, block] of docSums) {
+    const pmid = block.match(/<Id>(\d+)<\/Id>/)?.[1] || "";
+    const getItem = (name) => {
+      const re = new RegExp(`<Item Name="${name}"[^>]*>([\\s\\S]*?)<\\/Item>`);
+      return sanitizeXmlText(block.match(re)?.[1] || "");
+    };
+    const title = getItem("Title");
+    const source = getItem("Source");
+    const pubDate = getItem("PubDate");
+    const authorList = [...block.matchAll(/<Item Name="Author"[^>]*>([\s\S]*?)<\/Item>/g)]
+      .map((m) => sanitizeXmlText(m[1]))
+      .slice(0, 5);
+    const doi = getItem("DOI") || getItem("ELocationID");
+    articles.push({ pmid, title, source, pubDate, authors: authorList, doi });
+  }
+  return articles;
+}
+
+server.registerTool(
+  "search_pubmed",
+  {
+    description:
+      "Searches PubMed for biomedical literature. Returns PMIDs, titles, authors, journal, and publication dates. Use for finding specific papers, systematic reviews, or evidence for claims.",
+    inputSchema: {
+      query: z.string().describe("PubMed search query. Supports MeSH terms and boolean operators (AND, OR, NOT)."),
+      maxResults: z.number().optional().describe("Max results to return (default 20, max 100)."),
+      minDate: z.string().optional().describe("Minimum publication date (YYYY/MM/DD or YYYY)."),
+      maxDate: z.string().optional().describe("Maximum publication date (YYYY/MM/DD or YYYY)."),
+      sort: z.string().optional().describe("Sort order: 'relevance' (default) or 'date'."),
+    },
+  },
+  async ({ query, maxResults, minDate, maxDate, sort }) => {
+    try {
+      const retMax = Math.max(1, Math.min(100, Math.round(maxResults || 20)));
+      const params = new URLSearchParams({
+        db: "pubmed",
+        term: query,
+        retmax: String(retMax),
+        retmode: "json",
+        sort: sort === "date" ? "pub+date" : "relevance",
+      });
+      if (minDate) params.set("mindate", minDate);
+      if (maxDate) params.set("maxdate", maxDate);
+      if (minDate || maxDate) params.set("datetype", "pdat");
+
+      const searchUrl = `${PUBMED_ESEARCH}?${params.toString()}`;
+      const searchData = await fetchJsonWithRetry(searchUrl, { retries: 2, timeoutMs: 10000 });
+      const idList = searchData?.esearchresult?.idlist ?? [];
+      const totalCount = parseInt(searchData?.esearchresult?.count || "0", 10);
+
+      if (idList.length === 0) {
+        return {
+          content: [{ type: "text", text: `No PubMed results found for: "${query}"${minDate ? ` (from ${minDate})` : ""}${maxDate ? ` (to ${maxDate})` : ""}. Try broader terms or remove date filters.` }],
+        };
+      }
+
+      const summaryParams = new URLSearchParams({
+        db: "pubmed",
+        id: idList.join(","),
+        retmode: "xml",
+      });
+      const summaryUrl = `${PUBMED_ESUMMARY}?${summaryParams.toString()}`;
+      const summaryResp = await fetch(summaryUrl);
+      const summaryXml = await summaryResp.text();
+      const articles = parsePubmedArticleSummary(summaryXml);
+
+      const formatted = articles.map((a, i) => {
+        const authorStr = a.authors.length > 0
+          ? `${a.authors[0]}${a.authors.length > 1 ? " et al." : ""}`
+          : "Unknown";
+        const doiStr = a.doi ? ` DOI: ${a.doi}` : "";
+        return `${i + 1}. ${a.title}\n   PMID: ${a.pmid} | ${authorStr} | ${a.source} (${a.pubDate})${doiStr}`;
+      }).join("\n\n");
+
+      return {
+        content: [{
+          type: "text",
+          text: `PubMed search for "${query}":\nShowing ${articles.length} of ${totalCount} results${minDate ? ` | From: ${minDate}` : ""}${maxDate ? ` | To: ${maxDate}` : ""}\n\n${formatted}\n\nUse get_pubmed_abstract with a PMID for the full abstract.`,
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error searching PubMed: ${error.message}. Try different search terms.` }] };
+    }
+  }
+);
+
+// ============================================
+// TOOL: Get PubMed abstract
+// ============================================
+server.registerTool(
+  "get_pubmed_abstract",
+  {
+    description:
+      "Fetches the full abstract and metadata for a PubMed article by PMID. Returns title, authors, journal, abstract text, MeSH terms, and publication type.",
+    inputSchema: {
+      pmid: z.string().describe("PubMed ID (e.g., '12345678')"),
+    },
+  },
+  async ({ pmid }) => {
+    try {
+      const cleanPmid = pmid.replace(/^PMID:\s*/i, "").trim();
+      const params = new URLSearchParams({
+        db: "pubmed",
+        id: cleanPmid,
+        retmode: "xml",
+        rettype: "abstract",
+      });
+      const url = `${PUBMED_EFETCH}?${params.toString()}`;
+      const resp = await fetch(url);
+      const xml = await resp.text();
+
+      if (!xml || xml.includes("<ERROR>") || !xml.includes("<PubmedArticle>")) {
+        return { content: [{ type: "text", text: `PubMed article not found for PMID: ${cleanPmid}` }] };
+      }
+
+      const title = sanitizeXmlText(xml.match(/<ArticleTitle>([\s\S]*?)<\/ArticleTitle>/)?.[1] || "Untitled");
+      const abstractParts = [...xml.matchAll(/<AbstractText[^>]*>([\s\S]*?)<\/AbstractText>/g)]
+        .map((m) => sanitizeXmlText(m[1]));
+      const abstractText = abstractParts.join("\n\n") || "No abstract available.";
+      const journal = sanitizeXmlText(xml.match(/<Title>([\s\S]*?)<\/Title>/)?.[1] || "");
+      const year = xml.match(/<PubDate>[\s\S]*?<Year>(\d{4})<\/Year>/)?.[1] || "";
+      const doi = xml.match(/<ArticleId IdType="doi">([\s\S]*?)<\/ArticleId>/)?.[1]?.trim() || "";
+      const pmcId = xml.match(/<ArticleId IdType="pmc">([\s\S]*?)<\/ArticleId>/)?.[1]?.trim() || "";
+      const authors = parsePubmedAuthors(xml);
+      const authorStr = authors.slice(0, 5).map((a) => a.name).join(", ") + (authors.length > 5 ? " et al." : "");
+      const meshTerms = [...xml.matchAll(/<DescriptorName[^>]*>([\s\S]*?)<\/DescriptorName>/g)]
+        .map((m) => sanitizeXmlText(m[1]))
+        .slice(0, 15);
+      const pubTypes = [...xml.matchAll(/<PublicationType[^>]*>([\s\S]*?)<\/PublicationType>/g)]
+        .map((m) => sanitizeXmlText(m[1]));
+
+      let text = `Title: ${title}\nPMID: ${cleanPmid}`;
+      if (doi) text += ` | DOI: ${doi}`;
+      if (pmcId) text += ` | ${pmcId}`;
+      text += `\nAuthors: ${authorStr}\nJournal: ${journal} (${year})`;
+      if (pubTypes.length) text += `\nType: ${pubTypes.join(", ")}`;
+      text += `\n\nAbstract:\n${abstractText}`;
+      if (meshTerms.length) text += `\n\nMeSH Terms: ${meshTerms.join("; ")}`;
+      text += `\n\nLink: https://pubmed.ncbi.nlm.nih.gov/${cleanPmid}/`;
+
+      return { content: [{ type: "text", text }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error fetching PubMed abstract: ${error.message}` }] };
+    }
+  }
+);
+
+// ============================================
+// TOOL: Advanced PubMed search
+// ============================================
+server.registerTool(
+  "search_pubmed_advanced",
+  {
+    description:
+      "Advanced PubMed search with field-specific queries. Use for precise searches targeting specific fields like author, journal, MeSH terms, or publication type.",
+    inputSchema: {
+      query: z.string().describe("Full PubMed query with field tags, e.g., '\"BRCA1\"[Title] AND \"breast cancer\"[MeSH] AND review[pt]'"),
+      maxResults: z.number().optional().describe("Max results (default 20, max 100)."),
+      sort: z.string().optional().describe("Sort: 'relevance' (default) or 'date'."),
+    },
+  },
+  async ({ query, maxResults, sort }) => {
+    try {
+      const retMax = Math.max(1, Math.min(100, Math.round(maxResults || 20)));
+      const params = new URLSearchParams({
+        db: "pubmed",
+        term: query,
+        retmax: String(retMax),
+        retmode: "json",
+        sort: sort === "date" ? "pub+date" : "relevance",
+      });
+
+      const searchUrl = `${PUBMED_ESEARCH}?${params.toString()}`;
+      const searchData = await fetchJsonWithRetry(searchUrl, { retries: 2, timeoutMs: 10000 });
+      const idList = searchData?.esearchresult?.idlist ?? [];
+      const totalCount = parseInt(searchData?.esearchresult?.count || "0", 10);
+
+      if (idList.length === 0) {
+        return {
+          content: [{ type: "text", text: `No PubMed results for advanced query: ${query}. Check field tags and try broader terms.` }],
+        };
+      }
+
+      const summaryParams = new URLSearchParams({
+        db: "pubmed",
+        id: idList.join(","),
+        retmode: "xml",
+      });
+      const summaryUrl = `${PUBMED_ESUMMARY}?${summaryParams.toString()}`;
+      const summaryResp = await fetch(summaryUrl);
+      const summaryXml = await summaryResp.text();
+      const articles = parsePubmedArticleSummary(summaryXml);
+
+      const formatted = articles.map((a, i) => {
+        const authorStr = a.authors.length > 0
+          ? `${a.authors[0]}${a.authors.length > 1 ? " et al." : ""}`
+          : "Unknown";
+        const doiStr = a.doi ? ` DOI: ${a.doi}` : "";
+        return `${i + 1}. ${a.title}\n   PMID: ${a.pmid} | ${authorStr} | ${a.source} (${a.pubDate})${doiStr}`;
+      }).join("\n\n");
+
+      return {
+        content: [{
+          type: "text",
+          text: `PubMed advanced search:\nShowing ${articles.length} of ${totalCount} results\nQuery: ${query}\n\n${formatted}\n\nUse get_pubmed_abstract with a PMID for the full abstract.`,
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error in advanced PubMed search: ${error.message}` }] };
+    }
+  }
+);
+
 // TOOL 17: OpenAlex works search
 // ============================================
 server.registerTool(

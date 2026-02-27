@@ -51,7 +51,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --set-env-vars "BQ_PROJECT_ID=${PROJECT_ID}" \
   --set-env-vars "BQ_LOCATION=US" \
   --set-env-vars "ADK_NATIVE_PREFER_BIGQUERY=1" \
-  --set-env-vars "^||^BQ_DATASET_ALLOWLIST=${PROJECT_ID}.hackathon_data,bigquery-public-data.open_targets_platform,bigquery-public-data.ebi_chembl,bigquery-public-data.gnomAD,bigquery-public-data.pmc_open_access_commercial,bigquery-public-data.deepmind_alphafold,bigquery-public-data.fda_drug,bigquery-public-data.human_variant_annotation,bigquery-public-data.human_genome_variants,bigquery-public-data.immune_epitope_db,bigquery-public-data.umiami_lincs,bigquery-public-data.nlm_rxnorm,bigquery-public-data.ebi_surechembl,bigquery-public-data.breathe"
+  --set-env-vars "^||^BQ_DATASET_ALLOWLIST=${PROJECT_ID}.hackathon_data,bigquery-public-data.open_targets_platform,bigquery-public-data.ebi_chembl,bigquery-public-data.gnomAD,bigquery-public-data.deepmind_alphafold,bigquery-public-data.fda_drug,bigquery-public-data.human_variant_annotation,bigquery-public-data.human_genome_variants,bigquery-public-data.immune_epitope_db,bigquery-public-data.umiami_lincs,bigquery-public-data.nlm_rxnorm,bigquery-public-data.ebi_surechembl"
 
 SERVICE_URL="$(
   gcloud run services describe "${SERVICE_NAME}" \

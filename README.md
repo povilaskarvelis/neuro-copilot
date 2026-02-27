@@ -282,7 +282,6 @@ bash scripts/deploy_cloud_run.sh
 | **Ontology Context** | `expand_disease_context` | OLS (EFO/MONDO) |
 | **BigQuery** | `list_bigquery_tables`, `run_bigquery_select_query` | BigQuery |
 | **Benchmarks (No BQ)** | `benchmark_dataset_overview`, `sample_pubmedqa_examples`, `sample_bioasq_examples`, `check_gpqa_access` | Hugging Face datasets-server |
-| **Local Data** | `list_local_datasets`, `read_local_dataset` | Local filesystem |
 
 ## Testing
 

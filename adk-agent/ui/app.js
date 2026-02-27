@@ -49,7 +49,9 @@ function escapeHtml(text) {
 }
 
 function inlineMarkdown(text) {
-  let value = escapeHtml(text);
+  let value = text.replace(/<a\s+id="[^"]*">\s*<\/a>/gi, "");
+  value = escapeHtml(value);
+  value = value.replace(/\[([^\]]+)\]\((#[^)\s]+)\)/g, '<a href="$2">$1</a>');
   value = value.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   value = value.replace(/(^|[\s(])((?:https?:\/\/)[^\s<)]+)(?=$|[\s).,;:!?])/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
   value = value.replace(/`([^`]+)`/g, "<code>$1</code>");
@@ -65,23 +67,30 @@ function markdownToHtml(markdown) {
   let inOl = false;
   let inCode = false;
   let codeBuffer = [];
+  let inBlockquote = false;
 
   const closeLists = () => {
-    if (inUl) {
-      html.push("</ul>");
-      inUl = false;
-    }
-    if (inOl) {
-      html.push("</ol>");
-      inOl = false;
-    }
+    if (inUl) { html.push("</ul>"); inUl = false; }
+    if (inOl) { html.push("</ol>"); inOl = false; }
+  };
+  const closeBlockquote = () => {
+    if (inBlockquote) { html.push("</blockquote>"); inBlockquote = false; }
   };
 
   for (const rawLine of lines) {
     const line = String(rawLine || "");
-    const trimmed = line.trim();
+    let trimmed = line.trim();
+
+    // Extract <a id="..."></a> anchors — re-emit as real HTML anchor targets
+    let anchorHtml = "";
+    const am = trimmed.match(/^<a\s+id="([^"]+)">\s*<\/a>/);
+    if (am) {
+      anchorHtml = `<span id="${escapeHtml(am[1])}"></span>`;
+      trimmed = trimmed.slice(am[0].length).trim();
+    }
 
     if (trimmed.startsWith("```")) {
+      closeBlockquote();
       closeLists();
       if (inCode) {
         html.push(`<pre><code>${escapeHtml(codeBuffer.join("\n"))}</code></pre>`);
@@ -99,69 +108,83 @@ function markdownToHtml(markdown) {
     }
 
     if (!trimmed) {
+      closeBlockquote();
       closeLists();
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^(?:---+|\*\*\*+|___+)$/.test(trimmed)) {
+      closeBlockquote();
+      closeLists();
+      html.push("<hr>");
       continue;
     }
 
     const h3 = trimmed.match(/^###\s+(.+)$/);
     if (h3) {
+      closeBlockquote();
       closeLists();
-      html.push(`<h3>${inlineMarkdown(h3[1])}</h3>`);
+      html.push(`${anchorHtml}<h3>${inlineMarkdown(h3[1])}</h3>`);
       continue;
     }
     const h2 = trimmed.match(/^##\s+(.+)$/);
     if (h2) {
+      closeBlockquote();
       closeLists();
-      html.push(`<h2>${inlineMarkdown(h2[1])}</h2>`);
+      html.push(`${anchorHtml}<h2>${inlineMarkdown(h2[1])}</h2>`);
       continue;
     }
     const h1 = trimmed.match(/^#\s+(.+)$/);
     if (h1) {
+      closeBlockquote();
       closeLists();
-      html.push(`<h1>${inlineMarkdown(h1[1])}</h1>`);
+      html.push(`${anchorHtml}<h1>${inlineMarkdown(h1[1])}</h1>`);
       continue;
     }
 
-    const quote = trimmed.match(/^>\s+(.+)$/);
-    if (quote) {
+    // Blockquotes — merge consecutive > lines into a single <blockquote>
+    const quoteMatch = trimmed.match(/^>\s?(.*)$/);
+    if (quoteMatch) {
       closeLists();
-      html.push(`<blockquote>${inlineMarkdown(quote[1])}</blockquote>`);
+      if (!inBlockquote) {
+        html.push("<blockquote>");
+        inBlockquote = true;
+      }
+      const content = (quoteMatch[1] || "").trim();
+      if (content) {
+        html.push(`<p>${inlineMarkdown(content)}</p>`);
+      }
       continue;
     }
+
+    closeBlockquote();
 
     const ul = trimmed.match(/^[-*]\s+(.+)$/);
     if (ul) {
-      if (inOl) {
-        html.push("</ol>");
-        inOl = false;
-      }
-      if (!inUl) {
-        html.push("<ul>");
-        inUl = true;
-      }
-      html.push(`<li>${inlineMarkdown(ul[1])}</li>`);
+      if (inOl) { html.push("</ol>"); inOl = false; }
+      if (!inUl) { html.push("<ul>"); inUl = true; }
+      html.push(`<li>${anchorHtml}${inlineMarkdown(ul[1])}</li>`);
       continue;
     }
 
     const ol = trimmed.match(/^(\d+)\.\s+(.+)$/);
     if (ol) {
-      if (inUl) {
-        html.push("</ul>");
-        inUl = false;
-      }
+      if (inUl) { html.push("</ul>"); inUl = false; }
       if (!inOl) {
         const start = Number(ol[1] || "1");
         html.push(Number.isFinite(start) && start > 1 ? `<ol start="${start}">` : "<ol>");
         inOl = true;
       }
-      html.push(`<li>${inlineMarkdown(ol[2])}</li>`);
+      html.push(`<li>${anchorHtml}${inlineMarkdown(ol[2])}</li>`);
       continue;
     }
 
     closeLists();
-    html.push(`<p>${inlineMarkdown(trimmed)}</p>`);
+    html.push(`${anchorHtml}<p>${inlineMarkdown(trimmed)}</p>`);
   }
 
+  closeBlockquote();
   closeLists();
   if (inCode) html.push(`<pre><code>${escapeHtml(codeBuffer.join("\n"))}</code></pre>`);
   return html.join("");
@@ -1231,6 +1254,18 @@ function bindEvents() {
     if (!taskId) return;
     exportFinalReportPdf(taskId);
   });
+
+  const exampleContainer = document.getElementById("exampleQueries");
+  if (exampleContainer) {
+    exampleContainer.addEventListener("click", (event) => {
+      const chip = event.target.closest(".example-query");
+      if (!chip) return;
+      const query = chip.dataset.query || chip.textContent.trim();
+      el.promptInput.value = query;
+      updateSendVisibility();
+      el.promptInput.focus();
+    });
+  }
 }
 
 async function bootstrap() {

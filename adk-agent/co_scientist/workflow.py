@@ -13,6 +13,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any
 import urllib.error
 import urllib.parse
@@ -84,6 +85,7 @@ STATE_EXECUTOR_LAST_PROSE = "temp:co_scientist_executor_last_prose"
 MAX_REACT_PARSE_RETRIES = 2
 STATE_EXECUTOR_PREV_STEP_STATUS = "temp:co_scientist_executor_prev_step_status"
 STATE_PLAN_PENDING_APPROVAL = "co_scientist_plan_pending_approval"
+STATE_MODEL_ERROR_PASSTHROUGH = "temp:co_scientist_model_error_passthrough"
 
 FINALIZE_COMMANDS = {
     "finalize",
@@ -116,33 +118,46 @@ FINAL_SYNTHESIS_SCHEMA = "final_synthesis.v1"
 WORKFLOW_TASK_SCHEMA = "workflow_task_state.v1"
 
 KNOWN_MCP_TOOLS = [
-    # BigQuery (primary data source — covers gene info, disease ontology,
-    # drug labels, literature, preprints, variant annotations, and more)
     "list_bigquery_tables",
     "run_bigquery_select_query",
-    # Clinical trials (live registry, no BQ equivalent)
     "search_clinical_trials",
     "get_clinical_trial",
     "summarize_clinical_trials_landscape",
-    # Researcher discovery (live index, no BQ equivalent)
+    "search_pubmed",
+    "search_pubmed_advanced",
+    "get_pubmed_abstract",
     "search_openalex_works",
     "search_openalex_authors",
     "rank_researchers_by_activity",
     "get_researcher_contact_candidates",
-    # Protein profiles (detailed isoforms/PTMs beyond AlphaFold metadata)
     "search_uniprot_proteins",
     "get_uniprot_protein_profile",
-    # Pathway hierarchy (Reactome API returns full pathway trees)
     "search_reactome_pathways",
-    # Protein-protein interactions (no STRING data in BQ)
     "get_string_interactions",
-    # Benchmarks
     "benchmark_dataset_overview",
     "check_gpqa_access",
-    # Local data
-    "list_local_datasets",
-    "read_local_dataset",
 ]
+
+TOOL_DESCRIPTIONS: dict[str, str] = {
+    "list_bigquery_tables": "List tables/columns in a BigQuery dataset",
+    "run_bigquery_select_query": "Run SQL on BigQuery public datasets",
+    "search_clinical_trials": "Search ClinicalTrials.gov (returns NCT IDs)",
+    "get_clinical_trial": "Get details of a specific clinical trial by NCT ID",
+    "summarize_clinical_trials_landscape": "Aggregate trial landscape stats for a condition",
+    "search_pubmed": "Search PubMed literature (returns PMIDs, titles, authors)",
+    "search_pubmed_advanced": "Advanced PubMed search with field-specific queries (MeSH, author, journal)",
+    "get_pubmed_abstract": "Fetch full abstract for a PMID",
+    "search_openalex_works": "Search OpenAlex for papers, preprints, and citations (returns DOIs)",
+    "search_openalex_authors": "Find researchers and their publication profiles",
+    "rank_researchers_by_activity": "Rank authors by recent publication activity",
+    "get_researcher_contact_candidates": "Get contact/affiliation info for researchers",
+    "search_uniprot_proteins": "Search UniProt for protein entries",
+    "get_uniprot_protein_profile": "Detailed protein profile (isoforms, PTMs, function)",
+    "search_reactome_pathways": "Search biological pathway hierarchies",
+    "get_string_interactions": "Get protein-protein interaction networks from STRING",
+    "benchmark_dataset_overview": "Overview of available benchmark datasets",
+    "check_gpqa_access": "Check access to GPQA benchmark",
+}
 
 TOOL_SOURCE_NAMES: dict[str, str] = {
     # Generic BQ tool names (fallback when no dataset hint is available)
@@ -160,11 +175,13 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "fda_drug": "FDA Drug (BigQuery)",
     "umiami_lincs": "LINCS L1000",
     "ebi_surechembl": "SureChEMBL",
-    "pmc_open_access_commercial": "PubMed Central",
-    "breathe": "bioRxiv / arXiv",
     "hackathon_data": "CIViC / ClinGen",
     "civic": "CIViC",
     "clingen": "ClinGen",
+    # PubMed (NCBI E-utilities)
+    "search_pubmed": "PubMed",
+    "search_pubmed_advanced": "PubMed",
+    "get_pubmed_abstract": "PubMed",
     # Remaining MCP tools (live APIs with no BQ equivalent)
     "benchmark_dataset_overview": "Benchmark Datasets",
     "check_gpqa_access": "GPQA",
@@ -179,8 +196,6 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "get_string_interactions": "STRING",
     "search_uniprot_proteins": "UniProt",
     "get_uniprot_protein_profile": "UniProt",
-    "list_local_datasets": "Local Datasets",
-    "read_local_dataset": "Local Datasets",
 }
 
 
@@ -196,19 +211,20 @@ Rules:
 - Prioritize high-signal subtasks that reduce uncertainty first.
 - Choose the number of steps needed for the objective. Avoid unnecessary fragmentation.
 - Each step must include: id, goal, tool_hint, completion_condition.
+- Every step must call at least one tool. Pick tool_hint from the catalog above.
+- NEVER put example values or IDs in the goal or completion_condition.
 - Use step ids S1, S2, S3, ... in order.
-- Do not call tools.
 
 Citation requirement:
-- A final report without citations is incomplete. Every plan MUST produce at least one step
-  whose tool_hint is a literature or trial source that returns individual citable identifiers
-  (search_pubmed, search_pubmed_advanced, search_openalex_works, search_clinical_trials,
-  get_pubmed_abstract, get_pubmed_paper_details, search_gwas_associations, search_clinvar_variants).
-- If ALL steps use only aggregate or scoring tools (compare_targets_multi_axis, get_target_info,
-  check_druggability, get_target_drugs, summarize_target_expression_context,
-  summarize_target_competitive_landscape, summarize_target_safety_liabilities, search_targets,
-  search_disease_targets, search_diseases, search_reactome_pathways, get_string_interactions,
-  get_gene_info), you MUST append a dedicated literature corroboration step:
+- A final report without citations is incomplete. Every plan MUST include at least one step
+  whose tool_hint is a source that returns individual citable identifiers:
+  search_pubmed, search_pubmed_advanced, get_pubmed_abstract, search_openalex_works,
+  search_clinical_trials.
+- If ALL steps use only aggregate or structured-data tools (run_bigquery_select_query,
+  list_bigquery_tables, summarize_clinical_trials_landscape, search_reactome_pathways,
+  get_string_interactions, search_uniprot_proteins, get_uniprot_protein_profile,
+  search_openalex_authors, rank_researchers_by_activity), you MUST append a dedicated
+  literature corroboration step:
     - tool_hint: search_pubmed (or search_openalex_works or search_clinical_trials)
     - goal: "Find and record PMIDs / DOIs / NCT numbers for the key claims from the preceding steps."
     - completion_condition: "At least 3 specific identifiers (PMID, DOI, or NCT) are recorded."
@@ -220,13 +236,13 @@ Output requirements:
 - Return ONLY valid JSON (no markdown, no prose) matching this shape:
   {
     "schema": "plan_internal.v1",
-    "objective": "<restated objective>",
+    "objective": "<restated objective — a single clear research question; if this is a revision, synthesize the original query and revision feedback into one coherent question>",
     "success_criteria": ["..."],
     "steps": [
       {
         "id": "S1",
         "goal": "...",
-        "tool_hint": "<single best tool, tool family, or BigQuery dataset name (e.g. open_targets_platform, pmc_open_access_commercial, gnomad)>",
+        "tool_hint": "<tool name or BigQuery dataset from the catalog, e.g. open_targets_platform, search_pubmed, search_clinical_trials, gnomad>",
         "completion_condition": "..."
       }
     ]
@@ -249,8 +265,11 @@ __TOOL_CATALOG__
 Rules:
 - Focus ONLY on the current step provided in the execution context.
 - You MUST call at least one tool before returning a result.
-- If a tool call fails or returns insufficient data, try an alternative tool or query.
-- If no tool can satisfy the step, mark it as blocked with a clear reason.
+- If a tool call fails or returns insufficient data, try an alternative tool or query
+  (e.g. search_pubmed <-> search_openalex_works, or fall back to run_bigquery_select_query).
+- If no tool can satisfy the step after trying alternatives, mark it as blocked with a clear reason.
+- If the goal or completion_condition contains an example value (marked with "e.g." or similar),
+  treat it as illustrative — accept any valid result that fulfills the intent, not the exact example value.
 - Prioritize high-signal evidence before broad expansion.
 - Surface contradictions and unresolved gaps explicitly.
 - Include source identifiers when available (PMID, DOI, NCT, OpenAlex IDs).
@@ -258,15 +277,11 @@ Rules:
 Evidence ID requirements:
 - evidence_ids MUST be populated with real, specific identifiers (PMID:XXXXXXXX, DOI:10.xxxx,
   NCT########) returned directly by tool calls. Never fabricate identifiers.
-- If the primary tool for this step does not return individual document IDs (e.g.,
-  compare_targets_multi_axis, get_target_info, check_druggability), you MUST make a secondary
-  call to search_pubmed or search_openalex_works using key terms from the findings to harvest
-  supporting PMIDs or DOIs. Add every returned PMID/DOI to evidence_ids.
+- If the primary tool for this step does not return individual document IDs (e.g. BigQuery
+  aggregate queries), make a secondary call to search_pubmed or search_openalex_works using
+  key terms from the findings to harvest supporting PMIDs or DOIs.
 - A completed step with an empty evidence_ids array is only acceptable when the step is a
-  pure calculation, data transformation, or planning step with no literature or trial backing.
-- For ClinicalTrials results, record each trial as NCT########.
-- For PubMed results, record each article as PMID:XXXXXXXX.
-- For OpenAlex results, record each work as OpenAlex:WXXXXXXXXXX or its DOI.
+  pure calculation or data transformation with no literature or trial backing.
 __BQ_POLICY__
 
 Output requirements:
@@ -283,7 +298,9 @@ Output requirements:
     "open_gaps": ["..."],
     "suggested_next_searches": ["..."]
   }
-- The reasoning_trace MUST use labeled phases (REASON, ACT, OBSERVE, CONCLUDE) to clearly show each step of the Reason-Act-Observe cycle. If you made multiple tool calls, include multiple ACT/OBSERVE pairs.
+- The reasoning_trace MUST use labeled phases (REASON, ACT, OBSERVE, CONCLUDE). Keep it concise:
+  summarize intermediate tool calls briefly (one line each) and only expand on the final conclusion.
+  Do NOT repeat full query results in the trace — just note what was found. This avoids output truncation.
 - The tools_called list MUST contain the names of every MCP tool you invoked during this step.
 """
 
@@ -292,38 +309,35 @@ SYNTHESIZER_INSTRUCTION = """
 You are the final biomedical report synthesizer.
 You will receive structured state context (objective, plan steps, step results, coverage status, and a source_reference mapping).
 
+Your report MUST follow this exact section structure:
+
+## Summary
+A direct, evidence-grounded answer to the research question — not just a high-level statement but an informative synthesis that conveys the key takeaways a researcher needs. Include the most important specific findings, magnitudes, or conclusions so the reader learns something substantive without having to read the full report. When the answer naturally involves multiple items, categories, or dimensions, use bullet points to make the presentation clearer. If the plan is incomplete, note that the summary is partial.
+
+## Evidence and Methodology
+Start with ONE short overview paragraph that:
+- Lists the investigative steps taken and what type of evidence each provided at a high level.
+- Notes how many planned steps completed vs. total (e.g. "5 of 5 planned steps completed" or "3 of 5 planned steps completed; 2 steps could not be executed due to data unavailability").
+Then provide a subsection for EACH step with a status indicator in the heading (e.g. "### Step 1: <goal> — COMPLETED" or "### Step 2: <goal> — FAILED"), detailing:
+- The data source queried (use the human-readable source name, not tool names).
+- Key findings with specific identifiers (PMID, DOI, NCT numbers) inline.
+- Why the findings matter for the research question.
+- Any gaps or limitations specific to that step.
+Mark failed/blocked steps clearly with what went wrong.
+
+## Limitations
+Bullet list of overall limitations and caveats.
+
+## Potential Next Steps
+Numbered list of 3+ actionable follow-ups (confirmatory checks, risk reduction, monitoring, or decision-oriented follow-up).
+
 Rules:
-- Produce a final summary grounded only in the provided evidence/results.
-- If the plan is incomplete, clearly state that the summary is partial.
-- Do not invent unsupported claims.
-- Avoid terse output. Be specific and useful.
-- For each supporting evidence item, include:
-  - the evidence-backed claim,
-  - why it matters for the objective (rationale),
-  - source identifiers when available.
-- Always include 3 potential next steps, even when the plan is complete (e.g., confirmatory checks, risk reduction, monitoring, or decision-oriented follow-up).
-
-Source citation rules:
-- Each step in the context has a `source` field with the database/source name (e.g. "PubMed", "ClinicalTrials.gov").
-- A `source_reference` legend maps internal tool names to database names.
-- When citing findings, use ONLY the database/source name. NEVER mention tool names (like run_bigquery_select_query, search_clinical_trials, etc.) in the report.
-  Good: "According to PubMed Central (BigQuery), three RCTs showed..."
-  Good: "Open Targets Platform data indicates BRCA1 has high genetic association..."
-  Good: "ClinicalTrials.gov lists 12 active Phase II trials..."
-  Bad:  "run_bigquery_select_query returned three RCTs..."
-  Bad:  "Using the search_clinical_trials tool..."
-  Bad:  "BigQuery (run_bigquery_select_query) data shows..."
-- Include specific identifiers inline when available (PMID, DOI, NCT numbers, etc.).
-- NEVER include raw URLs, API endpoints, or links to JSON output in the report. Only use human-readable source names and identifiers.
-
-Output requirements:
-- Return user-facing Markdown.
-- Start with `## Final Summary`.
-- Present findings grouped by step. For each step, state the source explicitly on its own line before the findings, e.g.:
-  
-  **Source:** PubMed
-  Three RCTs (PMID: 12345678, PMID: 23456789) demonstrated...
-- End with `Limitations` and `Potential Next Steps` sections.
+- Ground every claim in the provided evidence. Do not invent unsupported claims.
+- Be specific and thorough — avoid terse output.
+- Use ONLY human-readable database/source names (e.g. "PubMed", "ClinicalTrials.gov"). NEVER mention tool names (like run_bigquery_select_query, search_clinical_trials, etc.).
+- Include specific identifiers inline when available (PMID, DOI, NCT numbers).
+- NEVER include raw URLs, API endpoints, or links to JSON output.
+- Return user-facing Markdown only (not JSON).
 """
 
 
@@ -462,6 +476,7 @@ def _clear_turn_temp_state(callback_context: CallbackContext) -> None:
     callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = ""
     callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = ""
     callback_context.state[STATE_REACT_PARSE_RETRIES] = 0
+    callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = False
 
 
 def _set_turn_rendered_output(callback_context: CallbackContext, *, key: str, text: str) -> None:
@@ -551,6 +566,14 @@ def _extract_balanced_json_substring(text: str) -> str | None:
     return None
 
 
+_INVALID_JSON_ESCAPES = re.compile(r"\\(?![\"\\\/bfnrtu])")
+
+
+def _sanitize_json_string(text: str) -> str:
+    """Fix common invalid JSON escape sequences produced by LLMs (e.g. \\' → ')."""
+    return _INVALID_JSON_ESCAPES.sub("", text)
+
+
 def _parse_json_object_from_text(raw_text: str) -> tuple[dict[str, Any] | None, str | None]:
     raw = str(raw_text or "").strip()
     if not raw:
@@ -570,15 +593,16 @@ def _parse_json_object_from_text(raw_text: str) -> tuple[dict[str, Any] | None, 
 
     last_error = "Failed to parse JSON object."
     for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except Exception as exc:  # noqa: BLE001
-            last_error = f"JSON parse error: {exc}"
-            continue
-        if not isinstance(parsed, dict):
-            last_error = "Top-level JSON value must be an object."
-            continue
-        return parsed, None
+        for attempt in (candidate, _sanitize_json_string(candidate)):
+            try:
+                parsed = json.loads(attempt)
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"JSON parse error: {exc}"
+                continue
+            if not isinstance(parsed, dict):
+                last_error = "Top-level JSON value must be an object."
+                continue
+            return parsed, None
     return None, last_error
 
 
@@ -695,10 +719,11 @@ def _initialize_task_state_from_plan(plan: dict[str, Any], *, objective_text: st
         }
         for step in validated["steps"]
     ]
+    objective = validated["objective"] or objective_text
     return {
         "schema": WORKFLOW_TASK_SCHEMA,
-        "objective": objective_text or validated["objective"],
-        "objective_fingerprint": _normalize_user_text(objective_text or validated["objective"]),
+        "objective": objective,
+        "objective_fingerprint": _normalize_user_text(objective_text or objective),
         "plan_status": "ready",
         "current_step_id": steps[0]["id"] if steps else None,
         "last_completed_step_id": None,
@@ -759,6 +784,10 @@ def _completed_step_count(task_state: dict[str, Any]) -> int:
 
 def _total_step_count(task_state: dict[str, Any]) -> int:
     return len(task_state.get("steps", []))
+
+
+def _failed_step_count(task_state: dict[str, Any]) -> int:
+    return sum(1 for step in task_state.get("steps", []) if str(step.get("status")) == "blocked")
 
 
 def _compute_coverage_status(task_state: dict[str, Any]) -> str:
@@ -1154,7 +1183,7 @@ def _fetch_pubmed_meta(pmid: str) -> dict | None:
         "authors": [str(a.get("name", "")).strip() for a in (result.get("authors") or []) if a.get("authtype") == "Author"],
         "title": str(result.get("title", "")).rstrip(".").strip(),
         "journal": str(result.get("source", "")).strip(),
-        "year": str(result.get("pubdate", "")).split()[0],
+        "year": (str(result.get("pubdate", "")).split() or [""])[0],
         "volume": str(result.get("volume", "")).strip(),
         "issue": str(result.get("issue", "")).strip(),
         "pages": str(result.get("pages", "")).strip(),
@@ -1401,7 +1430,7 @@ def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> s
         ref_key = re.sub(r"\s*:\s*", ":", normalized).lower()
         if ref_map and ref_key in ref_map:
             n = ref_map[ref_key]
-            return f"[{n}](#ref-{n})"
+            return f"[{n}]"
         url = _evidence_id_to_url(normalized)
         if not url:
             return m.group(0)
@@ -1416,39 +1445,98 @@ def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> s
     return linked + refs_tail
 
 
-def _merge_reference_ids(inline_ids: list[str], task_ids: list[str]) -> list[str]:
-    """Merge inline-extracted IDs (first) with task-state IDs, deduplicating."""
-    seen: set[str] = set()
-    combined: list[str] = []
-    for eid in inline_ids + task_ids:
-        key = re.sub(r"\s*:\s*", ":", eid).lower()
-        if key not in seen:
-            seen.add(key)
-            combined.append(eid)
-    return combined
-
-
+# ---------------------------------------------------------------------------
+# Evidence & Methodology helpers (used by _render_final_synthesis_markdown)
 # ---------------------------------------------------------------------------
 
 
-def _fallback_supporting_evidence_from_task_state(task_state: dict[str, Any]) -> list[str]:
-    items: list[str] = []
+def _build_methodology_overview(task_state: dict[str, Any], completed: int, total: int, failed: int) -> str:
+    """Build the one-paragraph overview for the Evidence and Methodology section."""
+    step_summaries: list[str] = []
     for step in task_state.get("steps", []):
-        if str(step.get("status", "")).strip() != "completed":
-            continue
         goal = str(step.get("goal", "")).strip()
-        summary = str(step.get("result_summary", "")).strip()
-        if not summary:
-            continue
-        evidence_ids = [str(x).strip() for x in step.get("evidence_ids", []) if str(x).strip()]
-        evidence_suffix = f" (IDs: {', '.join(evidence_ids[:6])})" if evidence_ids else ""
-        if goal:
-            items.append(f"{summary} This matters because it addresses the step goal: {goal}.{evidence_suffix}")
+        status = str(step.get("status", "")).strip()
+        source = _resolve_source_label(str(step.get("tool_hint", "")))
+        source_note = f" via {source}" if source else ""
+        if status == "completed":
+            step_summaries.append(f"{goal}{source_note}")
+        elif status == "blocked":
+            step_summaries.append(f"{goal} (failed)")
         else:
-            items.append(summary + evidence_suffix)
-        if len(items) >= 8:
-            break
-    return items
+            step_summaries.append(f"{goal} (not executed)")
+
+    overview_parts = [f"This investigation comprised {total} planned steps"]
+    if step_summaries:
+        overview_parts.append(": " + "; ".join(step_summaries) + ".")
+    else:
+        overview_parts.append(".")
+
+    if failed:
+        overview_parts.append(
+            f" {completed} of {total} steps completed successfully; {failed} could not be executed."
+        )
+    elif completed < total:
+        pending = total - completed
+        overview_parts.append(
+            f" {completed} of {total} steps completed; {pending} remaining when the summary was requested."
+        )
+    else:
+        overview_parts.append(f" All {total} planned steps completed successfully.")
+
+    return "".join(overview_parts)
+
+
+def _render_step_subsection(step: dict[str, Any]) -> list[str]:
+    """Render a ### subsection for one step in the Evidence and Methodology section."""
+    step_id = str(step.get("id", "")).strip()
+    goal = str(step.get("goal", "")).strip()
+    status = str(step.get("status", "")).strip()
+    summary = str(step.get("result_summary", "")).strip()
+    source = _resolve_source_label(str(step.get("tool_hint", "")))
+    evidence_ids = [str(x).strip() for x in (step.get("evidence_ids") or []) if str(x).strip()]
+    open_gaps = [str(x).strip() for x in (step.get("open_gaps") or []) if str(x).strip()]
+
+    if status == "completed":
+        status_tag = "COMPLETED"
+    elif status == "blocked":
+        status_tag = "FAILED"
+    else:
+        status_tag = (status.upper() if status else "PENDING")
+    heading = f"### {step_id}: {goal} — {status_tag}" if step_id else f"### {goal} — {status_tag}"
+    lines = [heading, ""]
+
+    if source:
+        lines.append(f"**Source:** {source}")
+        lines.append("")
+
+    if status == "blocked":
+        lines.append("*This step could not be completed.*")
+        if summary:
+            lines.append(f" {summary}")
+        lines.append("")
+        return lines
+
+    if status != "completed":
+        lines.append(f"*Status: {status}*")
+        lines.append("")
+        return lines
+
+    if summary:
+        lines.append(summary)
+        lines.append("")
+
+    if evidence_ids:
+        lines.append("**Key identifiers:** " + ", ".join(evidence_ids[:10]))
+        lines.append("")
+
+    if open_gaps:
+        lines.append("**Open gaps:** " + "; ".join(open_gaps[:5]))
+        lines.append("")
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
 
 
 def _fallback_next_actions_from_task_state(task_state: dict[str, Any]) -> list[str]:
@@ -1487,45 +1575,25 @@ def _fallback_next_actions_from_task_state(task_state: dict[str, Any]) -> list[s
     return actions[:5]
 
 
-def _coverage_note_from_task_state(task_state: dict[str, Any]) -> str:
-    coverage = _compute_coverage_status(task_state)
-    completed = _completed_step_count(task_state)
-    total = _total_step_count(task_state)
-    coverage_label = "Complete plan" if coverage == "complete_plan" else "Partial plan"
-    if coverage == "partial_plan":
-        return (
-            f"_Coverage: {coverage_label} ({completed} of {total} planned steps completed when final summary was requested)._"
-        )
-    return f"_Coverage: {coverage_label} ({completed} of {total} planned steps completed)._"
-
-
-
 def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -> str:
+    """Post-process the LLM's markdown output into the final report format."""
     text = str(raw_markdown or "").strip()
     if not text:
         text = "# AI Co-Scientist Report\n\n## Summary\n\nNo final summary was produced."
 
+    # Ensure title
     has_title = "# AI Co-Scientist Report" in text
     has_old_heading = "## Final Summary" in text or "# Final Summary" in text
     if not has_title and not has_old_heading:
-        text = "# AI Co-Scientist Report\n\n## Summary\n\n" + text
+        text = "# AI Co-Scientist Report\n\n" + text
     elif has_old_heading and not has_title:
-        # Upgrade legacy heading
         text = text.replace("## Final Summary", "## Summary").replace("# Final Summary", "## Summary")
         text = "# AI Co-Scientist Report\n\n" + text
 
-    # Inject research question callout beneath the title if not already present.
+    # Inject research question callout (query only, no coverage) beneath the title
     objective = str(task_state.get("objective", "")).strip()
     if objective and "**Research Question:**" not in text:
-        coverage_status = _compute_coverage_status(task_state)
-        completed = _completed_step_count(task_state)
-        total = _total_step_count(task_state)
-        coverage_label = "Complete" if coverage_status == "complete_plan" else "Partial"
-        callout = (
-            f"\n\n> **Research Question:** {objective}\n"
-            f">\n"
-            f"> **Coverage:** {coverage_label} \u2014 {completed} of {total} planned steps completed\n\n---"
-        )
+        callout = f"\n\n> **Research Question:** {objective}\n\n---"
         title_pos = text.find("# AI Co-Scientist Report")
         if title_pos != -1:
             title_end = text.find("\n", title_pos)
@@ -1534,15 +1602,14 @@ def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -
             else:
                 text += callout
 
-    lowered = text.lower()
+    # Strip any old-style coverage lines the LLM may have placed at the top callout
+    text = re.sub(r">\s*\n>\s*\*\*Coverage:\*\*[^\n]*\n?", "", text)
 
-    # References: inject before Potential Next Steps so _strip_next_steps_section in ui_server preserves them
-    # Only use IDs that appear inline in the body — every numbered reference must have an in-text citation.
+    # References: inject before Next Steps so _strip_next_steps_section preserves them
     inline_ids = _extract_inline_ids_from_text(text)
-    all_ids = inline_ids
-    ref_map = _build_ref_map(all_ids)
+    ref_map = _build_ref_map(inline_ids)
     if "## References" not in text:
-        refs = _build_references_section(all_ids)
+        refs = _build_references_section(inline_ids)
         if refs:
             next_steps_pattern = re.compile(
                 r"(\n#{1,3}\s+(?:Potential\s+)?Next\s+(?:Steps?|Actions?)\b)",
@@ -1554,9 +1621,9 @@ def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -
             else:
                 text += "\n\n" + refs
 
-    # Hyperlink bare inline IDs — link to local #ref-N anchors when available
     text = _hyperlink_inline_ids(text, ref_map)
 
+    # Ensure Next Steps section exists
     lowered = text.lower()
     if "potential next steps" not in lowered and "next steps" not in lowered and "next actions" not in lowered:
         fallback_next = _fallback_next_actions_from_task_state(task_state)
@@ -1564,32 +1631,21 @@ def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -
             text += "\n\n## Potential Next Steps\n\n"
             text += "\n".join(f"{i}. {item}" for i, item in enumerate(fallback_next[:20], start=1))
 
-    lowered = text.lower()
-    if "_coverage:" not in lowered and "coverage:" not in lowered:
-        text += "\n\n" + _coverage_note_from_task_state(task_state)
-
     return text.strip()
 
 
 def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict[str, Any]) -> str:
+    """Fallback renderer: builds the report from structured synthesis fields."""
     objective = str(task_state.get("objective", "")).strip()
     coverage = str(synthesis.get("coverage_status", "partial_plan"))
     completed = _completed_step_count(task_state)
     total = _total_step_count(task_state)
-    coverage_label = "Complete" if coverage == "complete_plan" else "Partial"
+    failed = _failed_step_count(task_state)
 
     lines = ["# AI Co-Scientist Report", ""]
 
-    # Research question + coverage callout
     if objective:
-        lines += [
-            f"> **Research Question:** {objective}",
-            ">",
-            f"> **Coverage:** {coverage_label} \u2014 {completed} of {total} planned steps completed",
-            "",
-            "---",
-            "",
-        ]
+        lines += [f"> **Research Question:** {objective}", "", "---", ""]
 
     # Summary
     lines += ["## Summary", ""]
@@ -1598,15 +1654,12 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
         lines.append(direct_answer)
         lines.append("")
 
-    # Supporting Evidence
-    supporting = [str(x).strip() for x in synthesis.get("supporting_evidence", []) if str(x).strip()]
-    if not supporting:
-        supporting = _fallback_supporting_evidence_from_task_state(task_state)
-    if supporting:
-        lines += ["## Supporting Evidence", ""]
-        for i, item in enumerate(supporting[:20], start=1):
-            lines.append(f"**{i}.** {item}")
-            lines.append("")
+    # Evidence and Methodology
+    lines += ["## Evidence and Methodology", ""]
+    lines.append(_build_methodology_overview(task_state, completed, total, failed))
+    lines.append("")
+    for step in task_state.get("steps", []):
+        lines += _render_step_subsection(step)
 
     # Limitations
     limitations = [str(x).strip() for x in synthesis.get("limitations", []) if str(x).strip()]
@@ -1615,23 +1668,20 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
         lines.extend(f"- {item}" for item in limitations[:20])
         lines.append("")
 
-    # Collect IDs, build ref_map, then render References and hyperlink inline mentions
-    # Only use IDs that appear inline in the body — every numbered reference must have an in-text citation.
+    # References
     current_text = "\n".join(lines)
     inline_ids = _extract_inline_ids_from_text(current_text)
-    all_ids = inline_ids
-    ref_map = _build_ref_map(all_ids)
-    refs = _build_references_section(all_ids)
+    ref_map = _build_ref_map(inline_ids)
+    refs = _build_references_section(inline_ids)
     if refs:
         lines += refs.split("\n")
         lines.append("")
 
-    # Hyperlink inline IDs — internal anchors to #ref-N where available
     body_so_far = "\n".join(lines)
     body_so_far = _hyperlink_inline_ids(body_so_far, ref_map)
     lines = body_so_far.split("\n")
 
-    # Next Steps (after References so _strip_next_steps_section in ui_server won't remove References)
+    # Next Steps (after References so _strip_next_steps_section in ui_server preserves References)
     next_actions = [str(x).strip() for x in synthesis.get("next_actions", []) if str(x).strip()]
     if not next_actions:
         next_actions = _fallback_next_actions_from_task_state(task_state)
@@ -1640,17 +1690,6 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
         for i, item in enumerate(next_actions[:20], start=1):
             lines.append(f"{i}. {item}")
         lines.append("")
-
-    lines.append("---")
-    lines.append("")
-    if coverage == "partial_plan":
-        lines.append(
-            f"_Coverage: Partial plan \u2014 {completed} of {total} planned steps completed when final summary was requested._"
-        )
-    else:
-        lines.append(
-            f"_Coverage: Complete plan \u2014 all {total} planned steps completed._"
-        )
 
     return "\n".join(lines).strip()
 
@@ -1799,8 +1838,8 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
         instructions.append(_serialize_pretty_json(prior_entries))
 
     instructions.append(
-        "Return user-facing Markdown (not JSON). Include a direct answer, supporting evidence with rationale, "
-        "limitations, potential next steps, and a coverage note (complete vs partial plan)."
+        "Return user-facing Markdown (not JSON). Follow the section structure from your instructions exactly: "
+        "Summary, Evidence and Methodology (with per-step subsections), Limitations, Potential Next Steps."
     )
     return instructions
 
@@ -2019,6 +2058,11 @@ def _make_planner_after_model_callback(*, require_approval: bool):
     """
 
     def _callback(*, callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
+        if bool(callback_context.state.get(STATE_MODEL_ERROR_PASSTHROUGH, False)):
+            callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = False
+            callback_context.state[STATE_PLANNER_BUFFER] = ""
+            return None
+
         if _llm_response_has_function_call(llm_response):
             return None
 
@@ -2060,26 +2104,34 @@ def _make_planner_after_model_callback(*, require_approval: bool):
     return _callback
 
 
+RATE_LIMIT_BACKOFF_SECONDS = 30
+
+
 def _on_model_error(
     *,
     callback_context: CallbackContext,
     llm_request: LlmRequest,
     error: Exception,
 ) -> LlmResponse | None:
-    """Surface model-level errors (rate limits, network, etc.) as visible output."""
+    """Handle model-level errors. Auto-retries rate limits after a backoff."""
     error_type = type(error).__name__
     error_msg = str(error)
     logger.error("Model error in %s: [%s] %s", "agent", error_type, error_msg)
+
+    callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = True
 
     is_rate_limit = any(
         hint in error_msg.lower()
         for hint in ("429", "resource exhausted", "rate limit", "quota")
     )
     if is_rate_limit:
+        logger.info(
+            "Rate limit detected — waiting %ds before auto-retry",
+            RATE_LIMIT_BACKOFF_SECONDS,
+        )
+        time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
         user_msg = (
-            "## Execution Paused — Rate Limit\n\n"
-            "The model API returned a rate-limit error. "
-            "Please wait a moment and send `continue` to resume."
+            f"_Rate limit hit — waited {RATE_LIMIT_BACKOFF_SECONDS}s, retrying…_"
         )
     else:
         user_msg = (
@@ -2103,11 +2155,20 @@ def _on_tool_error(
     tool_name = getattr(tool, "name", "unknown_tool")
     logger.error("Tool error in %s: [%s] %s", tool_name, error_type, error_msg)
 
+    fallback_hints = {
+        "search_openalex_works": "Try search_pubmed or search_pubmed_advanced instead.",
+        "search_pubmed": "Try search_openalex_works or search_pubmed_advanced instead.",
+        "search_pubmed_advanced": "Try search_pubmed or search_openalex_works instead.",
+        "search_clinical_trials": "Try summarize_clinical_trials_landscape or run_bigquery_select_query instead.",
+        "list_bigquery_tables": "Try run_bigquery_select_query with SELECT * FROM <dataset>.<table> LIMIT 1 to inspect schema instead.",
+    }
+    suggestion = fallback_hints.get(tool_name, "Try an alternative tool or query.")
+
     return {
         "error": True,
         "error_type": error_type,
         "message": f"Tool '{tool_name}' failed: {error_msg[:500]}",
-        "suggestion": "Try an alternative tool or skip this step.",
+        "suggestion": suggestion,
     }
 
 
@@ -2218,6 +2279,12 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
 
 def _react_after_model_callback(*, callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
     """ReAct step executor: parse single-step result, store trace, advance."""
+    if bool(callback_context.state.get(STATE_MODEL_ERROR_PASSTHROUGH, False)):
+        callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = False
+        callback_context.state[STATE_EXECUTOR_BUFFER] = ""
+        logger.info("[react:after] model error passthrough — skipping JSON parse")
+        return None
+
     if _llm_response_has_function_call(llm_response):
         logger.debug("[react:after] response has function_call — continuing tool loop")
         callback_context.state[STATE_EXECUTOR_BUFFER] = ""
@@ -2287,8 +2354,8 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
                 step["status"] = "completed"
                 step["result_summary"] = last_prose[:1500]
                 step["reasoning_trace"] = (
-                    f"Step completed via prose fallback after {MAX_REACT_PARSE_RETRIES + 1} "
-                    f"JSON formatting attempts. {error_label}: {error_msg}"
+                    f"Partial result (JSON formatting failed after {MAX_REACT_PARSE_RETRIES + 1} "
+                    f"attempts). {error_label}: {error_msg}"
                 )
                 next_id = _next_pending_step_id(task_state)
                 task_state["current_step_id"] = next_id
@@ -2298,7 +2365,7 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
                 if new_plan_status == "completed":
                     callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
                 rendered = (
-                    f"### {active_step_id} · completed _(via prose fallback)_\n\n"
+                    f"### {active_step_id} · `partial` _(output recovered from prose)_\n\n"
                     f"{last_prose[:800]}{'…' if len(last_prose) > 800 else ''}\n\n---"
                 )
                 _append_executor_rendered(callback_context, rendered)
@@ -2407,6 +2474,12 @@ def _synth_before_model_callback(*, callback_context: CallbackContext, llm_reque
 
 
 def _synth_after_model_callback(*, callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
+    if bool(callback_context.state.get(STATE_MODEL_ERROR_PASSTHROUGH, False)):
+        callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = False
+        callback_context.state[STATE_SYNTH_BUFFER] = ""
+        logger.info("[synth:after] model error passthrough — skipping synthesis")
+        return None
+
     if _llm_response_has_function_call(llm_response):
         return None
 
@@ -2442,9 +2515,10 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
     Key tables and their primary columns:
     - **target**: id (Ensembl gene ID, e.g. "ENSG00000012048"), approvedSymbol ("BRCA1"),
       approvedName, biotype, tractability, safetyLiabilities, pathways, proteinIds
-    - **disease**: id (EFO/MONDO ID, e.g. "EFO_0001075"), name ("ovarian carcinoma"),
-      therapeuticAreas, synonyms, ontology
-    - **evidence**: targetId (Ensembl ID), diseaseId (EFO ID), datasourceId, datatypeId,
+    - **disease**: id (MONDO or EFO ID — many common diseases use MONDO_* as primary ID,
+      e.g. "MONDO_0004975" for Alzheimer's, "EFO_0001075" for ovarian carcinoma),
+      name, therapeuticAreas, synonyms, ontology. Always query by name first, accept whatever ID is returned.
+    - **evidence**: targetId (Ensembl ID), diseaseId (MONDO or EFO ID), datasourceId, datatypeId,
       score, literature, drugId. Filter by targetId + diseaseId, NOT gene symbols.
     - **known_drug**, **drug_molecule**, **drug_mechanism_of_action**, **drug_warning**: drug data
     - **evidence_*** (evidence_gwas_credible_sets, evidence_chembl, evidence_clingen, etc.): typed evidence
@@ -2494,58 +2568,58 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
     nucleic acid reagents, readouts, and perturbation signatures. Use for drug repurposing hypotheses
     and mechanism-of-action characterization.
 
-  === Literature & preprints ===
-  **bigquery-public-data.pmc_open_access_commercial** — PubMed Central full-text articles with vector
-    embeddings. Tables: articles (pmid, pmc_id, title, author, article_text, pmc_link,
-    ml_generate_embedding_result), pmc_metadata. Use SEARCH() for keyword search, VECTOR_SEARCH()
-    for semantic similarity. Provides complete article text, not just abstracts.
-  **bigquery-public-data.breathe** — Full-text bioRxiv preprints, arxiv papers, and BioASQ QA data.
-    Tables: biorxiv, arxiv, bioasq. Complements PMC for preprint literature.
-
   === Hackathon project data ===
   **hackathon_data** (project dataset) — Contains:
     - civic_* tables: Cancer variant clinical interpretations (assertions, evidence, variants, molecular profiles)
     - clingen_* tables: Gene-disease validity, variant pathogenicity, dosage sensitivity, actionability
 
-  **How to query**: You can use short dataset names — they are auto-expanded to the full project path.
-  For example, `open_targets_platform.target` is automatically resolved to
-  `bigquery-public-data.open_targets_platform.target`. Both forms work in SQL and list_bigquery_tables.
+  **How to query**: Always wrap table names in backticks in SQL. Short names are auto-expanded:
+  `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`.
+  Example: SELECT id, approvedSymbol FROM `open_targets_platform.target` WHERE approvedSymbol = 'BRCA1'.
 
   Start every structured data lookup with BigQuery. Use `list_bigquery_tables` to discover table schemas.
-  Write Standard SQL via `run_bigquery_select_query`. Fall back to non-BigQuery MCP tools only for:
-    - ClinicalTrials.gov (search_clinical_trials, get_clinical_trial, etc.)
-    - OpenAlex researcher discovery (search_openalex_works, search_openalex_authors, etc.)
-    - UniProt protein profiles (detailed isoforms, PTMs beyond AlphaFold metadata)
-    - Reactome pathway hierarchies (search_reactome_pathways)
-    - STRING protein-protein interactions (get_string_interactions)
-  Do NOT use external APIs for: gene info (use open_targets_platform.target), disease ontology
-    (use open_targets_platform.disease), drug labels and adverse events (use fda_drug via BigQuery),
-    literature search (use pmc_open_access_commercial or breathe), preprints (use breathe.biorxiv/medrxiv),
-    variant annotations (use gnomAD, human_variant_annotation, human_genome_variants)."""
+  Write Standard SQL via `run_bigquery_select_query`. Use non-BigQuery MCP tools for:
+    - Literature search: search_pubmed, search_pubmed_advanced, get_pubmed_abstract (PubMed/NCBI)
+    - Literature search: search_openalex_works (OpenAlex — broader coverage, preprints)
+    - Clinical trials: search_clinical_trials, get_clinical_trial, summarize_clinical_trials_landscape
+    - Researcher discovery: search_openalex_authors, rank_researchers_by_activity
+    - Protein profiles: search_uniprot_proteins, get_uniprot_protein_profile
+    - Pathways: search_reactome_pathways
+    - Protein interactions: get_string_interactions
+"""
 
 
 BQ_EXECUTOR_POLICY = """- BigQuery-first policy: For any structured data lookup, prefer `list_bigquery_tables` \
-and `run_bigquery_select_query` over non-BQ tools. Short dataset names are auto-expanded to the full \
-project path (e.g. `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`). \
+and `run_bigquery_select_query` over non-BQ tools. \
 Available datasets: open_targets_platform (targets, diseases, drugs, evidence), ebi_chembl (bioactivity), \
 gnomAD (variant frequencies), human_genome_variants, human_variant_annotation (Ensembl), \
 deepmind_alphafold (protein structures), immune_epitope_db (IEDB), \
 nlm_rxnorm (drug nomenclature), fda_drug (adverse events, drug labels, NDC, enforcement), \
 umiami_lincs (perturbation signatures), ebi_surechembl (patents), \
-pmc_open_access_commercial (PubMed Central full text), breathe (bioRxiv/arxiv/BioASQ), \
 and project hackathon_data (CIViC, ClinGen).
-CRITICAL: Before writing any SQL query, you MUST first:
+CRITICAL SQL syntax: Always wrap table references in backticks in your SQL queries. \
+Short names are auto-expanded: `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`. \
+Example: SELECT id, approvedSymbol FROM `open_targets_platform.target` WHERE approvedSymbol = 'BRCA1'.
+Before writing queries:
   1. Call `list_bigquery_tables(dataset="<dataset_name>")` to see all available tables.
-  2. Run `SELECT * FROM <dataset>.<table> LIMIT 1` to inspect actual column names.
+  2. Run SELECT * FROM `<dataset>.<table>` LIMIT 1 to inspect actual column names.
   Do NOT guess table or column names — they are often singular (e.g. "target" not "targets") \
   and use IDs rather than human-readable names (e.g. targetId is an Ensembl ID like "ENSG00000012048", \
   diseaseId is an EFO ID like "EFO_0001075"). Look up IDs from reference tables first.
-Fall back to non-BQ tools only for ClinicalTrials.gov, \
-OpenAlex, UniProt, Reactome pathways, and STRING interactions."""
+Fall back to non-BQ tools for: literature search (search_pubmed, search_openalex_works), \
+ClinicalTrials.gov, UniProt, Reactome pathways, and STRING interactions."""
+
+
+def _format_tool_catalog(tool_hints: list[str]) -> str:
+    lines = []
+    for name in tool_hints[:80]:
+        desc = TOOL_DESCRIPTIONS.get(name)
+        lines.append(f"- {name} — {desc}" if desc else f"- {name}")
+    return "\n".join(lines) or "- No tools available."
 
 
 def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
-    tool_catalog = "\n".join(f"- {name}" for name in tool_hints[:80]) or "- No tools available."
+    tool_catalog = _format_tool_catalog(tool_hints)
     if prefer_bigquery:
         bq_policy = BQ_EXECUTOR_POLICY
     else:
@@ -2559,13 +2633,13 @@ def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: 
 
 
 def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
-    tool_catalog = "\n".join(f"- {name}" for name in tool_hints[:80]) or "- No tools available."
+    tool_catalog = _format_tool_catalog(tool_hints)
     if prefer_bigquery:
         bq_policy = (
             "- BigQuery-first policy:\n"
             f"{BQ_DATASET_CATALOG}"
             "\n- tool_hint for BigQuery steps: use the specific dataset name (e.g. open_targets_platform,"
-            " pmc_open_access_commercial, gnomad, ebi_chembl, deepmind_alphafold, hackathon_data)"
+            " gnomad, ebi_chembl, deepmind_alphafold, hackathon_data)"
             " rather than run_bigquery_select_query, so the plan clearly shows which source is being accessed."
         )
     else:
@@ -2587,6 +2661,7 @@ def create_mcp_toolset(tool_filter: list[str] | None = None) -> McpToolset | Non
         command="node",
         args=["server.js"],
         cwd=str(MCP_SERVER_DIR),
+        env=dict(os.environ),
     )
     connection_params = StdioConnectionParams(
         server_params=server_params,

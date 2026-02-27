@@ -714,6 +714,16 @@ body.expanded .messages {
   color: #cfcfcf;
 }
 
+.markdown-body blockquote p {
+  margin: 0.15em 0;
+}
+
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid #2f3237;
+  margin: 0.6em 0;
+}
+
 .markdown-body code {
   background: #1e1e1e;
   border: 1px solid #2b2b2b;
@@ -794,6 +804,16 @@ body.expanded .messages {
   padding: 0.18em 0 0.18em 0.95em;
 }
 
+.report-content.markdown-body blockquote p {
+  margin: 0.25em 0;
+}
+
+.report-content.markdown-body hr {
+  border: none;
+  border-top: 1px solid #2f3237;
+  margin: 1.3em 0;
+}
+
 .report-content.markdown-body pre {
   margin: 0.95em 0;
   padding: 0.85em 0.95em;
@@ -824,6 +844,37 @@ body.expanded .messages {
 body.expanded .composer {
   border: 1px solid var(--line);
   border-radius: 14px;
+  background: #141414;
+}
+
+.example-queries {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  animation: rise 320ms ease both;
+}
+
+body.expanded .example-queries {
+  display: none;
+}
+
+.example-query {
+  border: 1px solid #2a2a2a;
+  border-radius: 10px;
+  padding: 8px 13px;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: #6b6b6b;
+  background: #0e0e0e;
+  cursor: pointer;
+  transition: border-color 150ms ease, color 150ms ease, background 150ms ease;
+  max-width: 100%;
+}
+
+.example-query:hover {
+  border-color: #3a3a3a;
+  color: #a0a0a0;
   background: #141414;
 }
 

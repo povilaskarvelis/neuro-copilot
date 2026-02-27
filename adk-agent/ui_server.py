@@ -7,6 +7,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -14,6 +15,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import threading
 import traceback
 import uuid
 
@@ -446,10 +448,11 @@ class UiRuntime:
         self.user_id = "researcher"
         self.session_service: InMemorySessionService | None = None
         self.conv_sessions: dict[str, ConversationSession] = {}
-        self.execution_lock = asyncio.Lock()
+        self.conv_thread_locks: dict[str, threading.Lock] = {}
         self.runs_lock = asyncio.Lock()
         self.runs: dict[str, RunRecord] = {}
         self.background_tasks: set[asyncio.Task] = set()
+        self._thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wf")
 
     async def startup(self) -> None:
         is_valid, error_message = validate_runtime_configuration()
@@ -466,12 +469,18 @@ class UiRuntime:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        self._thread_pool.shutdown(wait=False)
         for cs in self.conv_sessions.values():
             if cs.mcp_tools is not None:
                 try:
                     await cs.mcp_tools.close()
                 except Exception:
                     pass
+
+    def _get_conv_thread_lock(self, conversation_id: str) -> threading.Lock:
+        if conversation_id not in self.conv_thread_locks:
+            self.conv_thread_locks[conversation_id] = threading.Lock()
+        return self.conv_thread_locks[conversation_id]
 
     async def _get_or_create_session(self, conversation_id: str) -> ConversationSession:
         if conversation_id in self.conv_sessions:
@@ -529,12 +538,46 @@ class UiRuntime:
         *,
         run_id: str,
     ) -> str:
+        """Run a workflow turn in a dedicated thread so it can't block other conversations."""
         cs = await self._get_or_create_session(conversation_id)
+        main_loop = asyncio.get_running_loop()
+        thread_lock = self._get_conv_thread_lock(conversation_id)
+
+        def _thread_target() -> str:
+            thread_lock.acquire()
+            try:
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(
+                        self._workflow_turn_inner(cs, conversation_id, prompt, run_id=run_id, caller_loop=main_loop)
+                    )
+                finally:
+                    loop.close()
+            finally:
+                thread_lock.release()
+
+        return await main_loop.run_in_executor(self._thread_pool, _thread_target)
+
+    async def _workflow_turn_inner(
+        self,
+        cs: ConversationSession,
+        conversation_id: str,
+        prompt: str,
+        *,
+        run_id: str,
+        caller_loop: asyncio.AbstractEventLoop,
+    ) -> str:
+        """The actual event-processing loop — runs inside its own thread event loop."""
         current_message = Content(role="user", parts=[Part(text=prompt)])
         partial_by_author: dict[str, str] = {}
         final_by_author: dict[str, str] = {}
         fallback_chunks: list[str] = []
         step_counter = 0
+
+        def _fire_progress(**kwargs) -> None:
+            asyncio.run_coroutine_threadsafe(
+                self._append_progress_event(run_id, **kwargs), caller_loop
+            )
 
         async for event in cs.runner.run_async(
             session_id=cs.session_id,
@@ -572,8 +615,7 @@ class UiRuntime:
                 react_phases = step_info.get("react_phases", {})
 
                 headline = f"{step_id} · {goal}" if goal else f"{step_id} complete"
-                await self._append_progress_event(
-                    run_id,
+                _fire_progress(
                     phase="execute",
                     event_type="step.completed",
                     status="done",
@@ -594,8 +636,7 @@ class UiRuntime:
                 )
 
             elif author == "planner" and not bool(getattr(event, "partial", False)):
-                await self._append_progress_event(
-                    run_id,
+                _fire_progress(
                     phase="plan",
                     event_type="plan.generated",
                     status="done",
@@ -603,8 +644,7 @@ class UiRuntime:
                 )
 
             elif author == "report_synthesizer" and not bool(getattr(event, "partial", False)):
-                await self._append_progress_event(
-                    run_id,
+                _fire_progress(
                     phase="synthesize",
                     event_type="synthesis.completed",
                     status="done",
@@ -623,10 +663,12 @@ class UiRuntime:
                 continue
             partial_by_author[author] = f"{partial_by_author.get(author, '')}{text}"
 
-        # After the turn, build a structured progress summary from workflow state
         wf_state = await self._read_workflow_state(conversation_id)
         if wf_state and step_counter > 0:
-            await self._emit_step_summary(run_id, wf_state, step_counter)
+            fut = asyncio.run_coroutine_threadsafe(
+                self._emit_step_summary(run_id, wf_state, step_counter), caller_loop
+            )
+            fut.result(timeout=10)
 
         for preferred_author in ("report_synthesizer", "co_scientist_workflow"):
             candidate = final_by_author.get(preferred_author, "").strip()
@@ -826,116 +868,123 @@ class UiRuntime:
             return
 
         try:
-            async with self.execution_lock:
-                task_id = f"task_{uuid.uuid4().hex[:10]}"
-                conv_id = conversation_id or f"conv_{task_id}"
-                title = _generate_chat_title(query)
-                parent = parent_task_id.strip() if parent_task_id else None
-                branch_label = f"Branched from report {parent}" if parent else ""
+            task_id = f"task_{uuid.uuid4().hex[:10]}"
+            conv_id = conversation_id or f"conv_{task_id}"
+            await self._get_or_create_session(conv_id)
 
-                task = _make_task(
-                    task_id,
-                    query,
-                    conv_id,
-                    title=title,
-                    user_query=query,
-                    parent_task_id=parent,
+            title = _generate_chat_title(query)
+            parent = parent_task_id.strip() if parent_task_id else None
+            branch_label = f"Branched from report {parent}" if parent else ""
+
+            task = _make_task(
+                task_id,
+                query,
+                conv_id,
+                title=title,
+                user_query=query,
+                parent_task_id=parent,
+            )
+            task["branch_label"] = branch_label
+            await self._save_task_with_progress(task, run_id)
+            await self._update_run(run_id, task_id=task_id, title=title)
+
+            await self._append_progress_event(
+                run_id,
+                phase="intake",
+                event_type="run.started",
+                status="start",
+                human_line=f"Started: {title}",
+                task_id=task_id,
+            )
+            await self._append_progress_event(
+                run_id,
+                phase="plan",
+                event_type="plan.initializing",
+                status="progress",
+                human_line="Building research plan...",
+                task_id=task_id,
+            )
+
+            max_plan_attempts = 2
+            for plan_attempt in range(1, max_plan_attempts + 1):
+                response_text = await self._run_workflow_turn(
+                    conv_id, query, run_id=run_id,
                 )
-                task["branch_label"] = branch_label
-                await self._update_run(run_id, task_id=task_id, title=title)
 
-                await self._append_progress_event(
-                    run_id,
-                    phase="intake",
-                    event_type="run.started",
-                    status="start",
-                    human_line=f"Started: {title}",
-                    task_id=task_id,
+                wf_state = await self._read_workflow_state(conv_id)
+                plan_pending = await self._is_plan_pending_approval(conv_id)
+                task["steps"] = _steps_from_workflow_state(wf_state)
+                task["current_step_index"] = 0
+
+                restated = (wf_state or {}).get("objective", "").strip()
+                if restated:
+                    task["objective"] = restated
+                    task["title"] = _generate_chat_title(restated)
+
+                planner_failed = not wf_state and not plan_pending
+                if planner_failed and plan_attempt < max_plan_attempts:
+                    logger.warning(
+                        "[new_task] Planner failed (attempt %d/%d), retrying...",
+                        plan_attempt, max_plan_attempts,
+                    )
+                    await self._append_progress_event(
+                        run_id,
+                        phase="plan",
+                        event_type="plan.retry",
+                        status="progress",
+                        human_line=f"Plan generation failed (attempt {plan_attempt}), retrying...",
+                        task_id=task_id,
+                    )
+                    continue
+                break
+
+            if planner_failed:
+                task["status"] = "failed"
+                task["report_markdown"] = response_text
+                await self._save_task_with_progress(task, run_id)
+                await self._update_run(
+                    run_id, status="failed", task_id=task_id,
+                    error="Planner failed to generate a valid research plan.",
                 )
                 await self._append_progress_event(
                     run_id,
                     phase="plan",
-                    event_type="plan.initializing",
-                    status="progress",
-                    human_line="Building research plan...",
+                    event_type="plan.failed",
+                    status="error",
+                    human_line="Failed to generate research plan. Please try again.",
                     task_id=task_id,
                 )
-
-                max_plan_attempts = 2
-                for plan_attempt in range(1, max_plan_attempts + 1):
-                    response_text = await self._run_workflow_turn(
-                        conv_id, query, run_id=run_id,
-                    )
-
-                    wf_state = await self._read_workflow_state(conv_id)
-                    plan_pending = await self._is_plan_pending_approval(conv_id)
-                    task["steps"] = _steps_from_workflow_state(wf_state)
-                    task["current_step_index"] = 0
-
-                    planner_failed = not wf_state and not plan_pending
-                    if planner_failed and plan_attempt < max_plan_attempts:
-                        logger.warning(
-                            "[new_task] Planner failed (attempt %d/%d), retrying...",
-                            plan_attempt, max_plan_attempts,
-                        )
-                        await self._append_progress_event(
-                            run_id,
-                            phase="plan",
-                            event_type="plan.retry",
-                            status="progress",
-                            human_line=f"Plan generation failed (attempt {plan_attempt}), retrying...",
-                            task_id=task_id,
-                        )
-                        continue
-                    break
-
-                if planner_failed:
-                    task["status"] = "failed"
-                    task["report_markdown"] = response_text
-                    await self._save_task_with_progress(task, run_id)
-                    await self._update_run(
-                        run_id, status="failed", task_id=task_id,
-                        error="Planner failed to generate a valid research plan.",
-                    )
-                    await self._append_progress_event(
-                        run_id,
-                        phase="plan",
-                        event_type="plan.failed",
-                        status="error",
-                        human_line="Failed to generate research plan. Please try again.",
-                        task_id=task_id,
-                    )
-                elif plan_pending:
-                    task["awaiting_hitl"] = True
-                    task["status"] = "in_progress"
-                    await self._append_progress_event(
-                        run_id,
-                        phase="plan",
-                        event_type="task.created",
-                        status="done",
-                        human_line=f"Plan ready with {len(task['steps'])} steps. Waiting for approval.",
-                        task_id=task_id,
-                        metrics={"steps_total": len(task["steps"])},
-                    )
-                    await self._save_task_with_progress(task, run_id)
-                    await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
-                else:
-                    task["status"] = "completed"
-                    task["follow_up_suggestions"] = _extract_next_steps(response_text)
-                    task["report_markdown"] = _strip_next_steps_section(response_text)
-                    await self._save_task_with_progress(task, run_id)
-                    await self._update_run(
-                        run_id, status="completed", task_id=task_id,
-                        final_report=task["report_markdown"],
-                    )
-                    await self._append_progress_event(
-                        run_id,
-                        phase="finalize",
-                        event_type="run.completed",
-                        status="done",
-                        human_line="Research complete.",
-                        task_id=task_id,
-                    )
+            elif plan_pending:
+                task["awaiting_hitl"] = True
+                task["status"] = "in_progress"
+                await self._append_progress_event(
+                    run_id,
+                    phase="plan",
+                    event_type="task.created",
+                    status="done",
+                    human_line=f"Plan ready with {len(task['steps'])} steps. Waiting for approval.",
+                    task_id=task_id,
+                    metrics={"steps_total": len(task["steps"])},
+                )
+                await self._save_task_with_progress(task, run_id)
+                await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
+            else:
+                task["status"] = "completed"
+                task["follow_up_suggestions"] = _extract_next_steps(response_text)
+                task["report_markdown"] = _strip_next_steps_section(response_text)
+                await self._save_task_with_progress(task, run_id)
+                await self._update_run(
+                    run_id, status="completed", task_id=task_id,
+                    final_report=task["report_markdown"],
+                )
+                await self._append_progress_event(
+                    run_id,
+                    phase="finalize",
+                    event_type="run.completed",
+                    status="done",
+                    human_line="Research complete.",
+                    task_id=task_id,
+                )
 
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -956,122 +1005,121 @@ class UiRuntime:
             return
 
         try:
-            async with self.execution_lock:
-                task = self.store.get_task(task_id)
-                if not task:
-                    await self._update_run(run_id, status="failed", error=f"Task {task_id} not found.")
-                    return
-                if not task.get("awaiting_hitl"):
-                    await self._update_run(run_id, status="failed", error="Task is not at checkpoint.")
-                    return
+            task = self.store.get_task(task_id)
+            if not task:
+                await self._update_run(run_id, status="failed", error=f"Task {task_id} not found.")
+                return
+            if not task.get("awaiting_hitl"):
+                await self._update_run(run_id, status="failed", error="Task is not at checkpoint.")
+                return
 
-                conv_id = task["conversation_id"]
-                await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
-                task["hitl_history"].append("continue")
-                task["awaiting_hitl"] = False
+            conv_id = task["conversation_id"]
+            await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
+            task["hitl_history"].append("continue")
+            task["awaiting_hitl"] = False
+            await self._save_task_with_progress(task, run_id)
+
+            await self._append_progress_event(
+                run_id,
+                phase="execute",
+                event_type="execution.running",
+                status="start",
+                human_line="Executing plan...",
+                task_id=task_id,
+            )
+
+            response_text = await self._run_workflow_turn(
+                conv_id, "approve", run_id=run_id,
+            )
+
+            wf_state = await self._read_workflow_state(conv_id)
+            plan_pending = await self._is_plan_pending_approval(conv_id)
+
+            task["steps"] = _steps_from_workflow_state(wf_state)
+            completed_steps = sum(
+                1 for s in task["steps"] if s.get("status") == "completed"
+            )
+            task["current_step_index"] = completed_steps
+
+            plan_status = wf_state.get("plan_status", "") if wf_state else ""
+            has_synthesis = bool(
+                wf_state
+                and wf_state.get("latest_synthesis", {})
+                and wf_state["latest_synthesis"].get("markdown", "").strip()
+            )
+
+            if plan_status == "completed" and has_synthesis:
+                task["status"] = "completed"
+                final_md = wf_state["latest_synthesis"]["markdown"]
+                task["follow_up_suggestions"] = _extract_next_steps(final_md)
+                stripped_md = _strip_next_steps_section(final_md)
+                task["report_markdown"] = stripped_md
                 await self._save_task_with_progress(task, run_id)
 
+                self._write_report(task_id, stripped_md)
+
+                await self._update_run(
+                    run_id, status="completed", task_id=task_id,
+                    final_report=stripped_md,
+                    follow_up_suggestions=task["follow_up_suggestions"],
+                )
                 await self._append_progress_event(
                     run_id,
-                    phase="execute",
-                    event_type="execution.running",
-                    status="start",
-                    human_line="Executing plan...",
+                    phase="finalize",
+                    event_type="run.completed",
+                    status="done",
+                    human_line="Report completed.",
                     task_id=task_id,
                 )
 
-                response_text = await self._run_workflow_turn(
-                    conv_id, "approve", run_id=run_id,
+            elif plan_pending:
+                task["awaiting_hitl"] = True
+                task["status"] = "in_progress"
+                await self._save_task_with_progress(task, run_id)
+                await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
+                await self._append_progress_event(
+                    run_id,
+                    phase="checkpoint",
+                    event_type="checkpoint.opened",
+                    status="done",
+                    human_line="Revised plan ready. Waiting for approval.",
+                    task_id=task_id,
                 )
 
-                wf_state = await self._read_workflow_state(conv_id)
-                plan_pending = await self._is_plan_pending_approval(conv_id)
-
-                task["steps"] = _steps_from_workflow_state(wf_state)
-                completed_steps = sum(
-                    1 for s in task["steps"] if s.get("status") == "completed"
-                )
-                task["current_step_index"] = completed_steps
-
-                plan_status = wf_state.get("plan_status", "") if wf_state else ""
-                has_synthesis = bool(
-                    wf_state
-                    and wf_state.get("latest_synthesis", {})
-                    and wf_state["latest_synthesis"].get("markdown", "").strip()
+            elif plan_status != "completed":
+                task["awaiting_hitl"] = True
+                task["status"] = "in_progress"
+                await self._save_task_with_progress(task, run_id)
+                await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
+                await self._append_progress_event(
+                    run_id,
+                    phase="execute",
+                    event_type="execution.paused",
+                    status="done",
+                    human_line=f"Completed {completed_steps}/{len(task['steps'])} steps. Send continue to resume.",
+                    task_id=task_id,
                 )
 
-                if plan_status == "completed" and has_synthesis:
-                    task["status"] = "completed"
-                    final_md = wf_state["latest_synthesis"]["markdown"]
-                    task["follow_up_suggestions"] = _extract_next_steps(final_md)
-                    stripped_md = _strip_next_steps_section(final_md)
-                    task["report_markdown"] = stripped_md
-                    await self._save_task_with_progress(task, run_id)
-
-                    report_path = self._write_report(task_id, stripped_md)
-
-                    await self._update_run(
-                        run_id, status="completed", task_id=task_id,
-                        final_report=stripped_md,
-                        follow_up_suggestions=task["follow_up_suggestions"],
-                    )
-                    await self._append_progress_event(
-                        run_id,
-                        phase="finalize",
-                        event_type="run.completed",
-                        status="done",
-                        human_line="Report completed.",
-                        task_id=task_id,
-                    )
-
-                elif plan_pending:
-                    task["awaiting_hitl"] = True
-                    task["status"] = "in_progress"
-                    await self._save_task_with_progress(task, run_id)
-                    await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
-                    await self._append_progress_event(
-                        run_id,
-                        phase="checkpoint",
-                        event_type="checkpoint.opened",
-                        status="done",
-                        human_line="Revised plan ready. Waiting for approval.",
-                        task_id=task_id,
-                    )
-
-                elif plan_status != "completed":
-                    task["awaiting_hitl"] = True
-                    task["status"] = "in_progress"
-                    await self._save_task_with_progress(task, run_id)
-                    await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
-                    await self._append_progress_event(
-                        run_id,
-                        phase="execute",
-                        event_type="execution.paused",
-                        status="done",
-                        human_line=f"Completed {completed_steps}/{len(task['steps'])} steps. Send continue to resume.",
-                        task_id=task_id,
-                    )
-
-                else:
-                    task["status"] = "completed"
-                    task["follow_up_suggestions"] = _extract_next_steps(response_text)
-                    stripped_md = _strip_next_steps_section(response_text)
-                    task["report_markdown"] = stripped_md
-                    await self._save_task_with_progress(task, run_id)
-                    self._write_report(task_id, stripped_md)
-                    await self._update_run(
-                        run_id, status="completed", task_id=task_id,
-                        final_report=stripped_md,
-                        follow_up_suggestions=task["follow_up_suggestions"],
-                    )
-                    await self._append_progress_event(
-                        run_id,
-                        phase="finalize",
-                        event_type="run.completed",
-                        status="done",
-                        human_line="Report completed.",
-                        task_id=task_id,
-                    )
+            else:
+                task["status"] = "completed"
+                task["follow_up_suggestions"] = _extract_next_steps(response_text)
+                stripped_md = _strip_next_steps_section(response_text)
+                task["report_markdown"] = stripped_md
+                await self._save_task_with_progress(task, run_id)
+                self._write_report(task_id, stripped_md)
+                await self._update_run(
+                    run_id, status="completed", task_id=task_id,
+                    final_report=stripped_md,
+                    follow_up_suggestions=task["follow_up_suggestions"],
+                )
+                await self._append_progress_event(
+                    run_id,
+                    phase="finalize",
+                    event_type="run.completed",
+                    status="done",
+                    human_line="Report completed.",
+                    task_id=task_id,
+                )
 
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -1093,58 +1141,64 @@ class UiRuntime:
             return
 
         try:
-            async with self.execution_lock:
-                task = self.store.get_task(task_id)
-                if not task:
-                    await self._update_run(run_id, status="failed", error=f"Task {task_id} not found.")
-                    return
+            task = self.store.get_task(task_id)
+            if not task:
+                await self._update_run(run_id, status="failed", error=f"Task {task_id} not found.")
+                return
 
-                conv_id = task["conversation_id"]
-                await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
+            conv_id = task["conversation_id"]
+            await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
 
-                prompt = f"revise: {message}"
+            prompt = f"revise: {message}"
+            await self._append_progress_event(
+                run_id,
+                phase="plan",
+                event_type="feedback.applying",
+                status="start",
+                human_line="Applying feedback...",
+                task_id=task_id,
+            )
+
+            response_text = await self._run_workflow_turn(
+                conv_id, prompt, run_id=run_id,
+            )
+
+            wf_state = await self._read_workflow_state(conv_id)
+            plan_pending = await self._is_plan_pending_approval(conv_id)
+
+            task["steps"] = _steps_from_workflow_state(wf_state)
+            task["hitl_history"].append(f"revise:{message}")
+            task["awaiting_hitl"] = plan_pending
+            task["status"] = "in_progress"
+
+            restated = (wf_state or {}).get("objective", "").strip()
+            if restated:
+                task["objective"] = restated
+                task["title"] = _generate_chat_title(restated)
+                await self._update_run(run_id, title=task["title"])
+
+            await self._save_task_with_progress(task, run_id)
+
+            if plan_pending:
+                await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
+                await self._append_progress_event(
+                    run_id,
+                    phase="checkpoint",
+                    event_type="feedback.applied",
+                    status="done",
+                    human_line="Revised plan ready. Waiting for approval.",
+                    task_id=task_id,
+                )
+            else:
+                await self._update_run(run_id, status="completed", task_id=task_id)
                 await self._append_progress_event(
                     run_id,
                     phase="plan",
-                    event_type="feedback.applying",
-                    status="start",
-                    human_line="Applying feedback...",
+                    event_type="feedback.applied",
+                    status="done",
+                    human_line="Feedback applied.",
                     task_id=task_id,
                 )
-
-                response_text = await self._run_workflow_turn(
-                    conv_id, prompt, run_id=run_id,
-                )
-
-                wf_state = await self._read_workflow_state(conv_id)
-                plan_pending = await self._is_plan_pending_approval(conv_id)
-
-                task["steps"] = _steps_from_workflow_state(wf_state)
-                task["hitl_history"].append(f"revise:{message}")
-                task["awaiting_hitl"] = plan_pending
-                task["status"] = "in_progress"
-                await self._save_task_with_progress(task, run_id)
-
-                if plan_pending:
-                    await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
-                    await self._append_progress_event(
-                        run_id,
-                        phase="checkpoint",
-                        event_type="feedback.applied",
-                        status="done",
-                        human_line="Revised plan ready. Waiting for approval.",
-                        task_id=task_id,
-                    )
-                else:
-                    await self._update_run(run_id, status="completed", task_id=task_id)
-                    await self._append_progress_event(
-                        run_id,
-                        phase="plan",
-                        event_type="feedback.applied",
-                        status="done",
-                        human_line="Feedback applied.",
-                        task_id=task_id,
-                    )
 
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -1174,14 +1228,32 @@ class UiRuntime:
 
     # -- Read APIs (conversations, tasks, runs) --------------------------------
 
+    async def _overlay_live_progress(self, task: dict) -> dict:
+        """Merge live progress from an active run into the task dict."""
+        task_id = task.get("task_id", "")
+        if not task_id:
+            return task
+        async with self.runs_lock:
+            for run in self.runs.values():
+                if run.task_id == task_id and run.status in ("running", "queued", "awaiting_hitl"):
+                    task = dict(task)
+                    if run.progress_events:
+                        task["progress_events"] = list(run.progress_events)
+                    if run.progress_summaries:
+                        task["progress_summaries"] = list(run.progress_summaries)
+                    break
+        return task
+
     def list_conversations(self) -> list[dict]:
         return self.store.list_conversations()
 
-    def get_conversation_detail(self, conversation_id: str) -> dict | None:
+    async def get_conversation_detail(self, conversation_id: str) -> dict | None:
         tasks = self.store.get_conversation_tasks(conversation_id)
         if not tasks:
             return None
         tasks.sort(key=lambda t: (t.get("created_at", ""), t.get("task_id", "")))
+
+        tasks = [await self._overlay_live_progress(t) for t in tasks]
 
         iterations = []
         for idx, task in enumerate(tasks, start=1):
@@ -1210,10 +1282,11 @@ class UiRuntime:
             "iterations": iterations,
         }
 
-    def get_task_detail(self, task_id: str) -> dict | None:
+    async def get_task_detail(self, task_id: str) -> dict | None:
         task = self.store.get_task(task_id)
         if not task:
             return None
+        task = await self._overlay_live_progress(task)
         return {
             "task": _task_detail(task),
             "active_plan_version": {
@@ -1320,7 +1393,7 @@ async def index() -> FileResponse:
 async def health() -> dict:
     return {
         "ok": runtime.ready,
-        "busy": runtime.execution_lock.locked(),
+        "busy": any(lock.locked() for lock in runtime.conv_thread_locks.values()),
         "error": runtime.ready_error,
     }
 
@@ -1343,7 +1416,7 @@ async def list_conversations() -> dict:
 
 @app.get("/api/conversations/{conversation_id}")
 async def conversation_detail(conversation_id: str) -> dict:
-    detail = runtime.get_conversation_detail(conversation_id)
+    detail = await runtime.get_conversation_detail(conversation_id)
     if not detail:
         raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
     return detail
@@ -1351,7 +1424,7 @@ async def conversation_detail(conversation_id: str) -> dict:
 
 @app.get("/api/tasks/{task_id}")
 async def task_detail(task_id: str) -> dict:
-    detail = runtime.get_task_detail(task_id)
+    detail = await runtime.get_task_detail(task_id)
     if not detail:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
     return detail
