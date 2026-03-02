@@ -39,7 +39,11 @@ const EBRAINS_KG_SEARCH_API = "https://search.kg.ebrains.eu/api";
 const HF_DATASETS_SERVER_API = "https://datasets-server.huggingface.co";
 const GITHUB_API = "https://api.github.com";
 const CONP_GITHUB_ORG = "conpdatasets";
+const NEMAR_GITHUB_ORG = "nemarDatasets";
+const BRAINCODE_CONP_QUERY = "braincode";
 const NEUROBAGEL_API = "https://api.neurobagel.org";
+const OPENNEURO_GRAPHQL = "https://openneuro.org/crn/graphql";
+const DANDI_API = "https://api.dandiarchive.org/api";
 const OPENALEX_WORKS_SELECT = [
   "id",
   "display_name",
@@ -5738,6 +5742,379 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
+// NEMAR (NeuroElectroMagnetic data Archive) dataset tools
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "search_nemar_datasets",
+  {
+    description:
+      "Searches NEMAR (NeuroElectroMagnetic data Archive) for EEG, MEG, and iEEG datasets. " +
+      "NEMAR hosts OpenNeuro neuroelectromagnetic data at SDSC with BIDS format, HED event descriptions, and NSG compute integration. " +
+      "Datasets are GitHub repos in the nemarDatasets organization. Use keywords like 'EEG', 'MEG', 'iEEG', 'resting state', 'visual', 'auditory', or study names. " +
+      "Omit query or use 'EEG' to browse. Use get_nemar_dataset_details with a repo name (e.g. nm000104) for full metadata.",
+    inputSchema: {
+      query: z.string().optional().describe("Search term for repo name/description/topics. Use 'EEG', 'MEG', 'iEEG', 'resting', 'visual', or study keywords. Omit to list recent datasets."),
+      sortBy: z.enum(["updated", "stars", "name"]).optional().describe("Result ordering. Default 'updated'."),
+      maxResults: z.number().optional().describe("Maximum results (default 20, max 50)."),
+    },
+  },
+  async ({ query, sortBy, maxResults }) => {
+    const limit = Math.min(Math.max(1, maxResults || 20), 50);
+    const mode = String(sortBy || "updated").toLowerCase();
+    const q = normalizeWhitespace(query || "");
+    const searchQ = q ? `${q} org:${NEMAR_GITHUB_ORG}` : `org:${NEMAR_GITHUB_ORG}`;
+    const params = new URLSearchParams({
+      q: searchQ,
+      per_page: String(limit),
+      page: "1",
+    });
+    if (mode === "updated" || mode === "stars") {
+      params.set("sort", mode);
+      params.set("order", "desc");
+    }
+
+    const url = `${GITHUB_API}/search/repositories?${params.toString()}`;
+    let data;
+    try {
+      data = await fetchJsonWithRetry(url, {
+        retries: 1,
+        timeoutMs: 12000,
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "research-mcp",
+        },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `NEMAR dataset search failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
+            keyFields: [q ? `Query: ${q}` : "Browse: all", `Organization: ${NEMAR_GITHUB_ORG}`],
+            sources: ["https://nemar.org/", "https://github.com/nemarDatasets"],
+            limitations: ["GitHub API rate limits may apply to unauthenticated requests."],
+          }),
+        }],
+      };
+    }
+
+    const items = Array.isArray(data?.items) ? data.items : [];
+    const total = Number(data?.total_count || 0);
+    if (items.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No NEMAR datasets found${q ? ` for "${q}"` : ""}.`,
+            keyFields: [q ? `Query: ${q}` : "Browse: all", `Organization: ${NEMAR_GITHUB_ORG}`],
+            sources: ["https://nemar.org/discover", "https://github.com/nemarDatasets"],
+            limitations: ["Try 'EEG', 'MEG', or 'iEEG' to find modality-specific datasets."],
+          }),
+        }],
+      };
+    }
+
+    const lines = items.map((repo, idx) => {
+      const name = repo?.name || "unknown";
+      const desc = normalizeWhitespace(repo?.description || "");
+      const descPreview = desc ? (desc.length > 100 ? `${desc.slice(0, 97)}...` : desc) : "No description.";
+      const stars = Number(repo?.stargazers_count || 0);
+      const updatedAt = repo?.updated_at ? String(repo.updated_at).slice(0, 10) : "unknown";
+      return `  ${String(idx + 1).padStart(3)}. ${name} — ${descPreview} | stars: ${stars} | updated: ${updatedAt}`;
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `NEMAR: ${items.length} dataset(s)${q ? ` matching "${q}"` : ""} in ${NEMAR_GITHUB_ORG}.`,
+          keyFields: [
+            q ? `Query: ${q}` : "Browse: all",
+            `Total matches: ${total}`,
+            "\nResults:",
+            ...lines,
+          ],
+          sources: [
+            "https://nemar.org/discover",
+            "https://nemar.org/dataexplorer",
+            "https://github.com/nemarDatasets",
+          ],
+          limitations: [
+            "NEMAR datasets are EEG/MEG/iEEG from OpenNeuro, hosted at SDSC. Use get_nemar_dataset_details with repo name for full metadata.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_nemar_dataset_details",
+  {
+    description:
+      "Fetches detailed metadata for a NEMAR dataset repository (e.g. nm000104). " +
+      "Returns description, stars, topics, README preview, and links. Use after search_nemar_datasets.",
+    inputSchema: {
+      repo: z.string().describe("Repository name from search_nemar_datasets (e.g. 'nm000104'). Can be full path 'nemarDatasets/nm000104'."),
+    },
+  },
+  async ({ repo }) => {
+    const rawRepo = normalizeWhitespace(repo || "");
+    if (!rawRepo) {
+      return { content: [{ type: "text", text: "Provide a NEMAR dataset repo name (e.g. nm000104)." }] };
+    }
+    const repoName = rawRepo.includes("/") ? rawRepo.split("/").pop() : rawRepo;
+    if (!repoName) {
+      return { content: [{ type: "text", text: "Unable to parse repository name." }] };
+    }
+
+    const repoUrl = `${GITHUB_API}/repos/${NEMAR_GITHUB_ORG}/${encodeURIComponent(repoName)}`;
+    let repoData;
+    try {
+      repoData = await fetchJsonWithRetry(repoUrl, {
+        retries: 1,
+        timeoutMs: 12000,
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "research-mcp",
+        },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `NEMAR dataset not found: ${NEMAR_GITHUB_ORG}/${repoName}.`,
+            keyFields: [`Repository: ${NEMAR_GITHUB_ORG}/${repoName}`, `Error: ${compactErrorMessage(error?.message || "unknown error", 220)}`],
+            sources: [`https://github.com/${NEMAR_GITHUB_ORG}/${repoName}`, "https://nemar.org/"],
+            limitations: ["Repository may be private or the name incorrect."],
+          }),
+        }],
+      };
+    }
+
+    let readmePreview = "";
+    try {
+      const readmeUrl = `${GITHUB_API}/repos/${NEMAR_GITHUB_ORG}/${encodeURIComponent(repoName)}/readme`;
+      const readmeResponse = await fetchWithRetry(readmeUrl, {
+        retries: 1,
+        timeoutMs: 10000,
+        headers: { Accept: "application/vnd.github.raw", "User-Agent": "research-mcp" },
+      });
+      const readmeText = await readmeResponse.text();
+      if (readmeText) {
+        const cleaned = normalizeWhitespace(readmeText.replace(/[#*_`>-]/g, " "));
+        readmePreview = cleaned.length > 400 ? `${cleaned.slice(0, 397)}...` : cleaned;
+      }
+    } catch (_) {}
+
+    const topics = Array.isArray(repoData?.topics) ? repoData.topics : [];
+    const keyFields = [
+      `Repository: ${repoData?.full_name || `${NEMAR_GITHUB_ORG}/${repoName}`}`,
+      `Description: ${normalizeWhitespace(repoData?.description || "No description.")}`,
+      `Stars: ${Number(repoData?.stargazers_count || 0)}`,
+      `Updated: ${repoData?.updated_at ? String(repoData.updated_at).slice(0, 10) : "unknown"}`,
+    ];
+    if (topics.length > 0) keyFields.push(`Topics: ${topics.slice(0, 8).join(", ")}`);
+    if (readmePreview) keyFields.push(`\nREADME preview:\n${readmePreview}`);
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `NEMAR dataset: ${repoData?.full_name || `${NEMAR_GITHUB_ORG}/${repoName}`}.`,
+          keyFields,
+          sources: [
+            repoData?.html_url || `https://github.com/${NEMAR_GITHUB_ORG}/${repoName}`,
+            "https://nemar.org/discover",
+            "https://nemar.org/",
+          ],
+          limitations: [
+            "Data download and NSG compute access require the NEMAR website or DataLad. Dataset IDs map to OpenNeuro equivalents.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Brain-CODE (Ontario Brain Institute) dataset tools
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "search_braincode_datasets",
+  {
+    description:
+      "Searches Brain-CODE (Ontario Brain Institute) datasets available through the CONP archive. " +
+      "Brain-CODE hosts clinical, MRI, EEG, genomic and other neuroscience data from Canadian brain disorder research (epilepsy, depression, neurodegenerative disease, cerebral palsy, concussion). " +
+      "Datasets are mirrored in conpdatasets under braincode_* repos. Use keywords like 'mouse', 'fBIRN', 'NDD', 'epilepsy', 'POND', or omit to list all Brain-CODE datasets in CONP. " +
+      "Use get_braincode_dataset_details with a repo name (e.g. braincode_Mouse_Image) for full metadata. Full catalog and controlled releases: braincode.ca.",
+    inputSchema: {
+      query: z.string().optional().describe("Keyword to narrow results (e.g. 'mouse', 'fBIRN', 'NDD'). Omit to list all Brain-CODE datasets in CONP."),
+      maxResults: z.number().optional().describe("Maximum results (default 20, max 50)."),
+    },
+  },
+  async ({ query, maxResults }) => {
+    const limit = Math.min(Math.max(1, maxResults || 20), 50);
+    const extra = normalizeWhitespace(query || "");
+    const q = extra ? `${BRAINCODE_CONP_QUERY} ${extra} org:${CONP_GITHUB_ORG}` : `${BRAINCODE_CONP_QUERY} org:${CONP_GITHUB_ORG}`;
+    const params = new URLSearchParams({ q, per_page: String(limit), page: "1", sort: "updated", order: "desc" });
+
+    const url = `${GITHUB_API}/search/repositories?${params.toString()}`;
+    let data;
+    try {
+      data = await fetchJsonWithRetry(url, {
+        retries: 1,
+        timeoutMs: 12000,
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "research-mcp" },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Brain-CODE search failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
+            keyFields: [extra ? `Query: ${extra}` : "Browse: all Brain-CODE"],
+            sources: ["https://www.braincode.ca/", "https://github.com/conpdatasets"],
+            limitations: ["GitHub API rate limits may apply."],
+          }),
+        }],
+      };
+    }
+
+    const items = Array.isArray(data?.items) ? data.items : [];
+    const total = Number(data?.total_count || 0);
+    if (items.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No Brain-CODE datasets found${extra ? ` for "${extra}"` : ""}.`,
+            keyFields: [extra ? `Query: ${extra}` : "Browse: all"],
+            sources: ["https://www.braincode.ca/content/public-data-releases", "https://github.com/conpdatasets"],
+            limitations: ["Brain-CODE datasets in CONP use braincode_* naming. Full catalog at braincode.ca."],
+          }),
+        }],
+      };
+    }
+
+    const lines = items.map((r, i) => {
+      const name = r?.name || "?";
+      const desc = normalizeWhitespace(r?.description || "").slice(0, 90);
+      const stars = Number(r?.stargazers_count || 0);
+      const updated = r?.updated_at ? String(r.updated_at).slice(0, 10) : "—";
+      return `  ${String(i + 1).padStart(3)}. ${name} — ${desc || "No description"} | stars: ${stars} | updated: ${updated}`;
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `Brain-CODE: ${items.length} dataset(s)${extra ? ` matching "${extra}"` : ""} in CONP. Total: ${total}.`,
+          keyFields: [extra ? `Query: ${extra}` : "Browse: all Brain-CODE", "\nResults:", ...lines],
+          sources: [
+            "https://www.braincode.ca/content/public-data-releases",
+            "https://www.braincode.ca/",
+            "https://github.com/conpdatasets",
+          ],
+          limitations: [
+            "This tool indexes Brain-CODE datasets mirrored in CONP. For controlled releases and full catalog, see braincode.ca.",
+            "Use get_braincode_dataset_details with repo name for full metadata.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_braincode_dataset_details",
+  {
+    description:
+      "Fetches detailed metadata for a Brain-CODE dataset repository (e.g. braincode_Mouse_Image, braincode_fBIRN). " +
+      "Brain-CODE datasets in CONP use braincode_* naming. Returns description, README preview, topics, and links to braincode.ca.",
+    inputSchema: {
+      repo: z.string().describe("Repository name from search_braincode_datasets (e.g. 'braincode_Mouse_Image', 'braincode_fBIRN')."),
+    },
+  },
+  async ({ repo }) => {
+    const rawRepo = normalizeWhitespace(repo || "");
+    if (!rawRepo) {
+      return { content: [{ type: "text", text: "Provide a Brain-CODE repo name (e.g. braincode_Mouse_Image)." }] };
+    }
+    const repoName = rawRepo.includes("/") ? rawRepo.split("/").pop() : rawRepo;
+    if (!repoName) {
+      return { content: [{ type: "text", text: "Unable to parse repository name." }] };
+    }
+
+    const repoUrl = `${GITHUB_API}/repos/${CONP_GITHUB_ORG}/${encodeURIComponent(repoName)}`;
+    let repoData;
+    try {
+      repoData = await fetchJsonWithRetry(repoUrl, {
+        retries: 1,
+        timeoutMs: 12000,
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "research-mcp" },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Brain-CODE dataset not found: ${CONP_GITHUB_ORG}/${repoName}.`,
+            keyFields: [`Repository: ${repoName}`, `Error: ${compactErrorMessage(error?.message || "unknown error", 220)}`],
+            sources: ["https://www.braincode.ca/", `https://github.com/${CONP_GITHUB_ORG}/${repoName}`],
+            limitations: ["Brain-CODE repos use braincode_* prefix. Verify name from search_braincode_datasets."],
+          }),
+        }],
+      };
+    }
+
+    let readmePreview = "";
+    try {
+      const readmeResponse = await fetchWithRetry(
+        `${GITHUB_API}/repos/${CONP_GITHUB_ORG}/${encodeURIComponent(repoName)}/readme`,
+        { retries: 1, timeoutMs: 10000, headers: { Accept: "application/vnd.github.raw", "User-Agent": "research-mcp" } }
+      );
+      const readmeText = await readmeResponse.text();
+      if (readmeText) {
+        const cleaned = normalizeWhitespace(readmeText.replace(/[#*_`>-]/g, " "));
+        readmePreview = cleaned.length > 400 ? `${cleaned.slice(0, 397)}...` : cleaned;
+      }
+    } catch (_) {}
+
+    const topics = Array.isArray(repoData?.topics) ? repoData.topics : [];
+    const keyFields = [
+      `Repository: ${repoData?.full_name || `${CONP_GITHUB_ORG}/${repoName}`}`,
+      `Description: ${normalizeWhitespace(repoData?.description || "No description.")}`,
+      `Stars: ${Number(repoData?.stargazers_count || 0)}`,
+      `Updated: ${repoData?.updated_at ? String(repoData.updated_at).slice(0, 10) : "unknown"}`,
+    ];
+    if (topics.length > 0) keyFields.push(`Topics: ${topics.slice(0, 8).join(", ")}`);
+    if (readmePreview) keyFields.push(`\nREADME preview:\n${readmePreview}`);
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `Brain-CODE dataset: ${repoData?.full_name || `${CONP_GITHUB_ORG}/${repoName}`}.`,
+          keyFields,
+          sources: [
+            repoData?.html_url || `https://github.com/${CONP_GITHUB_ORG}/${repoName}`,
+            "https://www.braincode.ca/content/public-data-releases",
+            "https://www.braincode.ca/",
+          ],
+          limitations: [
+            "Controlled releases and full metadata require registration at braincode.ca.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
 // Neurobagel cohort discovery tools
 // ---------------------------------------------------------------------------
 
@@ -5896,6 +6273,408 @@ server.registerTool(
           limitations: [
             "Public Neurobagel node currently reflects harmonized OpenNeuro-linked cohorts and may not include all private/institutional nodes.",
             "Subject-level records may be redacted or aggregated depending on dataset protection rules.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// OpenNeuro neuroimaging dataset tools
+// ---------------------------------------------------------------------------
+
+const OPENNEURO_MODALITIES = new Set(["MRI", "MEG", "EEG", "PET", "iEEG", "behavioral"]);
+
+server.registerTool(
+  "search_openneuro_datasets",
+  {
+    description:
+      "Searches public OpenNeuro neuroimaging datasets by imaging modality. " +
+      "OpenNeuro is the primary open platform for fMRI, MRI, MEG, EEG, and other neuroimaging data (BIDS format). " +
+      "Use modality to filter: 'MRI', 'MEG', 'EEG', 'PET', 'iEEG', or 'behavioral'. Omit modality to browse all public datasets. " +
+      "Returns dataset IDs (e.g. ds000224), names, modalities, and latest snapshot tags. Use get_openneuro_dataset with an ID for full metadata.",
+    inputSchema: {
+      modality: z.string().optional().describe("Imaging modality: MRI, MEG, EEG, PET, iEEG, or behavioral. Omit to list all datasets."),
+      maxResults: z.number().optional().describe("Maximum results (default 20, max 50)."),
+    },
+  },
+  async ({ modality, maxResults }) => {
+    const limit = Math.min(Math.max(1, maxResults || 20), 50);
+    const modArg = modality && OPENNEURO_MODALITIES.has(String(modality).trim().toUpperCase())
+      ? String(modality).trim().toUpperCase()
+      : null;
+
+    const query = modArg
+      ? `{ datasets(first: ${limit}, modality: "${modArg}") { edges { node { id name metadata { modalities } latestSnapshot { tag } } } pageInfo { hasNextPage } } }`
+      : `{ datasets(first: ${limit}) { edges { node { id name metadata { modalities } latestSnapshot { tag } } } pageInfo { hasNextPage } } }`;
+
+    let data;
+    try {
+      const res = await fetchWithRetry(OPENNEURO_GRAPHQL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+        timeoutMs: 15000,
+        retries: 1,
+      });
+      data = await res.json();
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `OpenNeuro search failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
+            keyFields: [modArg ? `Modality: ${modArg}` : "Modality: all"],
+            sources: ["https://openneuro.org/", "https://docs.openneuro.org/api.html"],
+            limitations: ["GraphQL API may be temporarily unavailable."],
+          }),
+        }],
+      };
+    }
+
+    const errs = data?.errors;
+    if (errs && errs.length > 0) {
+      const msg = errs.map((e) => e?.message || "").filter(Boolean).join("; ");
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `OpenNeuro GraphQL error: ${msg.slice(0, 300)}`,
+            keyFields: [modArg ? `Modality: ${modArg}` : "Modality: all"],
+            sources: ["https://openneuro.org/"],
+            limitations: ["Check modality spelling: MRI, MEG, EEG, PET, iEEG, behavioral."],
+          }),
+        }],
+      };
+    }
+
+    const edges = data?.data?.datasets?.edges || [];
+    if (edges.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No OpenNeuro datasets found${modArg ? ` for modality ${modArg}` : ""}.`,
+            keyFields: [modArg ? `Modality: ${modArg}` : "Modality: all"],
+            sources: ["https://openneuro.org/datasets"],
+            limitations: ["Valid modalities: MRI, MEG, EEG, PET, iEEG, behavioral."],
+          }),
+        }],
+      };
+    }
+
+    const lines = edges.map((e, i) => {
+      const node = e?.node || {};
+      const id = node.id || "?";
+      const name = node.name || "Unnamed";
+      const mods = Array.isArray(node.metadata?.modalities) ? node.metadata.modalities.join(", ") : "unknown";
+      const tag = node.latestSnapshot?.tag || "—";
+      return `  ${String(i + 1).padStart(3)}. ${id} — ${name} (${mods}) snapshot: ${tag}`;
+    });
+
+    const hasMore = data?.data?.datasets?.pageInfo?.hasNextPage;
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `OpenNeuro: ${edges.length} dataset(s)${modArg ? ` (modality: ${modArg})` : ""}.${hasMore ? " More available via pagination." : ""}`,
+          keyFields: [
+            modArg ? `Modality filter: ${modArg}` : "Modality: all",
+            `Showing: ${edges.length}`,
+            "\nDatasets:",
+            ...lines,
+          ],
+          sources: [
+            "https://openneuro.org/datasets",
+            `https://openneuro.org/datasets${modArg ? `?modality=${modArg.toLowerCase()}` : ""}`,
+          ],
+          limitations: [
+            "Use get_openneuro_dataset with a dataset ID (e.g. ds000224) for full metadata, DOI, and description.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_openneuro_dataset",
+  {
+    description:
+      "Retrieves detailed metadata for a specific OpenNeuro dataset by ID (e.g. ds000224). " +
+      "Returns dataset name, modalities, DOI, latest snapshot tag, and description. Use after search_openneuro_datasets to inspect promising datasets.",
+    inputSchema: {
+      datasetId: z.string().describe("OpenNeuro dataset ID, e.g. ds000224 or ds001."),
+    },
+  },
+  async ({ datasetId }) => {
+    const id = normalizeWhitespace(datasetId || "").toLowerCase();
+    if (!id) {
+      return { content: [{ type: "text", text: "Provide an OpenNeuro dataset ID (e.g. ds000224)." }] };
+    }
+    const normalizedId = id.startsWith("ds") ? id : `ds${id}`;
+
+    const query = `{ dataset(id: "${normalizedId}") { id name metadata { modalities } latestSnapshot { tag description { Name DatasetDOI } } } }`;
+
+    let data;
+    try {
+      const res = await fetchWithRetry(OPENNEURO_GRAPHQL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+        timeoutMs: 15000,
+        retries: 1,
+      });
+      data = await res.json();
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `OpenNeuro dataset fetch failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
+            keyFields: [`Dataset ID: ${normalizedId}`],
+            sources: [`https://openneuro.org/datasets/${normalizedId}`],
+            limitations: ["Dataset may not exist or may be private."],
+          }),
+        }],
+      };
+    }
+
+    const errs = data?.errors;
+    if (errs && errs.length > 0) {
+      const msg = errs.map((e) => e?.message || "").filter(Boolean).join("; ");
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `OpenNeuro error: ${msg.slice(0, 300)}`,
+            keyFields: [`Dataset ID: ${normalizedId}`],
+            sources: [`https://openneuro.org/datasets/${normalizedId}`],
+            limitations: ["Verify the dataset ID is correct and the dataset is public."],
+          }),
+        }],
+      };
+    }
+
+    const ds = data?.data?.dataset;
+    if (!ds) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `OpenNeuro dataset not found: ${normalizedId}.`,
+            keyFields: [`Dataset ID: ${normalizedId}`],
+            sources: ["https://openneuro.org/datasets"],
+            limitations: ["Dataset may be private, deleted, or the ID may be incorrect."],
+          }),
+        }],
+      };
+    }
+
+    const mods = Array.isArray(ds.metadata?.modalities) ? ds.metadata.modalities.join(", ") : "unknown";
+    const desc = ds.latestSnapshot?.description || {};
+    const name = desc.Name || ds.name || "Unnamed";
+    const doi = desc.DatasetDOI || "";
+    const tag = ds.latestSnapshot?.tag || "—";
+
+    const keyFields = [
+      `Dataset: ${name}`,
+      `ID: ${ds.id}`,
+      `Modalities: ${mods}`,
+      `Latest snapshot: ${tag}`,
+    ];
+    if (doi) keyFields.push(`DOI: ${doi}`);
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `OpenNeuro: ${name} (${ds.id}).`,
+          keyFields,
+          sources: [
+            `https://openneuro.org/datasets/${ds.id}`,
+            doi ? `https://doi.org/${doi.replace(/^doi:/i, "").trim()}` : null,
+          ].filter(Boolean),
+          limitations: [
+            "File listings and subject-level metadata require the OpenNeuro CLI or direct S3/git access.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// DANDI Archive neurophysiology dataset tools
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "search_dandi_datasets",
+  {
+    description:
+      "Searches the DANDI Archive for neurophysiology datasets (electrophysiology, optophysiology, behavioral, immunostaining). " +
+      "DANDI hosts NWB/BIDS-format data from the BRAIN Initiative. Use search terms like 'electrophysiology', 'hippocampus', 'calcium imaging', 'spike', or topic keywords. " +
+      "Returns dandiset identifiers, names, asset counts, sizes, and embargo status. Use get_dandi_dataset with an identifier for full metadata.",
+    inputSchema: {
+      query: z.string().optional().describe("Search term (e.g. 'electrophysiology', 'hippocampus', 'calcium'). Omit to list recent dandisets."),
+      maxResults: z.number().optional().describe("Maximum results (default 20, max 50)."),
+    },
+  },
+  async ({ query, maxResults }) => {
+    const limit = Math.min(Math.max(1, maxResults || 20), 50);
+    const params = new URLSearchParams({ page_size: String(limit), page: "1" });
+    if (normalizeWhitespace(query)) params.set("search", normalizeWhitespace(query));
+
+    const url = `${DANDI_API}/dandisets/?${params.toString()}`;
+
+    let data;
+    try {
+      data = await fetchJsonWithRetry(url, {
+        retries: 1,
+        timeoutMs: 15000,
+        headers: { Accept: "application/json" },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `DANDI search failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
+            keyFields: [query ? `Query: ${query}` : "Query: (none)"],
+            sources: ["https://dandiarchive.org/", "https://api.dandiarchive.org/"],
+            limitations: ["DANDI API may be temporarily unavailable."],
+          }),
+        }],
+      };
+    }
+
+    const results = data?.results || [];
+    const total = Number(data?.count ?? 0);
+
+    if (results.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No DANDI dandisets found${query ? ` for "${query}"` : ""}.`,
+            keyFields: [query ? `Query: ${query}` : "Query: (none)"],
+            sources: ["https://dandiarchive.org/dandisets/"],
+            limitations: ["Try broader search terms or omit the query to browse all dandisets."],
+          }),
+        }],
+      };
+    }
+
+    const formatBytes = (n) => {
+      if (!Number.isFinite(n)) return "—";
+      const gb = n / 1e9;
+      return gb >= 1 ? `${gb.toFixed(1)} GB` : `${(n / 1e6).toFixed(1)} MB`;
+    };
+
+    const lines = results.map((r, i) => {
+      const ver = r.most_recent_published_version || r.draft_version || {};
+      const name = ver.name || "Unnamed";
+      const ident = r.identifier || "?";
+      const assets = Number(ver.asset_count ?? 0);
+      const size = formatBytes(Number(ver.size ?? 0));
+      const embargo = r.embargo_status || "?";
+      return `  ${String(i + 1).padStart(3)}. ${ident} — ${name.slice(0, 60)}${name.length > 60 ? "..." : ""} | ${assets} assets, ${size} | ${embargo}`;
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `DANDI: ${results.length} dandiset(s)${query ? ` matching "${query}"` : ""}. Total in archive: ${total}.`,
+          keyFields: [
+            query ? `Search: ${query}` : "Browse: recent dandisets",
+            `Total: ${total}`,
+            "\nResults:",
+            ...lines,
+          ],
+          sources: [
+            query ? `https://dandiarchive.org/dandisets/?search=${encodeURIComponent(query)}` : "https://dandiarchive.org/dandisets/",
+            "https://dandiarchive.org/",
+          ],
+          limitations: [
+            "Use get_dandi_dataset with a dandiset identifier (e.g. 000003) for full metadata and asset details.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_dandi_dataset",
+  {
+    description:
+      "Retrieves detailed metadata for a DANDI dandiset by identifier (e.g. 000003). " +
+      "Returns name, version, asset count, size, embargo status, and contact. Use after search_dandi_datasets to inspect promising datasets.",
+    inputSchema: {
+      dandisetId: z.string().describe("DANDI dandiset identifier, e.g. 000003 or dandi:000003."),
+    },
+  },
+  async ({ dandisetId }) => {
+    let id = normalizeWhitespace(dandisetId || "").replace(/^dandi:/i, "").replace(/\D/g, "");
+    if (!id) {
+      return { content: [{ type: "text", text: "Provide a DANDI dandiset identifier (e.g. 000003)." }] };
+    }
+    id = id.padStart(6, "0");
+
+    const url = `${DANDI_API}/dandisets/${id}/`;
+
+    let data;
+    try {
+      data = await fetchJsonWithRetry(url, {
+        retries: 1,
+        timeoutMs: 15000,
+        headers: { Accept: "application/json" },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `DANDI dandiset fetch failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
+            keyFields: [`Identifier: ${id}`],
+            sources: [`https://dandiarchive.org/dandiset/${id}`],
+            limitations: ["Dandiset may not exist or may be embargoed."],
+          }),
+        }],
+      };
+    }
+
+    const ver = data.most_recent_published_version || data.draft_version || {};
+    const name = ver.name || "Unnamed";
+    const version = ver.version || "—";
+    const assets = Number(ver.asset_count ?? 0);
+    const size = Number(ver.size ?? 0);
+    const sizeStr = size >= 1e9 ? `${(size / 1e9).toFixed(1)} GB` : `${(size / 1e6).toFixed(1)} MB`;
+
+    const keyFields = [
+      `Name: ${name}`,
+      `Identifier: ${data.identifier || id}`,
+      `Version: ${version}`,
+      `Assets: ${assets}`,
+      `Size: ${sizeStr}`,
+      `Embargo: ${data.embargo_status || "?"}`,
+    ];
+    if (data.contact_person) keyFields.push(`Contact: ${data.contact_person}`);
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `DANDI: ${name} (${data.identifier || id}).`,
+          keyFields,
+          sources: [
+            `https://dandiarchive.org/dandiset/${data.identifier || id}`,
+          ],
+          limitations: [
+            "Asset-level metadata and downloads require the DANDI CLI or direct API asset endpoints.",
           ],
         }),
       }],

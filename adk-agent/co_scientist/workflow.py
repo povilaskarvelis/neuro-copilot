@@ -124,6 +124,14 @@ KNOWN_MCP_TOOLS = [
     "search_conp_datasets",
     "get_conp_dataset_details",
     "query_neurobagel_cohorts",
+    "search_openneuro_datasets",
+    "get_openneuro_dataset",
+    "search_dandi_datasets",
+    "get_dandi_dataset",
+    "search_nemar_datasets",
+    "get_nemar_dataset_details",
+    "search_braincode_datasets",
+    "get_braincode_dataset_details",
     "benchmark_dataset_overview",
     "check_gpqa_access",
 ]
@@ -156,6 +164,14 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "search_conp_datasets": "Search CONP dataset repositories by modality/method keywords (e.g. 'EEG', 'fMRI', 'MRI') or study names — NOT disease names. Disease queries rarely match; use broad neuroscience terms instead",
     "get_conp_dataset_details": "Get detailed metadata (README, license, topics) for a specific CONP dataset repository returned by search_conp_datasets",
     "query_neurobagel_cohorts": "Query Neurobagel public cohorts by age, sex, and imaging modality. Start broad (no filters = browse all). Avoid diagnosis filters — most public datasets lack diagnosis annotations. Use image_modal URIs for modality filtering",
+    "search_openneuro_datasets": "Search OpenNeuro neuroimaging datasets by modality (MRI, MEG, EEG, PET, iEEG, behavioral). Omit modality to browse all. Returns dataset IDs for get_openneuro_dataset",
+    "get_openneuro_dataset": "Get detailed metadata (name, DOI, modalities, snapshot) for an OpenNeuro dataset by ID (e.g. ds000224)",
+    "search_dandi_datasets": "Search DANDI Archive neurophysiology datasets (electrophysiology, calcium imaging, behavioral). Use keywords like 'hippocampus', 'electrophysiology'. Omit query to browse recent dandisets",
+    "get_dandi_dataset": "Get detailed metadata (name, version, assets, size, embargo) for a DANDI dandiset by identifier (e.g. 000003)",
+    "search_nemar_datasets": "Search NEMAR EEG/MEG/iEEG datasets (nemarDatasets GitHub org). Use 'EEG', 'MEG', 'iEEG', 'resting state', 'visual'. Omit query to browse. BIDS data from OpenNeuro at SDSC",
+    "get_nemar_dataset_details": "Get detailed metadata for a NEMAR dataset by repo name (e.g. nm000104)",
+    "search_braincode_datasets": "Search Brain-CODE (Ontario Brain Institute) datasets in CONP. Use 'mouse', 'fBIRN', 'NDD', 'epilepsy', or omit to list all. braincode_* repos",
+    "get_braincode_dataset_details": "Get detailed metadata for a Brain-CODE dataset by repo name (e.g. braincode_Mouse_Image)",
     "benchmark_dataset_overview": "Overview of available benchmark datasets",
     "check_gpqa_access": "Check access to GPQA benchmark",
 }
@@ -210,6 +226,18 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "get_conp_dataset_details": "CONP Datasets",
     # Neurobagel public node (harmonized cohort discovery)
     "query_neurobagel_cohorts": "Neurobagel",
+    # OpenNeuro (BIDS neuroimaging datasets)
+    "search_openneuro_datasets": "OpenNeuro",
+    "get_openneuro_dataset": "OpenNeuro",
+    # DANDI Archive (neurophysiology NWB/BIDS)
+    "search_dandi_datasets": "DANDI Archive",
+    "get_dandi_dataset": "DANDI Archive",
+    # NEMAR (EEG/MEG/iEEG from OpenNeuro)
+    "search_nemar_datasets": "NEMAR",
+    "get_nemar_dataset_details": "NEMAR",
+    # Brain-CODE (Ontario Brain Institute, via CONP)
+    "search_braincode_datasets": "Brain-CODE",
+    "get_braincode_dataset_details": "Brain-CODE",
     # FDA FAERS (post-marketing adverse events)
     "search_fda_adverse_events": "FDA FAERS (openFDA)",
     # PubMed (NCBI E-utilities)

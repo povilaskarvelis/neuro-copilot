@@ -6,7 +6,7 @@ An agentic AI research assistant that synthesizes evidence across biomedical dat
 
 The AI Co-Scientist helps biomedical researchers evaluate therapeutic targets and research directions before human trials by:
 
-- **Synthesizing evidence across 30 databases** — genomics, literature, clinical trials, neuroscience, protein structure, pathways, safety, and more
+- **Synthesizing evidence across 34 databases** — genomics, literature, clinical trials, neuroscience, protein structure, pathways, safety, and more
 - **Generating query-specific execution plans** with explicit tool and data-source proposals
 - **Requiring human plan approval or revision** before evidence tools run
 - **Running iterative evidence-gathering loops** via a ReAct (Reason → Act → Observe) cycle
@@ -29,7 +29,7 @@ The AI Co-Scientist helps biomedical researchers evaluate therapeutic targets an
 | **Clinical Variant Interpretation** | CIViC, ClinVar |
 | **Cancer Genomics** | cBioPortal |
 | **Target Discovery & Druggability** | GWAS Catalog, DGIdb, GTEx |
-| **Neuroscience Atlases & Knowledge Graphs** | Allen Brain Atlas, EBRAINS Knowledge Graph, CONP, Neurobagel |
+| **Neuroscience Atlases & Knowledge Graphs** | Allen Brain Atlas, EBRAINS Knowledge Graph, CONP, Neurobagel, OpenNeuro, DANDI, NEMAR, Brain-CODE |
 
 This stack combines live REST APIs (literature, trials, protein/pathway, neuroscience) with BigQuery public datasets (genomics, chemistry, safety, perturbation, and patent-derived chemistry).
 
@@ -137,6 +137,10 @@ The reasoning trace captures the full decision chain per step and is stored alon
 | **Neuroscience Knowledge Graph** | `search_ebrains_kg`, `get_ebrains_kg_document` | EBRAINS KG (datasets, models, software, contributors, projects) |
 | **Neuroscience Datasets (CONP)** | `search_conp_datasets`, `get_conp_dataset_details` | CONP datasets via `conpdatasets` GitHub catalog |
 | **Cohort Discovery (Neurobagel)** | `query_neurobagel_cohorts` | Neurobagel public node API (harmonized cohort-level dataset discovery) |
+| **Neuroimaging Datasets (OpenNeuro)** | `search_openneuro_datasets`, `get_openneuro_dataset` | OpenNeuro GraphQL (BIDS fMRI/MRI/MEG/EEG datasets by modality) |
+| **Neurophysiology (DANDI)** | `search_dandi_datasets`, `get_dandi_dataset` | DANDI Archive REST API (electrophysiology, calcium imaging, NWB/BIDS) |
+| **Neuroelectromagnetic (NEMAR)** | `search_nemar_datasets`, `get_nemar_dataset_details` | NEMAR (EEG/MEG/iEEG from OpenNeuro, nemarDatasets GitHub, BIDS, HED) |
+| **Brain-CODE (OBI)** | `search_braincode_datasets`, `get_braincode_dataset_details` | Brain-CODE via CONP (Ontario Brain Institute: epilepsy, depression, neurodegeneration, CP, concussion) |
 | **Benchmarks** | `benchmark_dataset_overview`, `check_gpqa_access` | Hugging Face Datasets |
 
 ### BigQuery Datasets
