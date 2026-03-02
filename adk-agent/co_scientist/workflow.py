@@ -102,6 +102,7 @@ KNOWN_MCP_TOOLS = [
     "search_clinical_trials",
     "get_clinical_trial",
     "summarize_clinical_trials_landscape",
+    "search_fda_adverse_events",
     "search_pubmed",
     "search_pubmed_advanced",
     "get_pubmed_abstract",
@@ -113,8 +114,18 @@ KNOWN_MCP_TOOLS = [
     "get_uniprot_protein_profile",
     "search_reactome_pathways",
     "get_string_interactions",
+    "get_alphafold_structure",
+    "search_protein_structures",
+    "search_drug_gene_interactions",
+    "annotate_variants_vep",
+    "search_civic_variants",
+    "search_civic_genes",
+    "get_variant_annotations",
+    "search_gwas_associations",
+    "get_gene_tissue_expression",
+    "get_cancer_mutation_profile",
+    "get_pubchem_compound",
     "get_chembl_bioactivities",
-    "search_fda_adverse_events",
     "search_aba_genes",
     "search_aba_structures",
     "get_aba_gene_expression",
@@ -137,6 +148,57 @@ KNOWN_MCP_TOOLS = [
     "benchmark_dataset_overview",
     "check_gpqa_access",
 ]
+
+TOOL_DOMAINS: dict[str, list[str]] = {
+    "literature": [
+        "search_pubmed", "search_pubmed_advanced", "get_pubmed_abstract",
+        "search_openalex_works", "search_openalex_authors",
+        "rank_researchers_by_activity", "get_researcher_contact_candidates",
+    ],
+    "clinical": [
+        "search_clinical_trials", "get_clinical_trial",
+        "summarize_clinical_trials_landscape", "search_fda_adverse_events",
+    ],
+    "protein": [
+        "search_uniprot_proteins", "get_uniprot_protein_profile",
+        "search_reactome_pathways", "get_string_interactions",
+        "get_alphafold_structure", "search_protein_structures",
+        "search_drug_gene_interactions",
+    ],
+    "genomics": [
+        "annotate_variants_vep", "search_civic_variants", "search_civic_genes",
+        "get_variant_annotations", "search_gwas_associations",
+        "get_gene_tissue_expression", "get_cancer_mutation_profile",
+    ],
+    "chemistry": [
+        "get_pubchem_compound", "get_chembl_bioactivities",
+    ],
+    "neuroscience": [
+        "search_aba_genes", "search_aba_structures",
+        "get_aba_gene_expression", "search_aba_differential_expression",
+        "search_ebrains_kg", "get_ebrains_kg_document",
+        "search_conp_datasets", "get_conp_dataset_details",
+        "query_neurobagel_cohorts",
+        "search_openneuro_datasets", "get_openneuro_dataset",
+        "search_dandi_datasets", "get_dandi_dataset",
+        "search_nemar_datasets", "get_nemar_dataset_details",
+        "search_braincode_datasets", "get_braincode_dataset_details",
+        "search_enigma_datasets", "get_enigma_dataset_info",
+    ],
+    "data": [
+        "list_bigquery_tables", "run_bigquery_select_query",
+        "benchmark_dataset_overview", "check_gpqa_access",
+    ],
+}
+
+ALWAYS_AVAILABLE_DOMAINS = {"data", "literature"}
+
+ALL_DOMAIN_NAMES = sorted(TOOL_DOMAINS.keys())
+
+TOOL_TO_DOMAINS: dict[str, list[str]] = {}
+for _domain, _tools in TOOL_DOMAINS.items():
+    for _tool in _tools:
+        TOOL_TO_DOMAINS.setdefault(_tool, []).append(_domain)
 
 TOOL_DESCRIPTIONS: dict[str, str] = {
     "list_bigquery_tables": "List tables in a BigQuery dataset, or inspect column schema for a specific table",
@@ -274,13 +336,19 @@ You are the internal planner for biomedical investigation.
 Available MCP tools:
 __TOOL_CATALOG__
 
+Tool domains (used to focus the executor on the most relevant tools for each step):
+__DOMAIN_CATALOG__
+
 Rules:
 - Build a concrete execution plan before any evidence collection begins.
 - Break the objective into ordered, atomic subtasks.
 - Prioritize high-signal subtasks that reduce uncertainty first.
 - Choose the number of steps needed for the objective. Avoid unnecessary fragmentation.
-- Each step must include: id, goal, tool_hint, completion_condition.
+- Each step must include: id, goal, tool_hint, domains, completion_condition.
 - Every step must call at least one tool. Pick tool_hint from the catalog above.
+- Pick domains from the domain list above. Include 1-3 domains most relevant to the step.
+  The executor will always have access to 'data' and 'literature' tools in addition to
+  the domains you specify. Choose domains that match the step's investigation area.
 - NEVER put example values or IDs in the goal or completion_condition.
 - Use step ids S1, S2, S3, ... in order.
 
@@ -312,6 +380,7 @@ Output requirements:
         "id": "S1",
         "goal": "...",
         "tool_hint": "<tool name or BigQuery dataset from the catalog, e.g. open_targets_platform, search_pubmed, search_clinical_trials, gnomad>",
+        "domains": ["<domain1>", "<domain2>"],
         "completion_condition": "..."
       }
     ]
@@ -755,11 +824,18 @@ def _validate_plan_internal(raw: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(step, dict):
             raise ValueError(f"steps[{idx - 1}] must be an object")
         canonical_id = f"S{idx}"
+        raw_domains = step.get("domains")
+        if isinstance(raw_domains, list):
+            domains = [str(d).strip().lower() for d in raw_domains if str(d).strip()]
+            domains = [d for d in domains if d in TOOL_DOMAINS]
+        else:
+            domains = []
         steps.append(
             {
                 "id": canonical_id,
                 "goal": _as_nonempty_str(step.get("goal"), f"steps[{idx - 1}].goal"),
                 "tool_hint": _as_nonempty_str(step.get("tool_hint"), f"steps[{idx - 1}].tool_hint"),
+                "domains": domains,
                 "completion_condition": _as_nonempty_str(
                     step.get("completion_condition"),
                     f"steps[{idx - 1}].completion_condition",
@@ -782,6 +858,7 @@ def _initialize_task_state_from_plan(plan: dict[str, Any], *, objective_text: st
             "id": step["id"],
             "goal": step["goal"],
             "tool_hint": step["tool_hint"],
+            "domains": step.get("domains", []),
             "completion_condition": step["completion_condition"],
             "status": "pending",
             "result_summary": "",
@@ -903,9 +980,11 @@ def _render_plan_markdown(task_state: dict[str, Any]) -> str:
         tool_hint = step.get("tool_hint", "").strip()
         source_label = _resolve_source_label(tool_hint)
         source_display = source_label if source_label else tool_hint
+        domains = step.get("domains") or []
+        domain_tag = f" | domains: {', '.join(domains)}" if domains else ""
         lines.append(
             f"1. **{step.get('id', 'S?')}**: {step.get('goal', '').strip()} "
-            f"*(source: {source_display})*"
+            f"*(source: {source_display}{domain_tag})*"
         )
         lines.append(f"Completion: {step.get('completion_condition', '').strip()}")
     return "\n".join(lines).strip()
@@ -1877,6 +1956,8 @@ def _render_no_plan_to_finalize_message() -> str:
 def _planner_json_instruction_suffix() -> str:
     return (
         "Return ONLY valid JSON matching `plan_internal.v1` for this objective. "
+        "Each step MUST include a \"domains\" array with 1-3 domain names from: "
+        f"{', '.join(ALL_DOMAIN_NAMES)}. "
         "Do not include markdown fences or commentary."
     )
 
@@ -1888,6 +1969,12 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
         1 for s in task_state.get("steps", [])
         if str(s.get("status", "")).strip() in {"pending", "in_progress"}
     )
+
+    step_domains = active_step.get("domains") or []
+    focused_tools = _resolve_step_tools(step_domains)
+
+    focused_catalog = _format_tool_catalog(focused_tools)
+
     payload = {
         "schema": "react_step_context.v1",
         "objective": task_state.get("objective", ""),
@@ -1895,22 +1982,34 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
             "id": active_step.get("id"),
             "goal": active_step.get("goal"),
             "tool_hint": active_step.get("tool_hint"),
+            "domains": step_domains,
             "completion_condition": active_step.get("completion_condition"),
         },
         "remaining_steps_after_this": remaining_count - 1,
         "prior_completed_steps": prior_completed,
     }
-    return [
+
+    instructions = [
         "Execution context (authoritative; use this instead of inferring from prior prose):",
         _serialize_pretty_json(payload),
-        (
-            f"Execute ONLY step {active_step.get('id')}. "
-            f"There are {remaining_count - 1} more step(s) after this one. "
-            "Call at least one tool, then return ONLY valid JSON matching "
-            "`step_execution_result.v1`. Include your reasoning_trace. "
-            "Do not include markdown fences or extra commentary."
-        ),
     ]
+
+    if step_domains:
+        instructions.append(
+            f"Focused tools for this step (domains: {', '.join(step_domains)}):\n"
+            f"{focused_catalog}\n"
+            "Prefer tools from this focused list. You may use other available tools "
+            "if the focused set is insufficient, but start here."
+        )
+
+    instructions.append(
+        f"Execute ONLY step {active_step.get('id')}. "
+        f"There are {remaining_count - 1} more step(s) after this one. "
+        "Call at least one tool, then return ONLY valid JSON matching "
+        "`step_execution_result.v1`. Include your reasoning_trace. "
+        "Do not include markdown fences or extra commentary."
+    )
+    return instructions
 
 
 def _resolve_source_label(tool_hint: str) -> str:
@@ -2788,6 +2887,32 @@ def _format_tool_catalog(tool_hints: list[str]) -> str:
     return "\n".join(lines) or "- No tools available."
 
 
+def _resolve_step_tools(domains: list[str] | None, *, available_tools: set[str] | None = None) -> list[str]:
+    """Resolve a list of domain names into a deduplicated, ordered tool list.
+
+    Always includes ALWAYS_AVAILABLE_DOMAINS.  Falls back to all known tools
+    when *domains* is empty/None (preserving backward compatibility with plans
+    that don't yet include domain tags).
+    """
+    if not domains:
+        return list(KNOWN_MCP_TOOLS)
+
+    target_domains = set(domains) | ALWAYS_AVAILABLE_DOMAINS
+    seen: set[str] = set()
+    tools: list[str] = []
+    for domain in ALL_DOMAIN_NAMES:
+        if domain not in target_domains:
+            continue
+        for tool in TOOL_DOMAINS.get(domain, []):
+            if tool in seen:
+                continue
+            if available_tools is not None and tool not in available_tools:
+                continue
+            seen.add(tool)
+            tools.append(tool)
+    return tools
+
+
 def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
     tool_catalog = _format_tool_catalog(tool_hints)
     if prefer_bigquery:
@@ -2802,8 +2927,19 @@ def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: 
     )
 
 
+def _format_domain_catalog() -> str:
+    lines = []
+    for domain in ALL_DOMAIN_NAMES:
+        tools = TOOL_DOMAINS.get(domain, [])
+        tool_names = ", ".join(tools[:12])
+        always = " (always included)" if domain in ALWAYS_AVAILABLE_DOMAINS else ""
+        lines.append(f"- {domain}{always}: {tool_names}")
+    return "\n".join(lines)
+
+
 def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
     tool_catalog = _format_tool_catalog(tool_hints)
+    domain_catalog = _format_domain_catalog()
     if prefer_bigquery:
         bq_policy = (
             "- BigQuery-first policy:\n"
@@ -2830,6 +2966,7 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
     return (
         PLANNER_INSTRUCTION_TEMPLATE
         .replace("__TOOL_CATALOG__", tool_catalog)
+        .replace("__DOMAIN_CATALOG__", domain_catalog)
         .replace("__BQ_POLICY__", bq_policy)
     )
 
