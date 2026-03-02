@@ -132,6 +132,8 @@ KNOWN_MCP_TOOLS = [
     "get_nemar_dataset_details",
     "search_braincode_datasets",
     "get_braincode_dataset_details",
+    "search_enigma_datasets",
+    "get_enigma_dataset_info",
     "benchmark_dataset_overview",
     "check_gpqa_access",
 ]
@@ -172,6 +174,8 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_nemar_dataset_details": "Get detailed metadata for a NEMAR dataset by repo name (e.g. nm000104)",
     "search_braincode_datasets": "Search Brain-CODE (Ontario Brain Institute) datasets in CONP. Use 'mouse', 'fBIRN', 'NDD', 'epilepsy', or omit to list all. braincode_* repos",
     "get_braincode_dataset_details": "Get detailed metadata for a Brain-CODE dataset by repo name (e.g. braincode_Mouse_Image)",
+    "search_enigma_datasets": "Search ENIGMA Consortium case-control summary stats (cortical thickness, subcortical volume). Use disorder: schizophrenia, depression, ADHD, bipolar, OCD, autism, epilepsy, Parkinson, 22q",
+    "get_enigma_dataset_info": "List ENIGMA summary statistic files for a disorder (e.g. scz, mdd, adhd, 22q, bd, asd). Returns filenames and raw CSV URLs",
     "benchmark_dataset_overview": "Overview of available benchmark datasets",
     "check_gpqa_access": "Check access to GPQA benchmark",
 }
@@ -238,6 +242,9 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     # Brain-CODE (Ontario Brain Institute, via CONP)
     "search_braincode_datasets": "Brain-CODE",
     "get_braincode_dataset_details": "Brain-CODE",
+    # ENIGMA Consortium (imaging genetics meta-analysis)
+    "search_enigma_datasets": "ENIGMA",
+    "get_enigma_dataset_info": "ENIGMA",
     # FDA FAERS (post-marketing adverse events)
     "search_fda_adverse_events": "FDA FAERS (openFDA)",
     # PubMed (NCBI E-utilities)

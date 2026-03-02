@@ -44,6 +44,8 @@ const BRAINCODE_CONP_QUERY = "braincode";
 const NEUROBAGEL_API = "https://api.neurobagel.org";
 const OPENNEURO_GRAPHQL = "https://openneuro.org/crn/graphql";
 const DANDI_API = "https://api.dandiarchive.org/api";
+const ENIGMA_TOOLBOX_REPO = "MICA-MNI/ENIGMA";
+const ENIGMA_SUMMARY_STATS_PATH = "enigmatoolbox/datasets/summary_statistics";
 const OPENALEX_WORKS_SELECT = [
   "id",
   "display_name",
@@ -6107,6 +6109,234 @@ server.registerTool(
           ],
           limitations: [
             "Controlled releases and full metadata require registration at braincode.ca.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// ENIGMA Consortium (imaging genetics meta-analysis) tools
+// ---------------------------------------------------------------------------
+
+const ENIGMA_DISORDER_PREFIXES = {
+  scz: "Schizophrenia",
+  schizophrenia: "Schizophrenia",
+  mdd: "mdd",
+  depression: "mdd",
+  adhd: "adhd",
+  bd: "bd",
+  bipolar: "bd",
+  asd: "asd",
+  autism: "asd",
+  ocd: "ocd",
+  "22q": "22q",
+  allepi: "allepi",
+  epilepsy: "allepi",
+  anorexia: "anorexia",
+  parkinsons: "parkinsons",
+  parkinson: "parkinsons",
+  antisocial: "Antisocial",
+  schizotypy: "schizotypy",
+};
+
+function enigmaFileMatchesQuery(filename, query) {
+  const q = normalizeWhitespace(query || "").toLowerCase();
+  if (!q) return true;
+  const f = filename.replace(".csv", "");
+  const fLower = f.toLowerCase();
+  if (fLower.includes(q)) return true;
+  const prefix = ENIGMA_DISORDER_PREFIXES[q] || q;
+  if (fLower.startsWith(prefix.toLowerCase())) return true;
+  for (const [key, val] of Object.entries(ENIGMA_DISORDER_PREFIXES)) {
+    if (q.includes(key) && fLower.startsWith(val.toLowerCase())) return true;
+  }
+  return false;
+}
+
+function enigmaDisorderPrefix(code) {
+  const c = normalizeWhitespace(code || "").toLowerCase();
+  return ENIGMA_DISORDER_PREFIXES[c] || c;
+}
+
+server.registerTool(
+  "search_enigma_datasets",
+  {
+    description:
+      "Searches ENIGMA Consortium case-control summary statistics from the ENIGMA Toolbox. " +
+      "ENIGMA provides 100+ meta-analytical neuroimaging datasets (cortical thickness, subcortical volume, surface area) for disorders including schizophrenia, depression, ADHD, bipolar, OCD, autism, epilepsy, Parkinson's, 22q, anorexia. " +
+      "Use disorder keywords: 'schizophrenia', 'depression', 'ADHD', 'bipolar', 'OCD', 'autism', 'epilepsy', 'Parkinson', '22q', 'anorexia'. Omit query to list all. " +
+      "Returns dataset names, metrics (CortThick, SubVol, CortSurf), and links. Use get_enigma_dataset_info for a specific disorder.",
+    inputSchema: {
+      query: z.string().optional().describe("Disorder or keyword (e.g. 'schizophrenia', 'depression', 'ADHD', 'epilepsy'). Omit to list all."),
+      maxResults: z.number().optional().describe("Maximum results (default 30, max 80)."),
+    },
+  },
+  async ({ query, maxResults }) => {
+    const limit = Math.min(Math.max(1, maxResults || 30), 80);
+    const url = `${GITHUB_API}/repos/${ENIGMA_TOOLBOX_REPO}/contents/${ENIGMA_SUMMARY_STATS_PATH}?ref=master`;
+
+    let fileList;
+    try {
+      fileList = await fetchJsonWithRetry(url, {
+        retries: 1,
+        timeoutMs: 12000,
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "research-mcp" },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `ENIGMA catalog fetch failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
+            keyFields: [],
+            sources: ["https://enigma-toolbox.readthedocs.io/", "https://github.com/MICA-MNI/ENIGMA"],
+            limitations: ["GitHub API rate limits may apply."],
+          }),
+        }],
+      };
+    }
+
+    const files = Array.isArray(fileList) ? fileList.filter((f) => (f.name || "").endsWith(".csv")) : [];
+    const filtered = normalizeWhitespace(query)
+      ? files.filter((f) => enigmaFileMatchesQuery(f.name, query))
+      : files;
+
+    if (filtered.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No ENIGMA datasets found${query ? ` for "${query}"` : ""}.`,
+            keyFields: [query ? `Query: ${query}` : "Query: (none)"],
+            sources: ["https://enigma-toolbox.readthedocs.io/", "https://enigma.ini.usc.edu/"],
+            limitations: ["Try: schizophrenia, depression, ADHD, bipolar, OCD, autism, epilepsy, Parkinson, 22q, anorexia."],
+          }),
+        }],
+      };
+    }
+
+    const shown = filtered.slice(0, limit);
+    const byDisorder = {};
+    for (const f of shown) {
+      const base = f.name.replace(".csv", "");
+      const disorder = base.split("_")[0] || "unknown";
+      const metric = base.includes("CortThick") ? "CortThick" : base.includes("SubVol") ? "SubVol" : base.includes("CortSurf") ? "CortSurf" : "other";
+      if (!byDisorder[disorder]) byDisorder[disorder] = [];
+      byDisorder[disorder].push(metric);
+    }
+    const lines = Object.entries(byDisorder).map(([d, mets]) => {
+      const unique = [...new Set(mets)];
+      return `  ${d}: ${unique.join(", ")} (${mets.length} file(s))`;
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `ENIGMA: ${filtered.length} summary statistic dataset(s)${query ? ` matching "${query}"` : ""}. Disorders: ${Object.keys(byDisorder).length}.`,
+          keyFields: [
+            query ? `Query: ${query}` : "Browse: all",
+            `Total matches: ${filtered.length}`,
+            "\nBy disorder (metric types):",
+            ...lines,
+          ],
+          sources: [
+            "https://enigma-toolbox.readthedocs.io/",
+            "https://enigma.ini.usc.edu/",
+            `https://github.com/${ENIGMA_TOOLBOX_REPO}/tree/master/${ENIGMA_SUMMARY_STATS_PATH}`,
+          ],
+          limitations: [
+            "Data are case-control meta-analysis summary statistics. Raw imaging requires joining ENIGMA Working Groups.",
+            "Use get_enigma_dataset_info with a disorder code (e.g. scz, mdd) for file list and access.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_enigma_dataset_info",
+  {
+    description:
+      "Lists ENIGMA summary statistic files for a specific disorder. " +
+      "Use disorder codes: 22q, scz, mdd, adhd (or adhdadult, adhdpediatric), bd, asd, ocd, allepi, parkinsons, anorexia, antisocial, schizotypy. " +
+      "Returns filenames, metric types, and raw CSV URLs from the ENIGMA Toolbox.",
+    inputSchema: {
+      disorder: z.string().describe("ENIGMA disorder code (e.g. scz, mdd, adhd, 22q, bd, asd, allepi)."),
+    },
+  },
+  async ({ disorder }) => {
+    const code = normalizeWhitespace(disorder || "").toLowerCase();
+    if (!code) {
+      return { content: [{ type: "text", text: "Provide an ENIGMA disorder code (e.g. scz, mdd, adhd)." }] };
+    }
+
+    const url = `${GITHUB_API}/repos/${ENIGMA_TOOLBOX_REPO}/contents/${ENIGMA_SUMMARY_STATS_PATH}?ref=master`;
+    let fileList;
+    try {
+      fileList = await fetchJsonWithRetry(url, {
+        retries: 1,
+        timeoutMs: 12000,
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "research-mcp" },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `ENIGMA catalog fetch failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
+            keyFields: [`Disorder: ${code}`],
+            sources: ["https://github.com/MICA-MNI/ENIGMA"],
+            limitations: [],
+          }),
+        }],
+      };
+    }
+
+    const files = Array.isArray(fileList) ? fileList.filter((f) => (f.name || "").endsWith(".csv")) : [];
+    const prefix = enigmaDisorderPrefix(code);
+    const prefixLower = prefix.toLowerCase();
+    const matching = files.filter((f) => {
+      const base = f.name.replace(".csv", "");
+      const filePrefix = base.split("_")[0] || "";
+      return base.toLowerCase().startsWith(prefixLower) || filePrefix.toLowerCase().startsWith(code) || code.startsWith(filePrefix.toLowerCase());
+    });
+
+    if (matching.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No ENIGMA files found for disorder "${code}".`,
+            keyFields: [`Disorder: ${code}`],
+            sources: ["https://enigma-toolbox.readthedocs.io/"],
+            limitations: ["Try: scz, mdd, adhd, bd, asd, ocd, 22q, allepi, parkinsons, anorexia."],
+          }),
+        }],
+      };
+    }
+
+    const lines = matching.map((f) => {
+      const rawUrl = f.download_url || `https://raw.githubusercontent.com/${ENIGMA_TOOLBOX_REPO}/master/${ENIGMA_SUMMARY_STATS_PATH}/${f.name}`;
+      return `  ${f.name} | ${rawUrl}`;
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `ENIGMA: ${matching.length} file(s) for disorder "${code}".`,
+          keyFields: [`Disorder: ${code}`, "\nFiles (with raw URLs):", ...lines],
+          sources: [
+            "https://enigma-toolbox.readthedocs.io/",
+            "https://enigma.ini.usc.edu/",
+            `https://github.com/${ENIGMA_TOOLBOX_REPO}`,
+          ],
+          limitations: [
+            "Load via Python: from enigmatoolbox.datasets import load_summary_stats; load_summary_stats('" + code + "').",
           ],
         }),
       }],
