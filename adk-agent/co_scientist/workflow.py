@@ -121,6 +121,9 @@ KNOWN_MCP_TOOLS = [
     "search_aba_differential_expression",
     "search_ebrains_kg",
     "get_ebrains_kg_document",
+    "search_conp_datasets",
+    "get_conp_dataset_details",
+    "query_neurobagel_cohorts",
     "benchmark_dataset_overview",
     "check_gpqa_access",
 ]
@@ -150,6 +153,9 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "search_aba_differential_expression": "Find genes differentially expressed between two brain structures (Allen Mouse Brain Atlas)",
     "search_ebrains_kg": "Search EBRAINS Knowledge Graph for neuroscience datasets, models, software, and contributors",
     "get_ebrains_kg_document": "Get detailed metadata for a specific EBRAINS Knowledge Graph resource (dataset, model, etc.)",
+    "search_conp_datasets": "Search CONP dataset repositories by modality/method keywords (e.g. 'EEG', 'fMRI', 'MRI') or study names — NOT disease names. Disease queries rarely match; use broad neuroscience terms instead",
+    "get_conp_dataset_details": "Get detailed metadata (README, license, topics) for a specific CONP dataset repository returned by search_conp_datasets",
+    "query_neurobagel_cohorts": "Query Neurobagel public cohorts by age, sex, and imaging modality. Start broad (no filters = browse all). Avoid diagnosis filters — most public datasets lack diagnosis annotations. Use image_modal URIs for modality filtering",
     "benchmark_dataset_overview": "Overview of available benchmark datasets",
     "check_gpqa_access": "Check access to GPQA benchmark",
 }
@@ -199,6 +205,11 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     # EBRAINS Knowledge Graph (neuroscience datasets, models, software)
     "search_ebrains_kg": "EBRAINS Knowledge Graph",
     "get_ebrains_kg_document": "EBRAINS Knowledge Graph",
+    # CONP (Canadian Open Neuroscience Platform) dataset catalog
+    "search_conp_datasets": "CONP Datasets",
+    "get_conp_dataset_details": "CONP Datasets",
+    # Neurobagel public node (harmonized cohort discovery)
+    "query_neurobagel_cohorts": "Neurobagel",
     # FDA FAERS (post-marketing adverse events)
     "search_fda_adverse_events": "FDA FAERS (openFDA)",
     # PubMed (NCBI E-utilities)

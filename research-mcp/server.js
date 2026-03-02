@@ -37,6 +37,9 @@ const CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data";
 const ABA_API = "https://api.brain-map.org/api/v2";
 const EBRAINS_KG_SEARCH_API = "https://search.kg.ebrains.eu/api";
 const HF_DATASETS_SERVER_API = "https://datasets-server.huggingface.co";
+const GITHUB_API = "https://api.github.com";
+const CONP_GITHUB_ORG = "conpdatasets";
+const NEUROBAGEL_API = "https://api.neurobagel.org";
 const OPENALEX_WORKS_SELECT = [
   "id",
   "display_name",
@@ -5488,6 +5491,411 @@ server.registerTool(
           limitations: [
             "Only publicly released metadata is available. Some linked resources may require EBRAINS account access.",
             "File downloads may require separate authentication via the EBRAINS data proxy.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// CONP (Canadian Open Neuroscience Platform) dataset tools
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "search_conp_datasets",
+  {
+    description:
+      "Searches public CONP (Canadian Open Neuroscience Platform) dataset repositories. " +
+      "CONP datasets are GitHub repositories in the conpdatasets organization, indexed by repository name, description, and topics — NOT by disease or diagnosis terms. " +
+      "Use short neuroscience keywords like 'EEG', 'fMRI', 'MRI', 'PET', 'MEG', 'resting state', 'brain', 'PREVENT-AD', 'POND', 'phantom', or study/cohort names. " +
+      "Disease-specific queries (e.g. 'Parkinson disease') rarely match because repos are named after projects, not conditions. " +
+      "If a disease-specific search returns no results, retry with broader modality or method terms, or browse all repos with a single-word query like 'brain' or 'neuro'.",
+    inputSchema: {
+      query: z.string().describe("Short keyword for repo name/description/topics. Use modality or method terms (e.g. 'EEG', 'fMRI', 'MRI', 'PET'), study names (e.g. 'PREVENT-AD', 'POND'), or broad terms ('brain', 'neuro'). Avoid full disease names."),
+      sortBy: z.enum(["updated", "stars", "name"]).optional().describe("Result ordering. Default 'updated'."),
+      maxResults: z.number().optional().describe("Maximum results to return (default 20, max 50)."),
+    },
+  },
+  async ({ query, sortBy, maxResults }) => {
+    const normalizedQuery = normalizeWhitespace(query || "");
+    if (!normalizedQuery) {
+      return { content: [{ type: "text", text: "Provide a CONP dataset search query." }] };
+    }
+
+    const limit = Math.min(Math.max(1, maxResults || 20), 50);
+    const mode = String(sortBy || "updated").toLowerCase();
+    const q = `${normalizedQuery} org:${CONP_GITHUB_ORG}`;
+    const params = new URLSearchParams({
+      q,
+      per_page: String(limit),
+      page: "1",
+    });
+    if (mode === "updated" || mode === "stars") {
+      params.set("sort", mode);
+      params.set("order", "desc");
+    }
+
+    const url = `${GITHUB_API}/search/repositories?${params.toString()}`;
+    let data;
+    try {
+      data = await fetchJsonWithRetry(url, {
+        retries: 1,
+        timeoutMs: 12000,
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "research-mcp",
+        },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `CONP dataset search failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
+            keyFields: [`Query: ${normalizedQuery}`, `Organization: ${CONP_GITHUB_ORG}`],
+            sources: ["https://github.com/conpdatasets"],
+            limitations: [
+              "GitHub API rate limits may apply to unauthenticated requests.",
+            ],
+          }),
+        }],
+      };
+    }
+
+    const items = Array.isArray(data?.items) ? data.items : [];
+    const total = Number(data?.total_count || 0);
+    if (items.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No CONP datasets found for "${normalizedQuery}".`,
+            keyFields: [`Query: ${normalizedQuery}`, `Organization: ${CONP_GITHUB_ORG}`],
+            sources: ["https://github.com/conpdatasets"],
+            limitations: [
+              "Search is performed against GitHub repository metadata (name, description, topics).",
+            ],
+          }),
+        }],
+      };
+    }
+
+    const lines = items.map((repo, idx) => {
+      const name = repo?.name || "unknown";
+      const desc = normalizeWhitespace(repo?.description || "");
+      const descPreview = desc ? (desc.length > 140 ? `${desc.slice(0, 137)}...` : desc) : "No description.";
+      const stars = Number(repo?.stargazers_count || 0);
+      const updatedAt = repo?.updated_at ? String(repo.updated_at).slice(0, 10) : "unknown";
+      const language = repo?.language || "n/a";
+      const topics = Array.isArray(repo?.topics) ? repo.topics.slice(0, 4).join(", ") : "";
+      const parts = [
+        `${String(idx + 1).padStart(3)}. ${name}`,
+        `     Stars: ${stars} | Language: ${language} | Updated: ${updatedAt}`,
+        `     URL: ${repo?.html_url || "n/a"}`,
+        `     ${descPreview}`,
+      ];
+      if (topics) parts.push(`     Topics: ${topics}`);
+      return parts.join("\n");
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `CONP datasets: ${total} repository match(es) for "${normalizedQuery}" in ${CONP_GITHUB_ORG}. Showing top ${items.length}.`,
+          keyFields: [
+            `Query: ${normalizedQuery}`,
+            `Organization: ${CONP_GITHUB_ORG}`,
+            `Sort: ${mode}`,
+            `Total matches: ${total}`,
+            "\nResults:",
+            ...lines,
+          ],
+          sources: [
+            `https://github.com/search?q=${encodeURIComponent(q)}&type=repositories`,
+            "https://github.com/conpdatasets",
+            "https://conp.ca/",
+          ],
+          limitations: [
+            "This tool indexes CONP datasets represented as GitHub repositories in the conpdatasets organization.",
+            "Repository metadata is not a substitute for full dataset documentation and usage terms.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_conp_dataset_details",
+  {
+    description:
+      "Fetches detailed metadata for a specific CONP dataset repository, including README preview, license, stars, topics, and links. " +
+      "Use this after search_conp_datasets returns repository names you want to inspect further.",
+    inputSchema: {
+      repo: z.string().describe("Repository name from search_conp_datasets results (e.g. 'preventad-open', 'SIMON-dataset'). Can also be full path like 'conpdatasets/preventad-open'."),
+    },
+  },
+  async ({ repo }) => {
+    const rawRepo = normalizeWhitespace(repo || "");
+    if (!rawRepo) {
+      return { content: [{ type: "text", text: "Provide a CONP repository name (e.g. preventad-open)." }] };
+    }
+    const repoName = rawRepo.includes("/") ? rawRepo.split("/").pop() : rawRepo;
+    if (!repoName) {
+      return { content: [{ type: "text", text: "Unable to parse repository name." }] };
+    }
+
+    const repoUrl = `${GITHUB_API}/repos/${CONP_GITHUB_ORG}/${encodeURIComponent(repoName)}`;
+    let repoData;
+    try {
+      repoData = await fetchJsonWithRetry(repoUrl, {
+        retries: 1,
+        timeoutMs: 12000,
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "research-mcp",
+        },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `CONP dataset repository not found: ${CONP_GITHUB_ORG}/${repoName}.`,
+            keyFields: [
+              `Repository: ${CONP_GITHUB_ORG}/${repoName}`,
+              `Error: ${compactErrorMessage(error?.message || "unknown error", 220)}`,
+            ],
+            sources: [
+              `https://github.com/${CONP_GITHUB_ORG}/${repoName}`,
+            ],
+            limitations: [
+              "The repository may be private, renamed, or unavailable.",
+            ],
+          }),
+        }],
+      };
+    }
+
+    let readmePreview = "";
+    try {
+      const readmeUrl = `${GITHUB_API}/repos/${CONP_GITHUB_ORG}/${encodeURIComponent(repoName)}/readme`;
+      const readmeResponse = await fetchWithRetry(readmeUrl, {
+        retries: 1,
+        timeoutMs: 10000,
+        headers: {
+          Accept: "application/vnd.github.raw",
+          "User-Agent": "research-mcp",
+        },
+      });
+      const readmeText = await readmeResponse.text();
+      if (readmeText) {
+        const cleaned = normalizeWhitespace(readmeText.replace(/[#*_`>-]/g, " "));
+        readmePreview = cleaned.length > 420 ? `${cleaned.slice(0, 417)}...` : cleaned;
+      }
+    } catch (_) {
+      // README preview is best-effort only.
+    }
+
+    const topics = Array.isArray(repoData?.topics) ? repoData.topics : [];
+    const keyFields = [
+      `Repository: ${repoData?.full_name || `${CONP_GITHUB_ORG}/${repoName}`}`,
+      `Description: ${normalizeWhitespace(repoData?.description || "No description.")}`,
+      `Stars: ${Number(repoData?.stargazers_count || 0)}`,
+      `Watchers: ${Number(repoData?.subscribers_count || 0)}`,
+      `Open issues: ${Number(repoData?.open_issues_count || 0)}`,
+      `Default branch: ${repoData?.default_branch || "unknown"}`,
+      `Updated: ${repoData?.updated_at ? String(repoData.updated_at).slice(0, 10) : "unknown"}`,
+    ];
+    if (repoData?.license?.name) keyFields.push(`License: ${repoData.license.name}`);
+    if (topics.length > 0) keyFields.push(`Topics: ${topics.slice(0, 8).join(", ")}`);
+    if (repoData?.homepage) keyFields.push(`Homepage: ${repoData.homepage}`);
+    if (readmePreview) keyFields.push(`\nREADME preview:\n${readmePreview}`);
+
+    const sources = [
+      repoData?.html_url || `https://github.com/${CONP_GITHUB_ORG}/${repoName}`,
+      "https://github.com/conpdatasets",
+      "https://conp.ca/",
+    ];
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `CONP dataset details retrieved for ${repoData?.full_name || `${CONP_GITHUB_ORG}/${repoName}`}.`,
+          keyFields,
+          sources,
+          limitations: [
+            "Metadata is sourced from GitHub repository records and may not include complete participant-level access constraints.",
+            "Many CONP datasets require reviewing dataset-specific usage terms before downloading or analysis.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Neurobagel cohort discovery tools
+// ---------------------------------------------------------------------------
+
+function neurobagelFormatTerm(value) {
+  const raw = normalizeWhitespace(value || "");
+  if (!raw) return "";
+  const cleaned = raw
+    .replace(/^https?:\/\/snomed\.info\/id\//i, "snomed:")
+    .replace(/^https?:\/\/purl\.org\/nidash\/nidm#/i, "nidm:")
+    .replace(/^https?:\/\/raw\.githubusercontent\.com\/neurobagel\/.*?\/vocab\/terms\//i, "")
+    .trim();
+  if (cleaned.includes("#")) return cleaned.split("#").pop() || cleaned;
+  if (cleaned.includes("/")) return cleaned.split("/").pop() || cleaned;
+  return cleaned;
+}
+
+server.registerTool(
+  "query_neurobagel_cohorts",
+  {
+    description:
+      "Queries public Neurobagel cohorts using structured demographic and imaging filters. " +
+      "The public Neurobagel node indexes harmonized OpenNeuro datasets — primarily healthy-participant neuroimaging studies. " +
+      "IMPORTANT query strategy: " +
+      "(1) Start with broad demographic/imaging filters (age range, sex, image_modal) rather than diagnosis codes. " +
+      "Most indexed datasets do NOT have diagnosis annotations, so diagnosis filters often return zero results. " +
+      "(2) Use image_modal to find datasets by modality: 'http://purl.org/nidash/nidm#T1Weighted', 'http://purl.org/nidash/nidm#T2Weighted', 'http://purl.org/nidash/nidm#FlowWeighted', 'http://purl.org/nidash/nidm#DiffusionWeighted'. " +
+      "(3) Calling with NO filters returns all indexed cohorts — useful for browsing available datasets. " +
+      "(4) Only use diagnosis if you know the specific SNOMED code is present in the graph (rare for the public node).",
+    inputSchema: {
+      minAge: z.number().optional().describe("Minimum participant age in years."),
+      maxAge: z.number().optional().describe("Maximum participant age in years."),
+      sex: z.string().optional().describe("SNOMED sex term: 'snomed:248152002' (female) or 'snomed:248153007' (male)."),
+      diagnosis: z.string().optional().describe("SNOMED diagnosis term. WARNING: most public-node datasets lack diagnosis annotations — this filter often returns empty results. Only use if you know the term is indexed."),
+      minImagingSessions: z.number().optional().describe("Minimum number of imaging sessions per participant."),
+      minPhenotypicSessions: z.number().optional().describe("Minimum number of phenotypic sessions per participant."),
+      assessment: z.string().optional().describe("Assessment/tool term used in Neurobagel harmonization."),
+      imageModal: z.string().optional().describe("Imaging modality NIDM URI, e.g. 'http://purl.org/nidash/nidm#T1Weighted', 'http://purl.org/nidash/nidm#DiffusionWeighted'."),
+      pipelineName: z.string().optional().describe("Pipeline name URI from Neurobagel pipeline catalog."),
+      pipelineVersion: z.string().optional().describe("Pipeline version string."),
+      maxResults: z.number().optional().describe("Maximum records to display (default 25, max 100)."),
+    },
+  },
+  async ({
+    minAge,
+    maxAge,
+    sex,
+    diagnosis,
+    minImagingSessions,
+    minPhenotypicSessions,
+    assessment,
+    imageModal,
+    pipelineName,
+    pipelineVersion,
+    maxResults,
+  }) => {
+    const params = new URLSearchParams();
+    if (Number.isFinite(minAge)) params.set("min_age", String(minAge));
+    if (Number.isFinite(maxAge)) params.set("max_age", String(maxAge));
+    if (normalizeWhitespace(sex)) params.set("sex", normalizeWhitespace(sex));
+    if (normalizeWhitespace(diagnosis)) params.set("diagnosis", normalizeWhitespace(diagnosis));
+    if (Number.isFinite(minImagingSessions)) params.set("min_num_imaging_sessions", String(minImagingSessions));
+    if (Number.isFinite(minPhenotypicSessions)) params.set("min_num_phenotypic_sessions", String(minPhenotypicSessions));
+    if (normalizeWhitespace(assessment)) params.set("assessment", normalizeWhitespace(assessment));
+    if (normalizeWhitespace(imageModal)) params.set("image_modal", normalizeWhitespace(imageModal));
+    if (normalizeWhitespace(pipelineName)) params.set("pipeline_name", normalizeWhitespace(pipelineName));
+    if (normalizeWhitespace(pipelineVersion)) params.set("pipeline_version", normalizeWhitespace(pipelineVersion));
+
+    const limit = Math.min(Math.max(1, maxResults || 25), 100);
+    const url = `${NEUROBAGEL_API}/query${params.toString() ? `?${params.toString()}` : ""}`;
+
+    let rows;
+    try {
+      rows = await fetchJsonWithRetry(url, {
+        retries: 1,
+        timeoutMs: 20000,
+        headers: { Accept: "application/json" },
+      });
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Neurobagel query failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
+            keyFields: [`Query URL: ${url}`],
+            sources: [
+              "https://api.neurobagel.org/docs",
+              "https://neurobagel.org/user_guide/api/",
+            ],
+            limitations: [
+              "Neurobagel API may reject invalid controlled terms or temporary network interruptions.",
+            ],
+          }),
+        }],
+      };
+    }
+
+    const matches = Array.isArray(rows) ? rows : [];
+    if (matches.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: "No Neurobagel cohorts matched the provided filters.",
+            keyFields: [
+              `Filters: ${params.toString() || "(none)"}`,
+            ],
+            sources: ["https://api.neurobagel.org/docs"],
+            limitations: [
+              "Public node results reflect currently indexed harmonized datasets and may change over time.",
+            ],
+          }),
+        }],
+      };
+    }
+
+    const shown = matches.slice(0, limit);
+    const lines = shown.map((row, i) => {
+      const dataset = row?.dataset_name || "Unnamed dataset";
+      const uuid = neurobagelFormatTerm(row?.dataset_uuid || "");
+      const totalSubjects = Number(row?.dataset_total_subjects || 0);
+      const matchedSubjects = Number(row?.num_matching_subjects || 0);
+      const modalities = Array.isArray(row?.image_modals)
+        ? row.image_modals.slice(0, 4).map((m) => neurobagelFormatTerm(m)).join(", ")
+        : "";
+      const protectedFlag = row?.records_protected ? "yes" : "no";
+      const parts = [
+        `${String(i + 1).padStart(3)}. ${dataset}`,
+        `     Dataset ID: ${uuid || "unknown"} | Matched subjects: ${matchedSubjects} | Total subjects: ${totalSubjects}`,
+        `     Records protected: ${protectedFlag}`,
+      ];
+      if (modalities) parts.push(`     Modalities: ${modalities}`);
+      if (row?.dataset_portal_uri) parts.push(`     Portal: ${row.dataset_portal_uri}`);
+      return parts.join("\n");
+    });
+
+    const uniqueDatasets = new Set(matches.map((r) => r?.dataset_uuid).filter(Boolean)).size;
+    const totalMatched = matches.reduce((acc, r) => acc + Number(r?.num_matching_subjects || 0), 0);
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `Neurobagel returned ${matches.length} cohort record(s) across ${uniqueDatasets} dataset(s). Showing top ${shown.length}.`,
+          keyFields: [
+            `Filters: ${params.toString() || "(none)"}`,
+            `Unique datasets: ${uniqueDatasets}`,
+            `Total matching subjects (sum across records): ${totalMatched}`,
+            "\nResults:",
+            ...lines,
+          ],
+          sources: [
+            url,
+            "https://api.neurobagel.org/docs",
+            "https://neurobagel.org/user_guide/public_nodes/",
+          ],
+          limitations: [
+            "Public Neurobagel node currently reflects harmonized OpenNeuro-linked cohorts and may not include all private/institutional nodes.",
+            "Subject-level records may be redacted or aggregated depending on dataset protection rules.",
           ],
         }),
       }],

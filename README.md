@@ -6,7 +6,7 @@ An agentic AI research assistant that synthesizes evidence across biomedical dat
 
 The AI Co-Scientist helps biomedical researchers evaluate therapeutic targets and research directions before human trials by:
 
-- **Synthesizing evidence across 28 databases** — genomics, literature, clinical trials, neuroscience, protein structure, pathways, safety, and more
+- **Synthesizing evidence across 30 databases** — genomics, literature, clinical trials, neuroscience, protein structure, pathways, safety, and more
 - **Generating query-specific execution plans** with explicit tool and data-source proposals
 - **Requiring human plan approval or revision** before evidence tools run
 - **Running iterative evidence-gathering loops** via a ReAct (Reason → Act → Observe) cycle
@@ -29,7 +29,7 @@ The AI Co-Scientist helps biomedical researchers evaluate therapeutic targets an
 | **Clinical Variant Interpretation** | CIViC, ClinVar |
 | **Cancer Genomics** | cBioPortal |
 | **Target Discovery & Druggability** | GWAS Catalog, DGIdb, GTEx |
-| **Neuroscience Atlases & Knowledge Graphs** | Allen Brain Atlas, EBRAINS Knowledge Graph |
+| **Neuroscience Atlases & Knowledge Graphs** | Allen Brain Atlas, EBRAINS Knowledge Graph, CONP, Neurobagel |
 
 This stack combines live REST APIs (literature, trials, protein/pathway, neuroscience) with BigQuery public datasets (genomics, chemistry, safety, perturbation, and patent-derived chemistry).
 
@@ -135,6 +135,8 @@ The reasoning trace captures the full decision chain per step and is stored alon
 | **Safety Signals** | `search_fda_adverse_events` | openFDA FAERS (post-marketing adverse event reports) |
 | **Brain Atlases** | `search_aba_genes`, `search_aba_structures`, `get_aba_gene_expression`, `search_aba_differential_expression` | Allen Brain Atlas (structure ontology, ISH expression, differential enrichment) |
 | **Neuroscience Knowledge Graph** | `search_ebrains_kg`, `get_ebrains_kg_document` | EBRAINS KG (datasets, models, software, contributors, projects) |
+| **Neuroscience Datasets (CONP)** | `search_conp_datasets`, `get_conp_dataset_details` | CONP datasets via `conpdatasets` GitHub catalog |
+| **Cohort Discovery (Neurobagel)** | `query_neurobagel_cohorts` | Neurobagel public node API (harmonized cohort-level dataset discovery) |
 | **Benchmarks** | `benchmark_dataset_overview`, `check_gpqa_access` | Hugging Face Datasets |
 
 ### BigQuery Datasets
