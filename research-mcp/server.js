@@ -34,6 +34,8 @@ const RCSB_DATA_API = "https://data.rcsb.org/rest/v1";
 const CBIOPORTAL_API = "https://www.cbioportal.org/api";
 const PUBCHEM_API = "https://pubchem.ncbi.nlm.nih.gov/rest/pug";
 const CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data";
+const ABA_API = "http://api.brain-map.org/api/v2";
+const EBRAINS_KG_SEARCH_API = "https://search.kg.ebrains.eu/api";
 const HF_DATASETS_SERVER_API = "https://datasets-server.huggingface.co";
 const HF_DATASET_PUBMEDQA = String(process.env.HF_DATASET_PUBMEDQA || "qiaojin/PubMedQA").trim();
 const HF_DATASET_BIOASQ = String(process.env.HF_DATASET_BIOASQ || "kroshan/BioASQ").trim();
@@ -4643,6 +4645,815 @@ server.registerTool(
             "FAERS is a spontaneous reporting system — counts reflect reports, not incidence rates.",
             "Reporting bias: serious events and events with new drugs are over-represented.",
             "A report does not prove causation between the drug and the adverse event.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Allen Brain Atlas (ABA) tools
+// ---------------------------------------------------------------------------
+
+const ABA_PRODUCT_IDS = {
+  mouse: 1,
+  human: 3,
+  developing_mouse: 5,
+  mouse_connectivity: 7,
+};
+
+function abaProductId(organism) {
+  const key = String(organism || "mouse").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return ABA_PRODUCT_IDS[key] ?? ABA_PRODUCT_IDS.mouse;
+}
+
+server.registerTool(
+  "search_aba_genes",
+  {
+    description:
+      "Searches the Allen Brain Atlas for genes by name, acronym, or keyword. Returns gene metadata including Entrez ID, acronym, and full name. Covers the Mouse Brain Atlas (default), Human Brain Atlas, Developing Mouse Brain Atlas, and Mouse Connectivity Atlas.",
+    inputSchema: {
+      query: z.string().describe("Gene name, acronym, or keyword (e.g. 'Pdyn', 'prodynorphin', 'dopamine')."),
+      organism: z
+        .enum(["mouse", "human", "developing_mouse", "mouse_connectivity"])
+        .optional()
+        .describe("Atlas product to search. Default 'mouse'."),
+      maxResults: z.number().optional().describe("Max results (default 20, max 100)."),
+    },
+  },
+  async ({ query, organism, maxResults }) => {
+    const limit = Math.min(Math.max(1, maxResults || 20), 100);
+    const productId = abaProductId(organism);
+
+    const nameUrl =
+      `${ABA_API}/data/Gene/query.json` +
+      `?criteria=products[id$eq${productId}],[name$il'*${encodeURIComponent(query)}*']` +
+      `&num_rows=${limit}`;
+    const acronymUrl =
+      `${ABA_API}/data/Gene/query.json` +
+      `?criteria=products[id$eq${productId}],[acronym$il'*${encodeURIComponent(query)}*']` +
+      `&num_rows=${limit}`;
+
+    const [byName, byAcronym] = await Promise.all([
+      fetchJsonWithRetry(nameUrl, { timeoutMs: 15000 }).catch(() => ({ msg: [] })),
+      fetchJsonWithRetry(acronymUrl, { timeoutMs: 15000 }).catch(() => ({ msg: [] })),
+    ]);
+
+    const seen = new Set();
+    const genes = [];
+    for (const g of [...(Array.isArray(byName.msg) ? byName.msg : []), ...(Array.isArray(byAcronym.msg) ? byAcronym.msg : [])]) {
+      if (!g?.id || seen.has(g.id)) continue;
+      seen.add(g.id);
+      genes.push(g);
+      if (genes.length >= limit) break;
+    }
+
+    if (genes.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No genes found in the Allen Brain Atlas for "${query}" (product: ${organism || "mouse"}).`,
+            keyFields: [`Query: ${query}`, `Product: ${organism || "mouse"}`],
+            sources: [`${ABA_API}/data/Gene/query.json`],
+            limitations: ["Search uses case-insensitive LIKE matching on name and acronym fields."],
+          }),
+        }],
+      };
+    }
+
+    const lines = genes.map((g, i) => {
+      const parts = [`${String(i + 1).padStart(3)}. ${g.acronym} — ${g.name}`];
+      if (g.entrez_id) parts.push(`Entrez: ${g.entrez_id}`);
+      if (g.homologene_id) parts.push(`HomoloGene: ${g.homologene_id}`);
+      parts.push(`ABA ID: ${g.id}`);
+      return parts.join(" | ");
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `Allen Brain Atlas: ${genes.length} gene(s) matching "${query}" (${organism || "mouse"} atlas).`,
+          keyFields: [`Query: ${query}`, `Product: ${organism || "mouse"}`, `Results: ${genes.length}`, ...lines],
+          sources: [
+            `http://api.brain-map.org/api/v2/data/Gene/query.json`,
+            "https://mouse.brain-map.org/",
+          ],
+          limitations: [
+            "Only genes with ISH experiments in the selected atlas product are returned.",
+            "Search is by name/acronym substring match — use the gene acronym for precise results.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "search_aba_structures",
+  {
+    description:
+      "Searches the Allen Brain Atlas structure ontology for brain regions by name or acronym. Returns structure hierarchy, depth, acronym, and ID. Useful for identifying structure IDs needed by other ABA tools.",
+    inputSchema: {
+      query: z.string().describe("Brain structure name or acronym (e.g. 'hippocampus', 'CA1', 'thalamus')."),
+      ontologyId: z
+        .number()
+        .optional()
+        .describe("Ontology ID. Default 1 (adult mouse). Use 12 for developing mouse."),
+      maxResults: z.number().optional().describe("Max results (default 20, max 100)."),
+    },
+  },
+  async ({ query, ontologyId, maxResults }) => {
+    const limit = Math.min(Math.max(1, maxResults || 20), 100);
+    const ontId = ontologyId || 1;
+
+    async function searchStructures(term) {
+      const encoded = encodeURIComponent(term);
+      const nameUrl =
+        `${ABA_API}/data/Structure/query.json` +
+        `?criteria=[ontology_id$eq${ontId}],[name$il'*${encoded}*']` +
+        `&num_rows=${limit}&order=depth`;
+      const acronymUrl =
+        `${ABA_API}/data/Structure/query.json` +
+        `?criteria=[ontology_id$eq${ontId}],[acronym$il'*${encoded}*']` +
+        `&num_rows=${limit}&order=depth`;
+      const [byName, byAcronym] = await Promise.all([
+        fetchJsonWithRetry(nameUrl, { timeoutMs: 15000 }).catch(() => ({ msg: [] })),
+        fetchJsonWithRetry(acronymUrl, { timeoutMs: 15000 }).catch(() => ({ msg: [] })),
+      ]);
+      return [...(Array.isArray(byName.msg) ? byName.msg : []), ...(Array.isArray(byAcronym.msg) ? byAcronym.msg : [])];
+    }
+
+    let raw = await searchStructures(query);
+
+    if (raw.length === 0 && query.length > 4) {
+      const stem = query.replace(/(us|al|um|ar|ic|is|ine|eum|ular|ial)$/i, "");
+      if (stem.length >= 4 && stem !== query) {
+        raw = await searchStructures(stem);
+      }
+    }
+
+    const seen = new Set();
+    const structures = [];
+    for (const s of raw) {
+      if (!s?.id || seen.has(s.id)) continue;
+      seen.add(s.id);
+      structures.push(s);
+      if (structures.length >= limit) break;
+    }
+
+    if (structures.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No brain structures found in the Allen ontology for "${query}" (ontology ${ontId}).`,
+            keyFields: [`Query: ${query}`, `Ontology ID: ${ontId}`],
+            sources: [`${ABA_API}/data/Structure/query.json`],
+            limitations: ["Search uses case-insensitive LIKE matching on name and acronym."],
+          }),
+        }],
+      };
+    }
+
+    const lines = structures.map((s, i) => {
+      const path = s.structure_id_path || "";
+      return `${String(i + 1).padStart(3)}. ${s.acronym} — ${s.name} (ID: ${s.id}, depth: ${s.depth}, color: #${s.color_hex_triplet || "000000"}, path: ${path})`;
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `Allen Brain Atlas ontology: ${structures.length} structure(s) matching "${query}".`,
+          keyFields: [`Query: ${query}`, `Ontology ID: ${ontId}`, `Results: ${structures.length}`, ...lines],
+          sources: [
+            `http://api.brain-map.org/api/v2/data/Structure/query.json`,
+            "https://mouse.brain-map.org/",
+          ],
+          limitations: [
+            "Structures are part of a hierarchical ontology; a parent structure's expression includes all descendants.",
+            "Use the structure ID in get_aba_gene_expression for quantified expression queries.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_aba_gene_expression",
+  {
+    description:
+      "Retrieves quantified gene expression data from the Allen Brain Atlas. Given a gene acronym, returns expression energy, density, and intensity across brain structures (StructureUnionize data). Optionally filter to a specific structure or sort by expression metric.",
+    inputSchema: {
+      geneAcronym: z.string().describe("Gene acronym (e.g. 'Pdyn', 'Gad1', 'Slc17a7')."),
+      organism: z
+        .enum(["mouse", "human", "developing_mouse", "mouse_connectivity"])
+        .optional()
+        .describe("Atlas product. Default 'mouse'."),
+      structureId: z
+        .number()
+        .optional()
+        .describe("Filter to a specific structure ID and its descendants. Omit for whole-brain."),
+      planeOfSection: z
+        .enum(["sagittal", "coronal"])
+        .optional()
+        .describe("Plane of section. Default: sagittal (delegate experiment)."),
+      maxStructures: z.number().optional().describe("Max structures to return (default 25, max 200)."),
+      sortBy: z
+        .enum(["expression_energy", "expression_density"])
+        .optional()
+        .describe("Sort metric. Default 'expression_energy'."),
+    },
+  },
+  async ({ geneAcronym, organism, structureId, planeOfSection, maxStructures, sortBy }) => {
+    const productId = abaProductId(organism);
+    const limit = Math.min(Math.max(1, maxStructures || 25), 200);
+    const sortField = sortBy || "expression_energy";
+
+    const planeFilter = planeOfSection
+      ? `,plane_of_section[name$eq'${planeOfSection}']`
+      : "";
+    const datasetUrl =
+      `${ABA_API}/data/SectionDataSet/query.json` +
+      `?criteria=products[id$eq${productId}],genes[acronym$eq'${encodeURIComponent(geneAcronym)}']${planeFilter}` +
+      `&include=genes` +
+      `&num_rows=1`;
+
+    const datasetRes = await fetchJsonWithRetry(datasetUrl, { timeoutMs: 15000 });
+    const datasets = datasetRes.msg || [];
+
+    if (datasets.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No ISH experiments found for gene "${geneAcronym}" in the Allen Brain Atlas (${organism || "mouse"}).`,
+            keyFields: [`Gene: ${geneAcronym}`, `Product: ${organism || "mouse"}`],
+            sources: [`${ABA_API}/data/SectionDataSet/query.json`],
+            limitations: ["Ensure the gene acronym is valid and exists in the selected atlas product."],
+          }),
+        }],
+      };
+    }
+
+    const dataset = datasets[0];
+    const datasetId = dataset.id;
+
+    let unionizeCriteria = `[section_data_set_id$eq${datasetId}]`;
+    if (structureId) {
+      unionizeCriteria += `,[structure_id$eq${structureId}]`;
+    }
+
+    const unionizeUrl =
+      `${ABA_API}/data/StructureUnionize/query.json` +
+      `?criteria=${unionizeCriteria}` +
+      `&include=structure` +
+      `&order=${sortField}$desc` +
+      `&num_rows=${limit}`;
+
+    const unionizeRes = await fetchJsonWithRetry(unionizeUrl, { timeoutMs: 20000 });
+    const records = unionizeRes.msg || [];
+
+    if (records.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No expression data returned for gene "${geneAcronym}" (dataset ${datasetId})${structureId ? ` in structure ${structureId}` : ""}.`,
+            keyFields: [`Gene: ${geneAcronym}`, `Dataset ID: ${datasetId}`],
+            sources: [`${ABA_API}/data/StructureUnionize/query.json`],
+            limitations: ["The dataset may lack unionize data for the specified structure."],
+          }),
+        }],
+      };
+    }
+
+    const plane = planeOfSection || (dataset.plane_of_section_id === 1 ? "coronal" : "sagittal");
+    const geneName = dataset.genes?.[0]?.name || geneAcronym;
+
+    const lines = records.map((r, i) => {
+      const s = r.structure || {};
+      const energy = r.expression_energy != null ? r.expression_energy.toFixed(4) : "N/A";
+      const density = r.expression_density != null ? r.expression_density.toFixed(6) : "N/A";
+      return `${String(i + 1).padStart(3)}. ${(s.acronym || "?").padEnd(12)} ${(s.name || "unknown").padEnd(45)} energy=${energy}  density=${density}`;
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `Allen Brain Atlas expression for ${geneAcronym} (${geneName}): top ${records.length} structures by ${sortField} (${plane}, dataset ${datasetId}).`,
+          keyFields: [
+            `Gene: ${geneAcronym} (${geneName})`,
+            `Dataset ID: ${datasetId}`,
+            `Plane: ${plane}`,
+            `Sorted by: ${sortField}`,
+            `Structures returned: ${records.length}`,
+            `\nExpression by structure:`,
+            ...lines,
+          ],
+          sources: [
+            `http://mouse.brain-map.org/experiment/show/${datasetId}`,
+            `http://api.brain-map.org/api/v2/data/StructureUnionize/query.json`,
+            "https://mouse.brain-map.org/",
+          ],
+          limitations: [
+            "Expression values are derived from automated ISH image analysis — false positives/negatives can occur.",
+            "Expression energy = intensity × density; compare within the same experiment for consistency.",
+            "Only the delegate (highest quality) experiment is queried unless a specific plane is requested.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "search_aba_differential_expression",
+  {
+    description:
+      "Finds genes differentially expressed between two brain structures in the Allen Mouse Brain Atlas. Uses the mouse_differential connected service to compute fold-change of expression energy in a target structure vs. a contrast structure. Returns genes ranked by enrichment in the target region.",
+    inputSchema: {
+      targetStructure: z.string().describe("Target structure name (e.g. 'thalamus'). Genes enriched here will be returned."),
+      contrastStructure: z.string().describe("Contrast structure name (e.g. 'isocortex'). Used as the comparison baseline."),
+      startRow: z.number().optional().describe("Pagination offset (default 0)."),
+      numRows: z.number().optional().describe("Number of results (default 25, max 100)."),
+    },
+  },
+  async ({ targetStructure, contrastStructure, startRow, numRows }) => {
+    const limit = Math.min(Math.max(1, numRows || 25), 100);
+    const offset = Math.max(0, startRow || 0);
+
+    async function lookupStructure(name) {
+      const encoded = encodeURIComponent(name);
+      const normalizedQuery = normalizeWhitespace(name).toLowerCase();
+      const queryStem = normalizedQuery.replace(/(us|al|um|ar|ic|is|ine|eum|ular|ial|s)$/i, "");
+      const coverageCache = new Map();
+
+      function structureScore(s) {
+        const nameValue = normalizeWhitespace(s?.name || "").toLowerCase();
+        const acronymValue = normalizeWhitespace(s?.acronym || "").toLowerCase();
+        const safeNameValue = normalizeWhitespace(s?.safe_name || "").toLowerCase();
+        const depth = Number.isFinite(Number(s?.depth)) ? Number(s.depth) : 0;
+        const stLevel = Number.isFinite(Number(s?.st_level)) ? Number(s.st_level) : 0;
+
+        let score = 0;
+        if (nameValue === normalizedQuery) score += 1000;
+        if (safeNameValue === normalizedQuery) score += 900;
+        if (acronymValue === normalizedQuery) score += 850;
+        if (nameValue.startsWith(normalizedQuery)) score += 700;
+        if (nameValue.includes(` ${normalizedQuery}`) || nameValue.includes(`${normalizedQuery} `)) score += 600;
+        if (nameValue.includes(normalizedQuery)) score += 500;
+        if (queryStem && nameValue.includes(queryStem)) score += 420;
+        if (queryStem && safeNameValue.includes(queryStem)) score += 380;
+        if (queryStem && acronymValue.includes(queryStem)) score += 300;
+
+        // Prefer canonical anatomical nodes over very specific tracts/surfaces for broad queries.
+        if (/region|formation|nucleus|area|complex|cortex/.test(nameValue)) score += 110;
+        if (/fissure|commissure|tract|bundle|ventricle|fiber|sulcus/.test(nameValue)) score -= 220;
+        if (/transition|retro|septo/.test(nameValue)) score -= 120;
+
+        // Slight preference for mid-level ontology nodes.
+        score += Math.min(60, Math.max(0, stLevel));
+        score -= Math.max(0, depth - 9) * 5;
+        return score;
+      }
+
+      async function getCoverageScore(structureId) {
+        if (coverageCache.has(structureId)) return coverageCache.get(structureId);
+        const url =
+          `${ABA_API}/data/StructureUnionize/query.json` +
+          `?criteria=[structure_id$eq${structureId}]&num_rows=1`;
+        const res = await fetchJsonWithRetry(url, { timeoutMs: 15000 }).catch(() => null);
+        const total = Number.isFinite(Number(res?.total_rows)) ? Number(res.total_rows) : 0;
+        coverageCache.set(structureId, total);
+        return total;
+      }
+
+      async function pickBestCandidate(candidates) {
+        if (!Array.isArray(candidates) || candidates.length === 0) return null;
+        if (candidates.length === 1) return candidates[0];
+
+        const ranked = candidates
+          .map((s) => ({ structure: s, lexical: structureScore(s) }))
+          .sort((a, b) => b.lexical - a.lexical);
+
+        const shortlist = ranked.slice(0, Math.min(6, ranked.length));
+        const withCoverage = await Promise.all(
+          shortlist.map(async (entry) => ({
+            ...entry,
+            coverage: await getCoverageScore(entry.structure.id),
+          }))
+        );
+
+        withCoverage.sort((a, b) => {
+          if (b.lexical !== a.lexical) return b.lexical - a.lexical;
+          if (b.coverage !== a.coverage) return b.coverage - a.coverage;
+          return 0;
+        });
+        return withCoverage[0]?.structure || ranked[0]?.structure || null;
+      }
+
+      const exactUrl =
+        `${ABA_API}/data/Structure/query.json` +
+        `?criteria=[ontology_id$eq1],[name$il'${encoded}']` +
+        `&num_rows=25`;
+      const exactRes = await fetchJsonWithRetry(exactUrl, { timeoutMs: 15000 }).catch(() => ({ msg: [] }));
+      const exactRows = Array.isArray(exactRes.msg) ? exactRes.msg : [];
+      if (exactRows.length > 0) {
+        return pickBestCandidate(exactRows);
+      }
+
+      const wildcardUrl =
+        `${ABA_API}/data/Structure/query.json` +
+        `?criteria=[ontology_id$eq1],[name$il'*${encoded}*']` +
+        `&num_rows=50`;
+      const wildcardRes = await fetchJsonWithRetry(wildcardUrl, { timeoutMs: 15000 }).catch(() => ({ msg: [] }));
+      const wildcardRows = Array.isArray(wildcardRes.msg) ? wildcardRes.msg : [];
+      if (wildcardRows.length > 0) {
+        return pickBestCandidate(wildcardRows);
+      }
+
+      if (name.length > 4) {
+        const stem = name.replace(/(us|al|um|ar|ic|is|ine|eum|ular|ial|s)$/i, "");
+        if (stem.length >= 4 && stem !== name) {
+          const stemUrl =
+            `${ABA_API}/data/Structure/query.json` +
+            `?criteria=[ontology_id$eq1],[name$il'*${encodeURIComponent(stem)}*']` +
+            `&num_rows=50`;
+          const stemRes = await fetchJsonWithRetry(stemUrl, { timeoutMs: 15000 }).catch(() => ({ msg: [] }));
+          const stemRows = Array.isArray(stemRes.msg) ? stemRes.msg : [];
+          if (stemRows.length > 0) {
+            return pickBestCandidate(stemRows);
+          }
+        }
+      }
+
+      const acronymUrl =
+        `${ABA_API}/data/Structure/query.json` +
+        `?criteria=[ontology_id$eq1],[acronym$il'*${encoded}*']` +
+        `&num_rows=25`;
+      const acronymRes = await fetchJsonWithRetry(acronymUrl, { timeoutMs: 15000 }).catch(() => ({ msg: [] }));
+      const acronymRows = Array.isArray(acronymRes.msg) ? acronymRes.msg : [];
+      if (acronymRows.length > 0) {
+        return pickBestCandidate(acronymRows);
+      }
+
+      return null;
+    }
+
+    const [targetStruct, contrastStruct] = await Promise.all([
+      lookupStructure(targetStructure),
+      lookupStructure(contrastStructure),
+    ]);
+
+    if (!targetStruct) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Could not find target structure "${targetStructure}" in the Allen Brain Atlas ontology.`,
+            keyFields: [`Query: ${targetStructure}`],
+            sources: [`${ABA_API}/data/Structure/query.json`],
+            limitations: ["Use search_aba_structures to find valid structure names. Allen uses terms like 'Hippocampal region' rather than 'hippocampus'."],
+          }),
+        }],
+      };
+    }
+    if (!contrastStruct) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Could not find contrast structure "${contrastStructure}" in the Allen Brain Atlas ontology.`,
+            keyFields: [`Query: ${contrastStructure}`],
+            sources: [`${ABA_API}/data/Structure/query.json`],
+            limitations: ["Use search_aba_structures to find valid structure names. Allen uses terms like 'Hippocampal region' rather than 'hippocampus'."],
+          }),
+        }],
+      };
+    }
+
+    function normalizeServiceRows(rows) {
+      return rows.map((r) => ({
+        geneSymbol: r["gene-symbol"] || "",
+        geneName: r["gene-name"] || "",
+        foldChange: Number.parseFloat(r["fold-change"]),
+        targetValue: Number.parseFloat(r["target-sum"]),
+        contrastValue: Number.parseFloat(r["contrast-sum"]),
+        plane: r["plane-of-section"] || "",
+        source: "mouse_differential_service",
+      }));
+    }
+
+    async function fetchServiceRowsWithRetries(maxAttempts = 4) {
+      const diffUrl =
+        `${ABA_API}/data/query.json` +
+        `?criteria=service::mouse_differential` +
+        `[set$eqmouse]` +
+        `[structures1$eq${contrastStruct.id}][threshold1$eq0,50]` +
+        `[structures2$eq${targetStruct.id}][threshold2$eq1,50]`;
+      let lastErr = "";
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const res = await fetchJsonWithRetry(diffUrl, { timeoutMs: 45000 }).catch((err) => ({
+          msg: `Request error: ${err?.message || String(err)}`,
+        }));
+        if (Array.isArray(res?.msg)) {
+          return { rows: normalizeServiceRows(res.msg), error: "" };
+        }
+        lastErr = typeof res?.msg === "string" ? res.msg : "Unknown differential service error.";
+        if (attempt < maxAttempts) {
+          await sleep(Math.min(5000, 700 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250));
+        }
+      }
+      return { rows: [], error: lastErr || "Differential service unavailable after retries." };
+    }
+
+    const serviceAttempt = await fetchServiceRowsWithRetries();
+    const allRows = serviceAttempt.rows;
+    if (allRows.length === 0) {
+      const errMsg = serviceAttempt.error || "Unknown Allen Brain Atlas differential service error.";
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Allen Brain Atlas differential service error: ${errMsg.slice(0, 200)}`,
+            keyFields: [
+              `Target: ${targetStruct.name} (${targetStruct.acronym}, ID: ${targetStruct.id})`,
+              `Contrast: ${contrastStruct.name} (${contrastStruct.acronym}, ID: ${contrastStruct.id})`,
+            ],
+            sources: [`${ABA_API}/data/query.json?criteria=service::mouse_differential`],
+            limitations: [
+              "The differential service may be temporarily unavailable.",
+              "No local fallback approximation is enabled.",
+            ],
+          }),
+        }],
+      };
+    }
+
+    const results = allRows.slice(offset, offset + limit);
+
+    if (results.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No differentially expressed genes found between ${targetStruct.name} (target) and ${contrastStruct.name} (contrast)${offset > 0 ? ` at offset ${offset}` : ""}.`,
+            keyFields: [
+              `Target: ${targetStruct.name} (${targetStruct.acronym}, ID: ${targetStruct.id})`,
+              `Contrast: ${contrastStruct.name} (${contrastStruct.acronym}, ID: ${contrastStruct.id})`,
+              `Total rows available: ${allRows.length}`,
+            ],
+            sources: [`${ABA_API}/data/query.json?criteria=service::mouse_differential`],
+            limitations: ["The differential service compares expression energy averaged over voxels."],
+          }),
+        }],
+      };
+    }
+
+    const lines = results.map((r, i) => {
+      const fc = Number.isFinite(r.foldChange) ? r.foldChange.toFixed(2) : "N/A";
+      const targetValue = Number.isFinite(r.targetValue) ? r.targetValue.toFixed(2) : "N/A";
+      const contrastValue = Number.isFinite(r.contrastValue) ? r.contrastValue.toFixed(2) : "N/A";
+      const gene = (r.geneSymbol || `ID:${i + offset + 1}`).slice(0, 14);
+      const geneName = (r.geneName || "").slice(0, 38);
+      return `${String(i + 1 + offset).padStart(3)}. ${gene.padEnd(14)} ${geneName.padEnd(40)} FC=${fc}  target=${targetValue}  contrast=${contrastValue}  (${r.plane || ""})`;
+    });
+    const limitations = [
+      "Fold-change is based on automated ISH expression energy; visual inspection of images is recommended for confirmation.",
+      "The differential service uses a subset of voxels loaded in memory (~26,000) and may miss low-abundance transcripts.",
+      "This service is available only for the Mouse Brain Atlas (adult ISH, ~25,000 datasets).",
+    ];
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `Allen Brain Atlas differential expression: ${allRows.length} total genes enriched in ${targetStruct.name} (${targetStruct.acronym}) vs ${contrastStruct.name} (${contrastStruct.acronym}). Showing ${offset + 1}–${offset + results.length}.`,
+          keyFields: [
+            `Target: ${targetStruct.name} (${targetStruct.acronym}, ID: ${targetStruct.id})`,
+            `Contrast: ${contrastStruct.name} (${contrastStruct.acronym}, ID: ${contrastStruct.id})`,
+            `Total genes: ${allRows.length}`,
+            `Showing: ${offset + 1}–${offset + results.length}`,
+            `\nDifferentially expressed genes (by fold-change):`,
+            ...lines,
+          ],
+          sources: [
+            `http://mouse.brain-map.org/search/show?search_type=differential&domain1=${contrastStruct.id}&domain2=${targetStruct.id}`,
+            `http://api.brain-map.org/api/v2/data/query.json?criteria=service::mouse_differential`,
+            "https://mouse.brain-map.org/",
+          ],
+          limitations,
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// EBRAINS Knowledge Graph tools
+// ---------------------------------------------------------------------------
+
+const EBRAINS_KG_VALID_TYPES = new Set([
+  "Dataset", "Model", "Software", "Contributor", "Project",
+  "Learning Resource", "Web service", "Workflow", "(Meta)Data Model",
+]);
+
+server.registerTool(
+  "search_ebrains_kg",
+  {
+    description:
+      "Searches the EBRAINS Knowledge Graph for neuroscience datasets, computational models, software tools, contributors, and projects. The Knowledge Graph aggregates curated, FAIR-compliant neuroscience resources from the Human Brain Project and EBRAINS ecosystem.",
+    inputSchema: {
+      query: z.string().describe("Search query (e.g. 'hippocampus', 'Parkinson', 'EEG resting state')."),
+      type: z
+        .enum(["Dataset", "Model", "Software", "Contributor", "Project", "Learning Resource", "Web service", "Workflow", "(Meta)Data Model"])
+        .optional()
+        .describe("Filter by resource type. Omit to search across all types."),
+      from: z.number().optional().describe("Pagination offset (default 0)."),
+      size: z.number().optional().describe("Number of results (default 20, max 50)."),
+    },
+  },
+  async ({ query, type, from: offset, size }) => {
+    const limit = Math.min(Math.max(1, size || 20), 50);
+    const pageFrom = Math.max(0, offset || 0);
+    const typeParam = type && EBRAINS_KG_VALID_TYPES.has(type) ? `&type=${encodeURIComponent(type)}` : "";
+
+    const url =
+      `${EBRAINS_KG_SEARCH_API}/groups/public/search` +
+      `?q=${encodeURIComponent(query)}${typeParam}&from=${pageFrom}&size=${limit}`;
+
+    const res = await fetchWithRetry(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+      timeoutMs: 20000,
+    });
+    const data = await res.json();
+
+    const hits = data.hits || [];
+    const total = data.total || 0;
+    const types = data.types || {};
+
+    if (hits.length === 0) {
+      const typeCounts = Object.entries(types)
+        .map(([t, v]) => `${t}: ${v.count}`)
+        .join(", ");
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `No EBRAINS Knowledge Graph results for "${query}"${type ? ` (type: ${type})` : ""}.${typeCounts ? ` Available counts across types: ${typeCounts}` : ""}`,
+            keyFields: [`Query: ${query}`, type ? `Type filter: ${type}` : "Type: all"],
+            sources: ["https://search.kg.ebrains.eu/"],
+            limitations: ["Only publicly released resources are searched."],
+          }),
+        }],
+      };
+    }
+
+    const lines = hits.map((hit, i) => {
+      const title = hit.title || "Untitled";
+      const hitType = hit.type || hit.category || "Unknown";
+      const desc = hit.fields?.description?.value || "";
+      const snippet = desc.length > 150 ? desc.slice(0, 147) + "..." : desc;
+      const tags = (hit.tags?.data || []).slice(0, 5).join(", ");
+      const doi = hit.fields?.citation?.value ? `DOI: ${hit.fields.citation.value}` : "";
+      const access = hit.fields?.dataAccessibility?.value || "";
+      const parts = [
+        `${String(i + 1 + pageFrom).padStart(3)}. [${hitType}] ${title}`,
+        `     ID: ${hit.id}`,
+      ];
+      if (doi) parts.push(`     ${doi}`);
+      if (access) parts.push(`     Access: ${access}`);
+      if (tags) parts.push(`     Tags: ${tags}`);
+      if (snippet) parts.push(`     ${snippet}`);
+      return parts.join("\n");
+    });
+
+    const typeSummary = Object.entries(types)
+      .sort((a, b) => b[1].count - a[1].count)
+      .map(([t, v]) => `${t}: ${v.count}`)
+      .join(", ");
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `EBRAINS Knowledge Graph: ${total} result(s) for "${query}"${type ? ` (type: ${type})` : ""}. Showing ${pageFrom + 1}–${pageFrom + hits.length}.`,
+          keyFields: [
+            `Query: ${query}`,
+            type ? `Type filter: ${type}` : "Type: all",
+            `Total: ${total}`,
+            `Type breakdown: ${typeSummary}`,
+            `\nResults:`,
+            ...lines,
+          ],
+          sources: [
+            `https://search.kg.ebrains.eu/?q=${encodeURIComponent(query)}${type ? `&category=${encodeURIComponent(type)}` : ""}`,
+            "https://search.kg.ebrains.eu/",
+          ],
+          limitations: [
+            "Only publicly released (curated) resources are included in search results.",
+            "Use get_ebrains_kg_document with the ID and type to retrieve full metadata, DOIs, authors, and file information.",
+            "EBRAINS primarily hosts data from the Human Brain Project and European neuroscience initiatives.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_ebrains_kg_document",
+  {
+    description:
+      "Retrieves detailed metadata for a specific resource in the EBRAINS Knowledge Graph by its type and ID. Returns full description, authors, DOI/citation, data accessibility, techniques, brain regions, species, and linked resources.",
+    inputSchema: {
+      type: z
+        .enum(["Dataset", "Model", "Software", "Contributor", "Project", "Learning Resource", "Web service", "Workflow", "(Meta)Data Model"])
+        .describe("Resource type (e.g. 'Dataset', 'Model', 'Software')."),
+      id: z.string().describe("EBRAINS KG document UUID (e.g. '885b4936-9345-43bd-880e-eebc19898ded')."),
+    },
+  },
+  async ({ type, id }) => {
+    const url = `${EBRAINS_KG_SEARCH_API}/groups/public/documents/${encodeURIComponent(type)}/${encodeURIComponent(id)}`;
+    const res = await fetchWithRetry(url, { timeoutMs: 15000 });
+
+    if (!res.ok) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `EBRAINS KG document not found: ${type}/${id} (HTTP ${res.status}).`,
+            keyFields: [`Type: ${type}`, `ID: ${id}`],
+            sources: [`https://search.kg.ebrains.eu/instances/${id}`],
+            limitations: ["The document may not be publicly released or the ID may be incorrect."],
+          }),
+        }],
+      };
+    }
+
+    const doc = await res.json();
+    const title = doc.title || doc.meta?.name || "Untitled";
+    const description = doc.fields?.description?.value || doc.meta?.description || "";
+    const fields = doc.fields || {};
+
+    const keyFields = [`Title: ${title}`, `Type: ${doc.type || type}`, `ID: ${doc.id || id}`];
+
+    const identifiers = doc.meta?.identifier || [];
+    for (const ident of identifiers) {
+      if (typeof ident === "string" && ident.startsWith("https://doi.org/")) {
+        keyFields.push(`DOI: ${ident}`);
+      }
+    }
+
+    if (fields.citation?.value) keyFields.push(`Citation DOI: ${fields.citation.value}`);
+    if (fields.releasedAt?.value) keyFields.push(`Released: ${fields.releasedAt.value}`);
+    if (fields.dataAccessibility?.value) keyFields.push(`Access: ${fields.dataAccessibility.value}`);
+
+    const custodians = (fields.custodians || []).map((c) => c.value).filter(Boolean);
+    if (custodians.length > 0) keyFields.push(`Custodians: ${custodians.join(", ")}`);
+
+    const authors = (doc.meta?.creator || []).map((a) => a.name).filter(Boolean);
+    if (authors.length > 0) keyFields.push(`Authors: ${authors.join(", ")}`);
+
+    const techniques = (fields.technique || []).map((t) => t.value || t.children?.map((c) => c.value).join(", ")).filter(Boolean);
+    if (techniques.length > 0) keyFields.push(`Techniques: ${techniques.join(", ")}`);
+
+    const keywords = (fields.keywords || []).map((k) => k.value).filter(Boolean);
+    if (keywords.length > 0) keyFields.push(`Keywords: ${keywords.join(", ")}`);
+
+    const tags = (doc.tags?.data || []);
+    if (tags.length > 0) keyFields.push(`Tags: ${tags.join(", ")}`);
+
+    const versions = (fields.versions || []).map((v) => `${v.value || ""}${v.reference ? ` (${v.reference})` : ""}`).filter(Boolean);
+    if (versions.length > 0) keyFields.push(`Versions: ${versions.join("; ")}`);
+
+    if (description) {
+      const descSnippet = description.length > 800 ? description.slice(0, 797) + "..." : description;
+      keyFields.push(`\nDescription:\n${descSnippet}`);
+    }
+
+    const sources = [`https://search.kg.ebrains.eu/instances/${id}`];
+    const doiIdent = identifiers.find((x) => typeof x === "string" && x.startsWith("https://doi.org/"));
+    if (doiIdent) sources.push(doiIdent);
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `EBRAINS KG: ${title} (${doc.type || type}).`,
+          keyFields,
+          sources,
+          limitations: [
+            "Only publicly released metadata is available. Some linked resources may require EBRAINS account access.",
+            "File downloads may require separate authentication via the EBRAINS data proxy.",
           ],
         }),
       }],

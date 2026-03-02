@@ -115,6 +115,12 @@ KNOWN_MCP_TOOLS = [
     "get_string_interactions",
     "get_chembl_bioactivities",
     "search_fda_adverse_events",
+    "search_aba_genes",
+    "search_aba_structures",
+    "get_aba_gene_expression",
+    "search_aba_differential_expression",
+    "search_ebrains_kg",
+    "get_ebrains_kg_document",
     "benchmark_dataset_overview",
     "check_gpqa_access",
 ]
@@ -138,6 +144,12 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_string_interactions": "Get protein-protein interaction networks from STRING",
     "get_chembl_bioactivities": "Get bioactivity data (IC50, Ki, Kd) for a drug from ChEMBL — selectivity profiling",
     "search_fda_adverse_events": "Search FDA FAERS for post-marketing adverse event reports by drug name",
+    "search_aba_genes": "Search Allen Brain Atlas for genes by name or acronym (mouse, human, developing mouse)",
+    "search_aba_structures": "Search Allen Brain Atlas structure ontology for brain regions",
+    "get_aba_gene_expression": "Get quantified gene expression across brain structures from Allen Brain Atlas ISH data",
+    "search_aba_differential_expression": "Find genes differentially expressed between two brain structures (Allen Mouse Brain Atlas)",
+    "search_ebrains_kg": "Search EBRAINS Knowledge Graph for neuroscience datasets, models, software, and contributors",
+    "get_ebrains_kg_document": "Get detailed metadata for a specific EBRAINS Knowledge Graph resource (dataset, model, etc.)",
     "benchmark_dataset_overview": "Overview of available benchmark datasets",
     "check_gpqa_access": "Check access to GPQA benchmark",
 }
@@ -179,6 +191,14 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "get_chembl_bioactivities": "ChEMBL API",
     # PubChem (chemical compound data)
     "get_pubchem_compound": "PubChem",
+    # Allen Brain Atlas (gene expression, brain structures, differential expression)
+    "search_aba_genes": "Allen Brain Atlas",
+    "search_aba_structures": "Allen Brain Atlas",
+    "get_aba_gene_expression": "Allen Brain Atlas",
+    "search_aba_differential_expression": "Allen Brain Atlas",
+    # EBRAINS Knowledge Graph (neuroscience datasets, models, software)
+    "search_ebrains_kg": "EBRAINS Knowledge Graph",
+    "get_ebrains_kg_document": "EBRAINS Knowledge Graph",
     # FDA FAERS (post-marketing adverse events)
     "search_fda_adverse_events": "FDA FAERS (openFDA)",
     # PubMed (NCBI E-utilities)

@@ -5,16 +5,22 @@ set -euo pipefail
 # PROJECT_ID  – GCP project (pass via env or edit default below)
 # GOOGLE_API_KEY – Google AI Studio key (pass via env; stored in Secret Manager)
 # ── Optional overrides ───────────────────────────────────────────────────────
-# REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI
+# REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI, GA4_MEASUREMENT_ID
 # ─────────────────────────────────────────────────────────────────────────────
 
-PROJECT_ID="${PROJECT_ID:-}"
+PROJECT_ID="gen-lang-client-0943167408"
 REGION="${REGION:-us-central1}"
 SERVICE_NAME="${SERVICE_NAME:-ai-co-scientist}"
 REPO_NAME="${REPO_NAME:-co-scientist-images}"
 IMAGE_NAME="${IMAGE_NAME:-ai-co-scientist}"
 USE_VERTEX_AI="${USE_VERTEX_AI:-false}"
 GOOGLE_API_KEY="${GOOGLE_API_KEY:-}"
+GA4_MEASUREMENT_ID="${GA4_MEASUREMENT_ID:-G-NTCXHW3B2G}"
+
+# Source local .env if API key not already in environment
+if [[ -z "${GOOGLE_API_KEY}" && -f "adk-agent/.env" ]]; then
+  set -a; source adk-agent/.env; set +a
+fi
 
 if [[ -z "${PROJECT_ID}" ]]; then
   echo "Error: PROJECT_ID is required."
@@ -107,6 +113,10 @@ DEPLOY_FLAGS=(
   --set-env-vars "ADK_NATIVE_PREFER_BIGQUERY=1"
   --set-env-vars "^||^BQ_DATASET_ALLOWLIST=${BQ_ALLOWLIST}"
 )
+
+if [[ -n "${GA4_MEASUREMENT_ID}" ]]; then
+  DEPLOY_FLAGS+=(--set-env-vars "GA4_MEASUREMENT_ID=${GA4_MEASUREMENT_ID}")
+fi
 
 if [[ "${USE_VERTEX_AI}" == "true" ]]; then
   DEPLOY_FLAGS+=(--set-env-vars "GOOGLE_GENAI_USE_VERTEXAI=true")

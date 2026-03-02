@@ -23,7 +23,7 @@ import uuid
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from google.adk import Runner
 from google.adk.sessions import InMemorySessionService
@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 RATE_LIMIT_QUERIES = int(os.environ.get("RATE_LIMIT_QUERIES", "20"))
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "3600"))
+GA4_MEASUREMENT_ID = os.environ.get("GA4_MEASUREMENT_ID", "").strip()
+_GA4_ID_PATTERN = re.compile(r"^G-[A-Z0-9]+$")
 
 
 class RateLimiter:
@@ -1431,6 +1433,31 @@ app = FastAPI(title="AI Co-Scientist UI", version="0.2.0")
 app.mount("/static", StaticFiles(directory=str(UI_DIR)), name="static")
 
 
+def _ga4_head_snippet() -> str:
+    if not GA4_MEASUREMENT_ID:
+        return ""
+    if not _GA4_ID_PATTERN.fullmatch(GA4_MEASUREMENT_ID):
+        logger.warning("Ignoring invalid GA4_MEASUREMENT_ID format.")
+        return ""
+    ga_id = GA4_MEASUREMENT_ID
+    return (
+        f'<script async src="https://www.googletagmanager.com/gtag/js?id={ga_id}"></script>\n'
+        "<script>\n"
+        "  window.dataLayer = window.dataLayer || [];\n"
+        "  function gtag(){dataLayer.push(arguments);}\n"
+        "  gtag('js', new Date());\n"
+        f"  gtag('config', '{ga_id}', {{ anonymize_ip: true }});\n"
+        "</script>"
+    )
+
+
+def _render_ui_page(filename: str) -> HTMLResponse:
+    html_path = UI_DIR / filename
+    html = html_path.read_text(encoding="utf-8")
+    html = html.replace("<!-- GA4_SNIPPET -->", _ga4_head_snippet(), 1)
+    return HTMLResponse(content=html)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     await runtime.startup()
@@ -1447,13 +1474,13 @@ async def _shutdown() -> None:
 
 
 @app.get("/")
-async def index() -> FileResponse:
-    return FileResponse(UI_DIR / "index.html")
+async def index() -> HTMLResponse:
+    return _render_ui_page("index.html")
 
 
 @app.get("/about")
-async def about() -> FileResponse:
-    return FileResponse(UI_DIR / "about.html")
+async def about() -> HTMLResponse:
+    return _render_ui_page("about.html")
 
 
 @app.get("/api/health")
