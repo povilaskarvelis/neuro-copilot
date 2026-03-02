@@ -6,7 +6,7 @@ An agentic AI research assistant that synthesizes evidence across biomedical dat
 
 The AI Co-Scientist helps biomedical researchers evaluate therapeutic targets and research directions before human trials by:
 
-- **Synthesizing evidence across 19 databases** — genomics, literature, clinical trials, protein structure, pathways, safety, and more
+- **Synthesizing evidence across 28 databases** — genomics, literature, clinical trials, neuroscience, protein structure, pathways, safety, and more
 - **Generating query-specific execution plans** with explicit tool and data-source proposals
 - **Requiring human plan approval or revision** before evidence tools run
 - **Running iterative evidence-gathering loops** via a ReAct (Reason → Act → Observe) cycle
@@ -17,19 +17,21 @@ The AI Co-Scientist helps biomedical researchers evaluate therapeutic targets an
 
 | Category | Sources |
 |----------|---------|
-| **Genomics & Variants** | Open Targets Platform, gnomAD, 1000 Genomes, Ensembl VEP |
+| **Genomics & Variants** | Open Targets Platform, gnomAD, 1000 Genomes, Ensembl VEP, MyVariant.info |
 | **Clinical Trials** | ClinicalTrials.gov |
 | **Literature & Researchers** | PubMed, OpenAlex |
-| **Protein Structure & Function** | AlphaFold, UniProt |
+| **Protein Structure & Function** | AlphaFold, RCSB PDB, UniProt |
 | **Pathways & Interactions** | Reactome, STRING |
-| **Chemistry & Bioactivity** | ChEMBL, SureChEMBL |
-| **Safety & Regulatory** | FDA FAERS |
+| **Chemistry & Bioactivity** | ChEMBL, PubChem, SureChEMBL |
+| **Safety & Regulatory** | FDA FAERS, RxNorm |
 | **Immunology** | IEDB |
-| **Drug Nomenclature** | RxNorm |
 | **Perturbation Signatures** | LINCS L1000 |
-| **Clinical Variant Interpretation** | CIViC, ClinGen |
+| **Clinical Variant Interpretation** | CIViC, ClinVar |
+| **Cancer Genomics** | cBioPortal |
+| **Target Discovery & Druggability** | GWAS Catalog, DGIdb, GTEx |
+| **Neuroscience Atlases & Knowledge Graphs** | Allen Brain Atlas, EBRAINS Knowledge Graph |
 
-Genomics, chemistry, safety, and structural databases are accessed via BigQuery public datasets. Literature, clinical trials, protein, pathway, and researcher tools use live REST APIs.
+This stack combines live REST APIs (literature, trials, protein/pathway, neuroscience) with BigQuery public datasets (genomics, chemistry, safety, perturbation, and patent-derived chemistry).
 
 ## Architecture
 
@@ -52,53 +54,49 @@ Source of truth: `adk-agent/co_scientist/workflow.py`.
 
 ```mermaid
 flowchart TD
-    U["User question or command"] --> P["planner (LlmAgent)<br/>parse objective → emit plan JSON"]
+    U["User question"] --> P["planner (LlmAgent)<br/>builds plan JSON"]
+    P --> G{"Plan approval required?"}
+    G -->|yes| H["User reviews plan"]
+    H -->|approve| L
+    H -->|revise| P
+    G -->|no| L
 
-    P --> AP{"Plan pending approval?"}
-    AP -->|yes| H["User reviews plan"]
-    H -->|approve / lgtm| LOOP
-    H -->|revise + feedback| P
-    AP -->|no / auto| LOOP
-
-    subgraph LOOP["react_loop (LoopAgent, max 25 iterations)"]
-        direction TB
-        CHK{"More steps?"}
-        CHK -->|yes| R["Reason: what to search and why"]
-        R --> A["Act: call MCP tool"]
-        A --> O["Observe: review results"]
-        O --> D{"Step complete?"}
-        D -->|no| R
-        D -->|yes, advance| CHK
+    subgraph L["react_loop (LoopAgent, max 25 iterations)"]
+      direction TB
+      S["Select next step"]
+      R["Reason"]
+      A["Act (call MCP tool)"]
+      O["Observe"]
+      C{"Step complete?"}
+      M{"More steps?"}
+      S --> R --> A --> O --> C
+      C -->|no| R
+      C -->|yes| M
+      M -->|yes| S
     end
 
-    CHK -->|"all done"| AUTO{"Auto-synthesize?"}
-    CHK -->|"blocked / partial"| WAIT["User prompted:<br/>continue · finalize"]
-    WAIT -->|continue| CHK
-    WAIT -->|finalize| SY
+    M -->|all done| X{"Auto-synthesize?"}
+    M -->|blocked/partial| W["User choice:<br/>continue or finalize"]
+    W -->|continue| S
+    W -->|finalize| Y
+    X -->|yes| Y
+    X -->|no| W
 
-    AUTO -->|yes| SY
-    AUTO -->|no| WAIT
+    Y["report_synthesizer (LlmAgent)<br/>final cited Markdown report"] --> Z["Report shown to user"]
+    Z -->|follow-up question| P
 
-    SY["report_synthesizer (LlmAgent)<br/>final Markdown report with source citations<br/>+ reasoning traces per step"]
-    SY --> DONE["Report displayed to user"]
-    DONE -->|follow-up question| P
-
-    subgraph "History & Rollback"
-        CMD["history · rollback · switch N"]
-        CMD --> ARCH["Archive current → restore selected cycle"]
-        ARCH --> DONE2["Restored state displayed"]
-    end
-
-    U -.->|command| CMD
+    U -. command .-> HC["history / rollback / switch N"]
+    HC --> HR["Archive current cycle<br/>restore selected cycle"]
+    HR --> Z
 
     classDef llm fill:#eef2f7,stroke:#5f6b7a,stroke-width:1.5px,color:#1f2933;
     classDef guard fill:#f3f4f6,stroke:#6b7280,stroke-width:1.5px,color:#1f2933;
     classDef cmd fill:#fef9c3,stroke:#ca8a04,stroke-width:1.5px,color:#1f2933;
     classDef react fill:#e0f2fe,stroke:#0284c7,stroke-width:1.5px,color:#1f2933;
-    class P,SY llm;
-    class AP,AUTO,H,WAIT,D guard;
-    class CMD,ARCH,DONE2 cmd;
-    class R,A,O,CHK react;
+    class P,Y llm;
+    class G,H,X,W,C,M guard;
+    class HC,HR cmd;
+    class S,R,A,O react;
 ```
 
 ### ReAct Execution Loop
@@ -134,7 +132,11 @@ The reasoning trace captures the full decision chain per step and is stored alon
 | **Tissue Expression** | `get_gene_tissue_expression` | GTEx v8 (median TPM across 54 human tissues) |
 | **Experimental Structures** | `search_protein_structures` | RCSB PDB (X-ray, cryo-EM structures, resolution, ligands) |
 | **Cancer Mutations** | `get_cancer_mutation_profile` | cBioPortal (TCGA Pan-Cancer mutation frequencies, hotspots) |
+| **Bioactivity** | `get_chembl_bioactivities` | ChEMBL API (IC50/Ki/Kd, target selectivity, assay metadata) |
 | **Chemical Compounds** | `get_pubchem_compound` | PubChem (116M+ compounds, molecular properties, SMILES, drug-likeness) |
+| **Safety Signals** | `search_fda_adverse_events` | openFDA FAERS (post-marketing adverse event reports) |
+| **Brain Atlases** | `search_aba_genes`, `search_aba_structures`, `get_aba_gene_expression`, `search_aba_differential_expression` | Allen Brain Atlas (structure ontology, ISH expression, differential enrichment) |
+| **Neuroscience Knowledge Graph** | `search_ebrains_kg`, `get_ebrains_kg_document` | EBRAINS KG (datasets, models, software, contributors, projects) |
 | **Benchmarks** | `benchmark_dataset_overview`, `check_gpqa_access` | Hugging Face Datasets |
 
 ### BigQuery Datasets
@@ -306,7 +308,7 @@ The deploy script builds a container image via Cloud Build, then deploys to Clou
 │   └── test_*.py           # Regression tests
 │
 ├── research-mcp/           # Research Tools Server (Node.js)
-│   ├── server.js           # MCP tool server (18 tools)
+│   ├── server.js           # MCP tool server (Allen + EBRAINS + biomedical tools)
 │   ├── data/               # Local datasets
 │   └── test-tools.js       # Optional manual MCP tool test script
 │
@@ -327,21 +329,29 @@ The deploy script builds a container image via Cloud Build, then deploys to Clou
 - **[UniProt](https://www.uniprot.org/)** — Protein sequence, function, and annotation
 - **[Reactome](https://reactome.org/)** — Curated biological pathway database
 - **[STRING](https://string-db.org/)** — Protein-protein interaction networks
+- **[MyVariant.info](https://myvariant.info/)** — Aggregated variant annotations across ClinVar/CADD/dbSNP/COSMIC
+- **[GWAS Catalog](https://www.ebi.ac.uk/gwas/)** — Trait-variant associations with p-values and mapped genes
+- **[DGIdb](https://dgidb.org/)** — Drug-gene interactions and druggability categories
+- **[GTEx](https://gtexportal.org/)** — Tissue-level expression profiles across human tissues
+- **[RCSB PDB](https://www.rcsb.org/)** — Experimentally resolved protein structures
+- **[AlphaFold](https://alphafold.ebi.ac.uk/)** — Predicted protein structures and confidence scores
+- **[cBioPortal](https://www.cbioportal.org/)** — Cancer mutation frequencies and hotspot profiles
+- **[PubChem](https://pubchem.ncbi.nlm.nih.gov/)** — Compound structures and physicochemical metadata
+- **[openFDA FAERS](https://open.fda.gov/apis/drug/event/)** — Post-marketing safety signal data
+- **[Allen Brain Atlas](https://mouse.brain-map.org/)** — Brain structure ontology and ISH gene expression atlases
+- **[EBRAINS Knowledge Graph](https://search.kg.ebrains.eu/)** — Neuroscience datasets, models, software, workflows, and contributors
 
 ### BigQuery Public Datasets
 - **[Open Targets Platform](https://platform.opentargets.org/)** — Disease-target associations, genetic evidence, tractability
 - **[ChEMBL](https://www.ebi.ac.uk/chembl/)** — Bioactive compound and target bioactivity data
 - **[gnomAD](https://gnomad.broadinstitute.org/)** — Population variant frequencies
 - **[1000 Genomes](https://www.internationalgenome.org/)** — Phase 3 variants, population structure
-- **[Ensembl VEP](https://www.ensembl.org/vep)** — Variant functional consequence annotations
-- **[AlphaFold](https://alphafold.ebi.ac.uk/)** — Predicted protein structures and confidence scores
+- **[ClinVar (BigQuery)](https://www.ncbi.nlm.nih.gov/clinvar/)** — Clinical significance labels and variant-condition mappings
 - **[IEDB](https://www.iedb.org/)** — Immune epitope data, B-cell and T-cell assays
 - **[RxNorm](https://www.nlm.nih.gov/research/umls/rxnorm/)** — Drug nomenclature and relationships
 - **[FDA FAERS](https://open.fda.gov/data/faers/)** — Adverse event reports, drug labels, enforcement
 - **[LINCS L1000](https://lincsproject.org/)** — Chemical and genetic perturbation signatures
 - **[SureChEMBL](https://www.surechembl.org/)** — Chemical structures from patent literature
-- **[CIViC](https://civicdb.org/)** — Clinical interpretation of cancer variants
-- **[ClinGen](https://clinicalgenome.org/)** — Gene-disease clinical validity
 
 ## Testing
 
