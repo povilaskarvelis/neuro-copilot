@@ -34,9 +34,29 @@ const RCSB_DATA_API = "https://data.rcsb.org/rest/v1";
 const CBIOPORTAL_API = "https://www.cbioportal.org/api";
 const PUBCHEM_API = "https://pubchem.ncbi.nlm.nih.gov/rest/pug";
 const CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data";
-const ABA_API = "http://api.brain-map.org/api/v2";
+const ABA_API = "https://api.brain-map.org/api/v2";
 const EBRAINS_KG_SEARCH_API = "https://search.kg.ebrains.eu/api";
 const HF_DATASETS_SERVER_API = "https://datasets-server.huggingface.co";
+const OPENALEX_WORKS_SELECT = [
+  "id",
+  "display_name",
+  "publication_year",
+  "publication_date",
+  "cited_by_count",
+  "doi",
+  "ids",
+  "primary_location",
+  "authorships",
+  "type",
+].join(",");
+const OPENALEX_AUTHORS_SELECT = [
+  "id",
+  "display_name",
+  "works_count",
+  "cited_by_count",
+  "last_known_institution",
+  "orcid",
+].join(",");
 const HF_DATASET_PUBMEDQA = String(process.env.HF_DATASET_PUBMEDQA || "qiaojin/PubMedQA").trim();
 const HF_DATASET_BIOASQ = String(process.env.HF_DATASET_BIOASQ || "kroshan/BioASQ").trim();
 const HF_DATASET_GPQA = String(process.env.HF_DATASET_GPQA || "Idavidrein/gpqa").trim();
@@ -485,6 +505,22 @@ async function fetchWithRetry(url, options = {}) {
 async function fetchJsonWithRetry(url, options = {}) {
   const response = await fetchWithRetry(url, options);
   return response.json();
+}
+function formatGraphQLErrors(responsePayload) {
+  const errors = Array.isArray(responsePayload?.errors) ? responsePayload.errors : [];
+  if (errors.length === 0) return "";
+  return errors
+    .map((err) => normalizeWhitespace(err?.message || String(err)))
+    .filter(Boolean)
+    .slice(0, 4)
+    .join(" | ");
+}
+function requireGraphQLData(responsePayload, providerName = "GraphQL") {
+  const errText = formatGraphQLErrors(responsePayload);
+  if (errText) {
+    throw new Error(`${providerName} returned errors: ${errText}`);
+  }
+  return responsePayload?.data ?? null;
 }
 
 function renderStructuredResponse({ summary, keyFields = [], sources = [], limitations = [] }) {
@@ -1680,24 +1716,7 @@ server.registerTool(
         }
 
         const url = `${CLINICAL_TRIALS_API}/studies?${params.toString()}`;
-        const response = await fetch(url);
-
-        if (!response.ok) {
-          if (studies.length > 0) break;
-          return {
-            content: [{ type: "text", text: `ClinicalTrials.gov API error (${response.status}). Try a different search term.` }],
-          };
-        }
-
-        const text = await response.text();
-        if (!text || text.trim() === '') {
-          if (studies.length > 0) break;
-          return {
-            content: [{ type: "text", text: `ClinicalTrials.gov returned empty response for: "${query}". Try broader search terms.` }],
-          };
-        }
-
-        const data = JSON.parse(text);
+        const data = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 15000, maxBackoffMs: 3500 });
         const pageStudies = data?.studies ?? [];
         if (Number.isFinite(data?.totalCount)) {
           resultCount = data.totalCount;
@@ -1780,28 +1799,14 @@ server.registerTool(
     
     let study;
     try {
-      const response = await fetch(url);
-      
-      if (!response.ok) {
-        if (response.status === 404) {
-          return {
-            content: [{ type: "text", text: `Clinical trial not found: ${nctId}. Check the NCT ID format (e.g., NCT04665245).` }],
-          };
-        }
-        return {
-          content: [{ type: "text", text: `ClinicalTrials.gov API error (${response.status}) for ${nctId}.` }],
-        };
-      }
-      
-      const text = await response.text();
-      if (!text || text.trim() === '') {
-        return {
-          content: [{ type: "text", text: `Empty response for ${nctId}. The trial may not exist.` }],
-        };
-      }
-      
-      study = JSON.parse(text);
+      study = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 15000, maxBackoffMs: 3500 });
     } catch (error) {
+      const message = String(error?.message || "");
+      if (message.includes("404")) {
+        return {
+          content: [{ type: "text", text: `Clinical trial not found: ${nctId}. Check the NCT ID format (e.g., NCT04665245).` }],
+        };
+      }
       return {
         content: [{ type: "text", text: `Error fetching trial ${nctId}: ${error.message}` }],
       };
@@ -2168,7 +2173,12 @@ server.registerTool(
       const filters = [];
       if (fromYear) filters.push(`from_publication_date:${fromYear}-01-01`);
       if (toYear) filters.push(`to_publication_date:${toYear}-12-31`);
-      const params = new URLSearchParams({ search: query, per_page: String(limit) });
+      const boundedLimit = Math.max(1, Math.min(50, Math.round(limit)));
+      const params = new URLSearchParams({
+        search: query,
+        per_page: String(boundedLimit),
+        select: OPENALEX_WORKS_SELECT,
+      });
       if (filters.length) params.set("filter", filters.join(","));
       const url = buildOpenAlexUrl("/works", params);
       const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
@@ -2210,7 +2220,15 @@ server.registerTool(
   },
   async ({ query, limit = 10 }) => {
     try {
-      const url = buildOpenAlexUrl("/authors", new URLSearchParams({ search: query, per_page: String(limit) }));
+      const boundedLimit = Math.max(1, Math.min(50, Math.round(limit)));
+      const url = buildOpenAlexUrl(
+        "/authors",
+        new URLSearchParams({
+          search: query,
+          per_page: String(boundedLimit),
+          select: OPENALEX_AUTHORS_SELECT,
+        })
+      );
       const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
       const results = data?.results ?? [];
       const keyFields = results.map((a, idx) => {
@@ -2271,6 +2289,7 @@ server.registerTool(
           per_page: String(worksPerPage),
           page: String(page),
           filter: filters.join(","),
+          select: OPENALEX_WORKS_SELECT,
         });
         const worksUrl = buildOpenAlexUrl("/works", params);
         const data = await fetchJsonWithRetry(worksUrl, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
@@ -2482,11 +2501,22 @@ server.registerTool(
       let url = "";
       let results = [];
       if (authorId) {
-        url = buildOpenAlexUrl(`/authors/${encodeURIComponent(authorId.replace("https://openalex.org/", ""))}`);
+        url = buildOpenAlexUrl(
+          `/authors/${encodeURIComponent(authorId.replace("https://openalex.org/", ""))}`,
+          new URLSearchParams({ select: OPENALEX_AUTHORS_SELECT })
+        );
         const author = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
         results = author ? [author] : [];
       } else {
-        url = buildOpenAlexUrl("/authors", new URLSearchParams({ search: authorName, per_page: String(limit) }));
+        const boundedLimit = Math.max(1, Math.min(20, Math.round(limit)));
+        url = buildOpenAlexUrl(
+          "/authors",
+          new URLSearchParams({
+            search: authorName,
+            per_page: String(boundedLimit),
+            select: OPENALEX_AUTHORS_SELECT,
+          })
+        );
         const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
         results = data?.results ?? [];
       }
@@ -2505,6 +2535,7 @@ server.registerTool(
               filter: `author.id:${a.id}`,
               sort: "publication_date:desc",
               per_page: "1",
+              select: OPENALEX_WORKS_SELECT,
             })
           );
           try {
@@ -3172,7 +3203,7 @@ server.registerTool(
 // ---------------------------------------------------------------------------
 
 async function fetchCivicGraphQL(query, variables = {}) {
-  return fetchJsonWithRetry(CIVIC_GRAPHQL_API, {
+  const payload = await fetchJsonWithRetry(CIVIC_GRAPHQL_API, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ query, variables }),
@@ -3180,6 +3211,7 @@ async function fetchCivicGraphQL(query, variables = {}) {
     timeoutMs: 15000,
     maxBackoffMs: 3000,
   });
+  return requireGraphQLData(payload, "CIViC");
 }
 
 server.registerTool(
@@ -3241,8 +3273,8 @@ server.registerTool(
     `;
 
     const data = await fetchCivicGraphQL(query, { geneName: normalizedGene, first: boundedLimit });
-    const variants = data?.data?.variants?.nodes || [];
-    const totalCount = data?.data?.variants?.totalCount || 0;
+    const variants = data?.variants?.nodes || [];
+    const totalCount = data?.variants?.totalCount || 0;
 
     const filtered = variantName
       ? variants.filter((v) => normalizeWhitespace(v.name || "").toLowerCase().includes(normalizeWhitespace(variantName).toLowerCase()))
@@ -3356,7 +3388,7 @@ server.registerTool(
     `;
 
     const data = await fetchCivicGraphQL(query, { name: normalizedName });
-    const genes = data?.data?.genes?.nodes || [];
+    const genes = data?.genes?.nodes || [];
 
     if (genes.length === 0) {
       return {
@@ -3771,8 +3803,9 @@ server.registerTool(
       return { content: [{ type: "text", text: "Provide at least one gene symbol." }] };
     }
 
-    const query = `{
-      genes(names: ${JSON.stringify(cleanGenes)}) {
+    const query = `
+      query DgidbGeneInteractions($genes: [String!]!) {
+      genes(names: $genes) {
         nodes {
           name
           longName
@@ -3795,9 +3828,10 @@ server.registerTool(
         timeoutMs: 15000,
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, variables: { genes: cleanGenes } }),
       });
-      data = resp?.data?.genes?.nodes || [];
+      const gqlData = requireGraphQLData(resp, "DGIdb");
+      data = gqlData?.genes?.nodes || [];
     } catch (err) {
       return {
         content: [{ type: "text", text: renderStructuredResponse({
