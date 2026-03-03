@@ -650,13 +650,19 @@ function iterationActivitySnapshot(iteration) {
   if (!taskId) return null;
   const run = getRunForTask(taskId);
   const researchLog = iteration?.research_log || {};
-  const events = run
-    ? (Array.isArray(run.progress_events) ? run.progress_events : [])
-    : (Array.isArray(researchLog.events) ? researchLog.events : []);
-  const summaries = run
-    ? (Array.isArray(run.progress_summaries) ? run.progress_summaries : [])
-    : (Array.isArray(researchLog.summaries) ? researchLog.summaries : []);
+  const runEvents = Array.isArray(run?.progress_events) ? run.progress_events : [];
+  const runSummaries = Array.isArray(run?.progress_summaries) ? run.progress_summaries : [];
+  const logEvents = Array.isArray(researchLog.events) ? researchLog.events : [];
+  const logSummaries = Array.isArray(researchLog.summaries) ? researchLog.summaries : [];
   const status = String(run?.status || task.status || researchLog.status || "").trim();
+  // For completed runs: prefer whichever source has more step completion data (handles edge cases
+  // where run may be stale or research_log from persisted task has fuller data after refresh)
+  const stepCount = (arr) => arr.filter((e) => e?.type === "step.completed" && e?.metrics?.step_id).length;
+  const useLogForCompleted =
+    (status === "completed" || status === "failed") &&
+    stepCount(logEvents) > stepCount(runEvents);
+  const events = useLogForCompleted ? logEvents : runEvents.length ? runEvents : logEvents;
+  const summaries = useLogForCompleted ? logSummaries : runSummaries.length ? runSummaries : logSummaries;
   // Plan is approved if we have an active run executing, or task's hitl_history shows continue
   const planApproved = (run && ["running", "queued", "in_progress"].includes(status)) || taskHasStarted(task);
   return buildActivitySnapshot({ taskId, status, events, summaries, planApproved });
@@ -1235,8 +1241,10 @@ function bindEvents() {
     if (reportCard) {
       const taskId = String(reportCard.dataset.taskId || "").trim();
       if (!taskId) return;
+      const scrollTop = el.messages.scrollTop;
       state.selectedReportTaskId = taskId;
       renderAll();
+      el.messages.scrollTop = scrollTop;
     }
   });
 
@@ -1261,8 +1269,10 @@ function bindEvents() {
     event.preventDefault();
     const taskId = String(reportCard.dataset.taskId || "").trim();
     if (!taskId) return;
+    const scrollTop = el.messages.scrollTop;
     state.selectedReportTaskId = taskId;
     renderAll();
+    el.messages.scrollTop = scrollTop;
   });
 
   el.composerForm.addEventListener("submit", (event) => {
