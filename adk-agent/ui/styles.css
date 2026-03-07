@@ -227,7 +227,7 @@ body.expanded .workspace.report-open {
   min-height: auto;
   overflow: hidden;
   min-width: 0;
-  max-width: 900px;
+  max-width: 1080px;
   width: 100%;
   margin: 0 auto;
 }
@@ -1036,7 +1036,7 @@ body.expanded .composer {
   flex-direction: column;
   align-items: center;
   gap: 14px;
-  margin-top: 28px;
+  margin-top: 42px;
   padding: 0 20px;
   animation: rise 320ms ease both;
 }
@@ -1057,7 +1057,7 @@ body.expanded .example-queries {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 10px 14px;
-  max-width: 900px;
+  max-width: 1080px;
 }
 
 @media (max-width: 560px) {
