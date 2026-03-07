@@ -18,6 +18,7 @@ ADK session state via callbacks.
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
@@ -38,6 +39,8 @@ from google.adk.tools.mcp_tool.mcp_toolset import StdioConnectionParams
 from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 from mcp.client.stdio import StdioServerParameters
+
+from . import tool_registry
 
 logger = logging.getLogger(__name__)
 
@@ -187,478 +190,6 @@ KNOWN_MCP_TOOLS = [
     "check_gpqa_access",
 ]
 
-TOOL_DOMAINS: dict[str, list[str]] = {
-    "literature": [
-        "search_pubmed", "search_pubmed_advanced", "get_pubmed_abstract", "get_paper_fulltext",
-        "search_europe_pmc_literature",
-        "search_openalex_works", "search_openalex_authors",
-        "rank_researchers_by_activity", "get_researcher_contact_candidates",
-    ],
-    "clinical": [
-        "search_clinical_trials", "get_clinical_trial",
-        "summarize_clinical_trials_landscape", "search_fda_adverse_events",
-        "get_dailymed_drug_label",
-    ],
-    "protein": [
-        "get_human_protein_atlas_gene",
-        "search_uniprot_proteins", "get_uniprot_protein_profile",
-        "search_reactome_pathways", "get_string_interactions", "get_intact_interactions",
-        "get_biogrid_interactions",
-        "search_pathway_commons_top_pathways", "get_guidetopharmacology_target",
-        "get_alphafold_structure", "search_protein_structures",
-        "search_drug_gene_interactions",
-    ],
-    "genomics": [
-        "resolve_gene_identifiers", "map_ontology_terms_oxo",
-        "search_hpo_terms", "get_orphanet_disease_profile", "query_monarch_associations",
-        "search_quickgo_terms", "get_quickgo_annotations",
-        "annotate_variants_vep", "search_civic_variants", "search_civic_genes",
-        "get_variant_annotations", "search_gwas_associations",
-        "get_gene_tissue_expression", "get_depmap_gene_dependency",
-        "get_biogrid_orcs_gene_summary",
-        "get_gdsc_drug_sensitivity",
-        "get_prism_repurposing_response", "get_pharmacodb_compound_response",
-        "search_cellxgene_datasets", "get_clingen_gene_curation", "get_alliance_genome_gene_profile",
-        "get_cancer_mutation_profile",
-        "search_geo_datasets", "get_geo_dataset",
-    ],
-    "chemistry": [
-        "get_pubchem_compound", "get_chembl_bioactivities",
-        "get_guidetopharmacology_target", "get_dailymed_drug_label",
-        "get_gdsc_drug_sensitivity", "get_prism_repurposing_response",
-        "get_pharmacodb_compound_response",
-    ],
-    "neuroscience": [
-        "search_aba_genes", "search_aba_structures",
-        "get_aba_gene_expression", "search_aba_differential_expression",
-        "search_ebrains_kg", "get_ebrains_kg_document",
-        "search_conp_datasets", "get_conp_dataset_details",
-        "query_neurobagel_cohorts",
-        "search_openneuro_datasets", "get_openneuro_dataset",
-        "search_dandi_datasets", "get_dandi_dataset",
-        "search_nemar_datasets", "get_nemar_dataset_details",
-        "search_braincode_datasets", "get_braincode_dataset_details",
-        "search_enigma_datasets", "get_enigma_dataset_info",
-    ],
-    "data": [
-        "list_bigquery_tables", "run_bigquery_select_query",
-        "benchmark_dataset_overview", "check_gpqa_access",
-    ],
-}
-
-ALWAYS_AVAILABLE_DOMAINS = {"data", "literature"}
-
-ALL_DOMAIN_NAMES = sorted(TOOL_DOMAINS.keys())
-
-TOOL_TO_DOMAINS: dict[str, list[str]] = {}
-for _domain, _tools in TOOL_DOMAINS.items():
-    for _tool in _tools:
-        TOOL_TO_DOMAINS.setdefault(_tool, []).append(_domain)
-
-TOOL_DESCRIPTIONS: dict[str, str] = {
-    "list_bigquery_tables": "List tables in a BigQuery dataset, or inspect column schema for a specific table",
-    "run_bigquery_select_query": "Run SQL on BigQuery public datasets",
-    "search_clinical_trials": "Search ClinicalTrials.gov (returns NCT IDs)",
-    "get_clinical_trial": "Get details of a specific clinical trial by NCT ID",
-    "summarize_clinical_trials_landscape": "Aggregate trial landscape stats for a condition",
-    "search_pubmed": "Search PubMed literature (returns PMIDs, titles, authors)",
-    "search_pubmed_advanced": "Advanced PubMed search with field-specific queries (MeSH, author, journal)",
-    "get_pubmed_abstract": "Fetch full abstract for a PMID",
-    "get_paper_fulltext": "Fetch PMC full text when available using a PMID, PMCID, or DOI",
-    "search_geo_datasets": "Search GEO (Gene Expression Omnibus) for transcriptomics and functional genomics records by disease, gene, perturbation, tissue, or accession. Returns GSE/GSM/GPL/GDS accessions for follow-up",
-    "get_geo_dataset": "Get detailed GEO metadata for a specific accession or GEO UID, including organism, study type, sample count, PubMed links, and summary text",
-    "search_openalex_works": "Search OpenAlex for papers, preprints, and citations (returns DOIs)",
-    "search_openalex_authors": "Find researchers and their publication profiles",
-    "rank_researchers_by_activity": "Rank authors by recent publication activity",
-    "get_researcher_contact_candidates": "Get contact/affiliation info for researchers",
-    "search_europe_pmc_literature": "Search Europe PMC for papers, preprints, citation counts, and open-access metadata",
-    "resolve_gene_identifiers": "Resolve gene symbols, aliases, Entrez IDs, and Ensembl IDs via MyGene.info for identifier normalization",
-    "map_ontology_terms_oxo": "Map ontology CURIEs across MONDO/EFO/DOID/MeSH/OMIM/UMLS and other prefixes using EBI OxO cross-references",
-    "search_hpo_terms": "Search Human Phenotype Ontology terms via OLS for phenotype-term normalization",
-    "get_orphanet_disease_profile": "Retrieve Orphanet / ORDO rare-disease profiles with xrefs, phenotypes, and curated disease-gene links",
-    "query_monarch_associations": "Query Monarch phenotype- and rare-disease-centric associations such as phenotype-to-gene, disease-to-gene, and disease-to-phenotype",
-    "search_quickgo_terms": "Search Gene Ontology terms in QuickGO by text and aspect",
-    "get_quickgo_annotations": "Get GO annotations for a gene product via QuickGO, resolving gene symbols to UniProtKB when needed",
-    "search_uniprot_proteins": "Search UniProt for protein entries",
-    "get_uniprot_protein_profile": "Detailed protein profile (isoforms, PTMs, function)",
-    "search_reactome_pathways": "Search biological pathway hierarchies",
-    "get_string_interactions": "Get protein-protein interaction networks from STRING",
-    "get_intact_interactions": "Get curated experimental molecular interactions from IntAct with partners, interaction types, detection methods, and publication support",
-    "get_biogrid_interactions": "Get broader BioGRID experimental interaction evidence with physical/genetic classes, throughput tags, partners, and PMIDs",
-    "get_human_protein_atlas_gene": "Get Human Protein Atlas summaries for tissue specificity, single-cell specificity, protein class, and subcellular localization",
-    "get_depmap_gene_dependency": "Summarize DepMap gene dependency metrics (CRISPR/RNAi dependency fractions, pan-dependency/selectivity, predictive features)",
-    "get_biogrid_orcs_gene_summary": "Summarize BioGRID ORCS published CRISPR screen evidence for a gene, including hit status, phenotypes, cell lines, and representative screens",
-    "get_gdsc_drug_sensitivity": "Summarize GDSC / CancerRxGene compound sensitivity profiles across cell lines and tissues using IC50/AUC pharmacogenomic screens",
-    "get_prism_repurposing_response": "Summarize Broad PRISM repurposing primary-screen response using single-dose log2-fold-change viability across pooled cancer cell lines",
-    "get_pharmacodb_compound_response": "Summarize PharmacoDB cross-dataset compound-response evidence across public pharmacogenomic screens such as GDSC, PRISM, and CTRPv2",
-    "search_cellxgene_datasets": "Search public CELLxGENE Discover/Census-backed single-cell datasets by cell type, tissue, disease, assay, and organism",
-    "search_pathway_commons_top_pathways": "Search integrated top pathways in Pathway Commons across multiple pathway providers",
-    "get_guidetopharmacology_target": "Get curated target-ligand interactions and pharmacology summaries from Guide to Pharmacology",
-    "get_dailymed_drug_label": "Summarize key DailyMed SPL label sections such as boxed warnings, indications, contraindications, and warnings",
-    "get_clingen_gene_curation": "Summarize ClinGen gene-disease validity and dosage sensitivity curations for a gene",
-    "get_alliance_genome_gene_profile": "Summarize Alliance Genome Resources model-organism and translational evidence for a gene, including orthologs, disease/phenotype counts, and disease models",
-    "get_chembl_bioactivities": "Get bioactivity data (IC50, Ki, Kd) for a drug from ChEMBL — selectivity profiling",
-    "search_fda_adverse_events": "Search FDA FAERS for post-marketing adverse event reports by drug name",
-    "search_aba_genes": "Search Allen Brain Atlas for genes by name or acronym (mouse, human, developing mouse)",
-    "search_aba_structures": "Search Allen Brain Atlas structure ontology for brain regions",
-    "get_aba_gene_expression": "Get quantified gene expression across brain structures from Allen Brain Atlas ISH data",
-    "search_aba_differential_expression": "Find genes differentially expressed between two brain structures (Allen Mouse Brain Atlas)",
-    "search_ebrains_kg": "Search EBRAINS Knowledge Graph for neuroscience datasets, models, software, and contributors",
-    "get_ebrains_kg_document": "Get detailed metadata for a specific EBRAINS Knowledge Graph resource (dataset, model, etc.)",
-    "search_conp_datasets": "Search CONP dataset repositories by modality/method keywords (e.g. 'EEG', 'fMRI', 'MRI') or study names — NOT disease names. Disease queries rarely match; use broad neuroscience terms instead",
-    "get_conp_dataset_details": "Get detailed metadata (README, license, topics) for a specific CONP dataset repository returned by search_conp_datasets",
-    "query_neurobagel_cohorts": "Query Neurobagel public cohorts by age, sex, and imaging modality. Start broad (no filters = browse all). Avoid diagnosis filters — most public datasets lack annotations. Use image_modal as nidm:term (e.g. nidm:T1Weighted, nidm:Electroencephalography)",
-    "search_openneuro_datasets": "Search OpenNeuro neuroimaging datasets by modality (MRI, MEG, EEG, PET, iEEG, behavioral). Omit modality to browse all. Returns dataset IDs for get_openneuro_dataset",
-    "get_openneuro_dataset": "Get detailed metadata (name, DOI, modalities, snapshot) for an OpenNeuro dataset by ID (e.g. ds000224)",
-    "search_dandi_datasets": "Search DANDI Archive neurophysiology datasets (electrophysiology, calcium imaging, behavioral). Use keywords like 'hippocampus', 'electrophysiology'. Omit query to browse recent dandisets",
-    "get_dandi_dataset": "Get detailed metadata (name, version, assets, size, embargo) for a DANDI dandiset by identifier (e.g. 000003)",
-    "search_nemar_datasets": "Search NEMAR EEG/MEG/iEEG datasets (nemarDatasets GitHub org). Use 'EEG', 'MEG', 'iEEG', 'resting state', 'visual'. Omit query to browse. BIDS data from OpenNeuro at SDSC",
-    "get_nemar_dataset_details": "Get detailed metadata for a NEMAR dataset by repo name (e.g. nm000104)",
-    "search_braincode_datasets": "Search Brain-CODE (Ontario Brain Institute) datasets in CONP. Use 'mouse', 'fBIRN', 'NDD', 'epilepsy', or omit to list all. braincode_* repos",
-    "get_braincode_dataset_details": "Get detailed metadata for a Brain-CODE dataset by repo name (e.g. braincode_Mouse_Image)",
-    "search_enigma_datasets": "Search ENIGMA Consortium case-control summary stats (cortical thickness, subcortical volume). Use disorder: schizophrenia, depression, ADHD, bipolar, OCD, autism, epilepsy, Parkinson, 22q",
-    "get_enigma_dataset_info": "List ENIGMA summary statistic files for a disorder (e.g. scz, mdd, adhd, 22q, bd, asd). Returns filenames and raw CSV URLs",
-    "benchmark_dataset_overview": "Overview of available benchmark datasets",
-    "check_gpqa_access": "Check access to GPQA benchmark",
-}
-
-TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
-    "search_pubmed": {
-        "overlap_group": "literature_search",
-        "preferred_for": "default biomedical literature search, PMID harvesting, and MeSH-friendly follow-up",
-        "fallback_tools": ["search_europe_pmc_literature", "search_openalex_works"],
-    },
-    "search_europe_pmc_literature": {
-        "overlap_group": "literature_search",
-        "preferred_for": "preprints, Europe PMC citation metadata, and open-access status",
-        "fallback_tools": ["search_pubmed", "search_openalex_works"],
-    },
-    "search_openalex_works": {
-        "overlap_group": "literature_search",
-        "preferred_for": "broader citation graph context, institution/researcher discovery, and non-PubMed coverage",
-        "fallback_tools": ["search_pubmed", "search_europe_pmc_literature"],
-    },
-    "search_reactome_pathways": {
-        "overlap_group": "pathway_context",
-        "preferred_for": "specific curated pathway titles and canonical Reactome pathway hierarchy",
-        "fallback_tools": ["search_pathway_commons_top_pathways"],
-    },
-    "search_pathway_commons_top_pathways": {
-        "overlap_group": "pathway_context",
-        "preferred_for": "integrated pathway context across multiple pathway providers",
-        "fallback_tools": ["search_reactome_pathways", "get_string_interactions"],
-    },
-    "get_string_interactions": {
-        "overlap_group": "molecular_interactions",
-        "preferred_for": "broad protein-network neighborhoods and integrated interaction evidence",
-        "fallback_tools": ["get_intact_interactions", "get_biogrid_interactions", "search_pathway_commons_top_pathways"],
-    },
-    "get_intact_interactions": {
-        "overlap_group": "molecular_interactions",
-        "preferred_for": "curated experimental interaction records with detection methods and PMIDs",
-        "fallback_tools": ["get_biogrid_interactions", "get_string_interactions", "search_pathway_commons_top_pathways"],
-    },
-    "get_biogrid_interactions": {
-        "overlap_group": "molecular_interactions",
-        "preferred_for": "broader experimental physical/genetic interaction coverage, throughput tags, and BioGRID partner evidence",
-        "fallback_tools": ["get_intact_interactions", "get_string_interactions", "search_pathway_commons_top_pathways"],
-    },
-    "get_guidetopharmacology_target": {
-        "overlap_group": "compound_pharmacology",
-        "preferred_for": "curated target-ligand summaries, mechanism/action-type evidence, and representative ligands",
-        "fallback_tools": ["get_chembl_bioactivities", "search_drug_gene_interactions", "get_pubchem_compound"],
-    },
-    "get_chembl_bioactivities": {
-        "overlap_group": "compound_pharmacology",
-        "preferred_for": "quantitative potency, selectivity, and assay-level bioactivity data",
-        "fallback_tools": ["get_guidetopharmacology_target", "get_pubchem_compound", "search_drug_gene_interactions"],
-    },
-    "search_drug_gene_interactions": {
-        "overlap_group": "compound_pharmacology",
-        "preferred_for": "broad druggability categories and known drug-gene interaction coverage",
-        "fallback_tools": ["get_guidetopharmacology_target", "get_chembl_bioactivities"],
-    },
-    "get_pubchem_compound": {
-        "overlap_group": "compound_pharmacology",
-        "preferred_for": "compound identity, synonyms, and chemistry/property summaries",
-        "fallback_tools": ["get_chembl_bioactivities", "get_guidetopharmacology_target"],
-    },
-    "get_dailymed_drug_label": {
-        "overlap_group": "drug_safety_regulatory",
-        "preferred_for": "current US label language such as boxed warnings, indications, contraindications, and precautions",
-        "fallback_tools": ["search_fda_adverse_events"],
-    },
-    "search_fda_adverse_events": {
-        "overlap_group": "drug_safety_regulatory",
-        "preferred_for": "post-marketing adverse-event signals rather than label text",
-        "fallback_tools": ["get_dailymed_drug_label"],
-    },
-    "get_variant_annotations": {
-        "overlap_group": "variant_evidence",
-        "preferred_for": "aggregate variant annotations across ClinVar, dbSNP, gnomAD, CADD, and COSMIC",
-        "fallback_tools": ["annotate_variants_vep", "search_civic_variants", "get_clingen_gene_curation"],
-    },
-    "annotate_variants_vep": {
-        "overlap_group": "variant_evidence",
-        "preferred_for": "functional consequence and pathogenicity prediction scores such as SIFT, PolyPhen, and AlphaMissense",
-        "fallback_tools": ["get_variant_annotations", "search_civic_variants"],
-    },
-    "search_civic_variants": {
-        "overlap_group": "variant_evidence",
-        "preferred_for": "oncology-specific clinical variant interpretations",
-        "fallback_tools": ["search_civic_genes", "get_variant_annotations", "get_clingen_gene_curation"],
-    },
-    "search_civic_genes": {
-        "overlap_group": "variant_evidence",
-        "preferred_for": "oncology gene-level CIViC context when the exact variant is not yet known",
-        "fallback_tools": ["search_civic_variants", "get_variant_annotations"],
-    },
-    "get_clingen_gene_curation": {
-        "overlap_group": "variant_evidence",
-        "preferred_for": "expert-curated gene-disease validity and dosage sensitivity at the gene level",
-        "fallback_tools": ["get_variant_annotations", "search_civic_genes"],
-    },
-    "get_gene_tissue_expression": {
-        "overlap_group": "expression_context",
-        "preferred_for": "bulk tissue RNA expression across human tissues",
-        "fallback_tools": ["get_human_protein_atlas_gene", "search_cellxgene_datasets"],
-    },
-    "get_human_protein_atlas_gene": {
-        "overlap_group": "expression_context",
-        "preferred_for": "protein-level tissue specificity, subcellular localization, and atlas-style single-cell summaries",
-        "fallback_tools": ["get_gene_tissue_expression", "search_cellxgene_datasets"],
-    },
-    "search_cellxgene_datasets": {
-        "overlap_group": "expression_context",
-        "preferred_for": "discovering relevant single-cell datasets by tissue, disease, assay, or cell type",
-        "fallback_tools": ["get_human_protein_atlas_gene", "get_gene_tissue_expression"],
-    },
-    "get_depmap_gene_dependency": {
-        "overlap_group": "target_vulnerability",
-        "preferred_for": "gene dependency and target vulnerability across cancer cell lines",
-        "fallback_tools": ["get_biogrid_orcs_gene_summary", "get_gdsc_drug_sensitivity"],
-    },
-    "get_biogrid_orcs_gene_summary": {
-        "overlap_group": "target_vulnerability",
-        "preferred_for": "published CRISPR screen evidence with phenotype, cell-line, and screen-level context",
-        "fallback_tools": ["get_depmap_gene_dependency", "get_gdsc_drug_sensitivity"],
-    },
-    "get_gdsc_drug_sensitivity": {
-        "overlap_group": "target_vulnerability",
-        "preferred_for": "GDSC / CancerRxGene compound sensitivity and pharmacogenomic response across cancer cell lines",
-        "fallback_tools": ["get_prism_repurposing_response", "get_pharmacodb_compound_response", "get_guidetopharmacology_target"],
-    },
-    "get_prism_repurposing_response": {
-        "overlap_group": "target_vulnerability",
-        "preferred_for": "Broad PRISM repurposing primary-screen single-dose log2-fold-change viability across pooled cell lines",
-        "fallback_tools": ["get_gdsc_drug_sensitivity", "get_pharmacodb_compound_response", "get_guidetopharmacology_target"],
-    },
-    "get_pharmacodb_compound_response": {
-        "overlap_group": "target_vulnerability",
-        "preferred_for": "cross-dataset compound-response context across PharmacoDB datasets such as PRISM, GDSC, CTRPv2, and related public screens",
-        "fallback_tools": ["get_gdsc_drug_sensitivity", "get_prism_repurposing_response", "get_guidetopharmacology_target"],
-    },
-    "search_hpo_terms": {
-        "overlap_group": "phenotype_rare_disease",
-        "preferred_for": "phenotype-term normalization and choosing the right HPO concept before disease or graph queries",
-        "fallback_tools": ["get_orphanet_disease_profile", "query_monarch_associations"],
-    },
-    "get_orphanet_disease_profile": {
-        "overlap_group": "phenotype_rare_disease",
-        "preferred_for": "rare-disease profiles, disease xrefs, curated phenotype sets, and curated disease-gene links",
-        "fallback_tools": ["search_hpo_terms", "query_monarch_associations"],
-    },
-    "query_monarch_associations": {
-        "overlap_group": "phenotype_rare_disease",
-        "preferred_for": "phenotype-driven gene/disease association reasoning and graph-style rare-disease exploration",
-        "fallback_tools": ["search_hpo_terms", "get_orphanet_disease_profile"],
-    },
-    "get_alliance_genome_gene_profile": {
-        "overlap_group": "translational_model_evidence",
-        "preferred_for": "model-organism evidence, ortholog context, and Alliance-wide translational summaries for a gene",
-        "fallback_tools": ["get_clingen_gene_curation", "query_monarch_associations", "get_orphanet_disease_profile"],
-    },
-}
-
-SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
-    {
-        "topic": "Literature search",
-        "tools": ["search_pubmed", "search_europe_pmc_literature", "search_openalex_works"],
-        "summary": "Use `search_pubmed` by default for biomedical papers and PMIDs; use `search_europe_pmc_literature` when preprints, citation metadata, or open-access status matter; use `search_openalex_works` for broader citation graph or researcher context.",
-    },
-    {
-        "topic": "Pathway context",
-        "tools": ["search_reactome_pathways", "search_pathway_commons_top_pathways"],
-        "summary": "Use `search_reactome_pathways` for specific curated pathway titles; use `search_pathway_commons_top_pathways` when you want integrated pathway context across multiple providers.",
-    },
-    {
-        "topic": "Interaction evidence",
-        "tools": ["get_intact_interactions", "get_biogrid_interactions", "get_string_interactions", "search_pathway_commons_top_pathways"],
-        "summary": "Use `get_intact_interactions` for deeply curated molecular interaction records with detection methods and PMIDs; use `get_biogrid_interactions` for broader experimental physical/genetic interaction coverage and throughput context; use `get_string_interactions` for broader network neighborhoods; use `search_pathway_commons_top_pathways` when the goal is pathway-level context rather than pairwise interactions.",
-    },
-    {
-        "topic": "Compound pharmacology",
-        "tools": ["get_guidetopharmacology_target", "get_chembl_bioactivities", "search_drug_gene_interactions", "get_pubchem_compound"],
-        "summary": "Use `get_guidetopharmacology_target` for curated target-ligand summaries; use `get_chembl_bioactivities` for quantitative potency/selectivity; use `search_drug_gene_interactions` for broad druggability coverage; use `get_pubchem_compound` for compound identity and properties.",
-    },
-    {
-        "topic": "Drug label vs safety signals",
-        "tools": ["get_dailymed_drug_label", "search_fda_adverse_events"],
-        "summary": "Use `get_dailymed_drug_label` for current US label language; use `search_fda_adverse_events` for post-marketing adverse-event signals rather than regulatory label text.",
-    },
-    {
-        "topic": "Variant evidence",
-        "tools": ["get_variant_annotations", "annotate_variants_vep", "search_civic_variants", "search_civic_genes", "get_clingen_gene_curation"],
-        "summary": "Use `get_variant_annotations` for aggregate annotation, `annotate_variants_vep` for prediction scores, `search_civic_variants`/`search_civic_genes` for oncology interpretation, and `get_clingen_gene_curation` for gene-level expert curation.",
-    },
-    {
-        "topic": "Expression context",
-        "tools": ["get_gene_tissue_expression", "get_human_protein_atlas_gene", "search_cellxgene_datasets"],
-        "summary": "Use `get_gene_tissue_expression` for bulk tissue RNA, `get_human_protein_atlas_gene` for protein localization and atlas summaries, and `search_cellxgene_datasets` when the task is finding relevant single-cell datasets rather than returning expression values directly.",
-    },
-    {
-        "topic": "Functional screening vs drug response",
-        "tools": [
-            "get_depmap_gene_dependency",
-            "get_biogrid_orcs_gene_summary",
-            "get_gdsc_drug_sensitivity",
-            "get_prism_repurposing_response",
-            "get_pharmacodb_compound_response",
-        ],
-        "summary": "Use `get_depmap_gene_dependency` for release-level gene essentiality and vulnerability metrics; use `get_biogrid_orcs_gene_summary` for published CRISPR screens with phenotype and cell-line context; use `get_gdsc_drug_sensitivity` for GDSC / CancerRxGene response; use `get_prism_repurposing_response` for Broad PRISM single-dose repurposing response; use `get_pharmacodb_compound_response` for harmonized cross-dataset drug-response context across public screens.",
-    },
-    {
-        "topic": "Phenotype and rare-disease reasoning",
-        "tools": ["search_hpo_terms", "get_orphanet_disease_profile", "query_monarch_associations"],
-        "summary": "Use `search_hpo_terms` for phenotype-term normalization, `get_orphanet_disease_profile` for rare-disease profiles and curated phenotype/gene summaries, and `query_monarch_associations` for phenotype-driven or graph-style disease/gene association reasoning.",
-    },
-    {
-        "topic": "Translational model-organism evidence",
-        "tools": ["get_alliance_genome_gene_profile", "get_clingen_gene_curation", "get_orphanet_disease_profile", "query_monarch_associations"],
-        "summary": "Use `get_alliance_genome_gene_profile` for orthologs, disease models, and model-organism translational context; use `get_clingen_gene_curation` for expert human gene-disease validity; use `get_orphanet_disease_profile` and `query_monarch_associations` for rare-disease and phenotype-centric reasoning.",
-    },
-]
-
-TOOL_SOURCE_NAMES: dict[str, str] = {
-    # Generic BQ tool names (fallback when no dataset hint is available)
-    "list_bigquery_tables": "BigQuery",
-    "run_bigquery_select_query": "BigQuery",
-    # BigQuery dataset names — used as tool_hint by the planner for precise source attribution
-    "open_targets_platform": "Open Targets Platform",
-    "ebi_chembl": "ChEMBL",
-    "gnomad": "gnomAD",
-    "human_genome_variants": "Human Genome Variants",
-    "human_variant_annotation": "ClinVar (BigQuery)",
-    "immune_epitope_db": "IEDB",
-    "nlm_rxnorm": "RxNorm",
-    "fda_drug": "FDA Drug (BigQuery)",
-    "umiami_lincs": "LINCS L1000",
-    "ebi_surechembl": "SureChEMBL",
-    # Variant annotation APIs
-    "annotate_variants_vep": "Ensembl VEP",
-    "get_variant_annotations": "MyVariant.info",
-    "resolve_gene_identifiers": "MyGene.info",
-    "map_ontology_terms_oxo": "EBI OxO",
-    "search_hpo_terms": "Human Phenotype Ontology",
-    "get_orphanet_disease_profile": "Orphanet / ORDO",
-    "query_monarch_associations": "Monarch Initiative",
-    "get_alliance_genome_gene_profile": "Alliance Genome Resources",
-    "search_quickgo_terms": "QuickGO",
-    "get_quickgo_annotations": "QuickGO",
-    # CIViC (clinical variant interpretations)
-    "search_civic_variants": "CIViC",
-    "search_civic_genes": "CIViC",
-    # AlphaFold (protein structure predictions)
-    "get_alphafold_structure": "AlphaFold API",
-    # GWAS Catalog (trait-variant associations)
-    "search_gwas_associations": "GWAS Catalog",
-    # DGIdb (drug-gene interactions)
-    "search_drug_gene_interactions": "DGIdb",
-    # GTEx (tissue expression)
-    "get_gene_tissue_expression": "GTEx",
-    # Human Protein Atlas (protein/tissue/single-cell summaries)
-    "get_human_protein_atlas_gene": "Human Protein Atlas",
-    # DepMap (gene dependency and vulnerability)
-    "get_depmap_gene_dependency": "DepMap",
-    # BioGRID ORCS (published CRISPR screens)
-    "get_biogrid_orcs_gene_summary": "BioGRID ORCS",
-    # GDSC / CancerRxGene (drug sensitivity pharmacogenomics)
-    "get_gdsc_drug_sensitivity": "GDSC / CancerRxGene",
-    # PRISM Repurposing (Broad single-dose viability)
-    "get_prism_repurposing_response": "PRISM Repurposing",
-    # PharmacoDB (cross-dataset pharmacogenomics)
-    "get_pharmacodb_compound_response": "PharmacoDB",
-    # CELLxGENE Discover / Census metadata search
-    "search_cellxgene_datasets": "CELLxGENE Discover / Census",
-    # RCSB PDB (experimental protein structures)
-    "search_protein_structures": "RCSB PDB",
-    # cBioPortal (cancer mutation profiles)
-    "get_cancer_mutation_profile": "cBioPortal",
-    # ChEMBL REST API (bioactivity & selectivity)
-    "get_chembl_bioactivities": "ChEMBL API",
-    # PubChem (chemical compound data)
-    "get_pubchem_compound": "PubChem",
-    # Allen Brain Atlas (gene expression, brain structures, differential expression)
-    "search_aba_genes": "Allen Brain Atlas",
-    "search_aba_structures": "Allen Brain Atlas",
-    "get_aba_gene_expression": "Allen Brain Atlas",
-    "search_aba_differential_expression": "Allen Brain Atlas",
-    # EBRAINS Knowledge Graph (neuroscience datasets, models, software)
-    "search_ebrains_kg": "EBRAINS Knowledge Graph",
-    "get_ebrains_kg_document": "EBRAINS Knowledge Graph",
-    # CONP (Canadian Open Neuroscience Platform) dataset catalog
-    "search_conp_datasets": "CONP Datasets",
-    "get_conp_dataset_details": "CONP Datasets",
-    # Neurobagel public node (harmonized cohort discovery)
-    "query_neurobagel_cohorts": "Neurobagel",
-    # OpenNeuro (BIDS neuroimaging datasets)
-    "search_openneuro_datasets": "OpenNeuro",
-    "get_openneuro_dataset": "OpenNeuro",
-    # DANDI Archive (neurophysiology NWB/BIDS)
-    "search_dandi_datasets": "DANDI Archive",
-    "get_dandi_dataset": "DANDI Archive",
-    # NEMAR (EEG/MEG/iEEG from OpenNeuro)
-    "search_nemar_datasets": "NEMAR",
-    "get_nemar_dataset_details": "NEMAR",
-    # Brain-CODE (Ontario Brain Institute, via CONP)
-    "search_braincode_datasets": "Brain-CODE",
-    "get_braincode_dataset_details": "Brain-CODE",
-    # ENIGMA Consortium (imaging genetics meta-analysis)
-    "search_enigma_datasets": "ENIGMA",
-    "get_enigma_dataset_info": "ENIGMA",
-    # FDA FAERS (post-marketing adverse events)
-    "search_fda_adverse_events": "FDA FAERS (openFDA)",
-    # PubMed (NCBI E-utilities)
-    "search_pubmed": "PubMed",
-    "search_pubmed_advanced": "PubMed",
-    "get_pubmed_abstract": "PubMed",
-    "get_paper_fulltext": "PubMed Central",
-    # GEO (NCBI Gene Expression Omnibus)
-    "search_geo_datasets": "Gene Expression Omnibus",
-    "get_geo_dataset": "Gene Expression Omnibus",
-    # Remaining MCP tools (live APIs with no BQ equivalent)
-    "benchmark_dataset_overview": "Benchmark Datasets",
-    "check_gpqa_access": "GPQA",
-    "search_clinical_trials": "ClinicalTrials.gov",
-    "get_clinical_trial": "ClinicalTrials.gov",
-    "summarize_clinical_trials_landscape": "ClinicalTrials.gov",
-    "search_openalex_works": "OpenAlex",
-    "search_openalex_authors": "OpenAlex",
-    "rank_researchers_by_activity": "OpenAlex",
-    "get_researcher_contact_candidates": "OpenAlex",
-    "search_europe_pmc_literature": "Europe PMC",
-    "search_reactome_pathways": "Reactome",
-    "search_pathway_commons_top_pathways": "Pathway Commons",
-    "get_guidetopharmacology_target": "Guide to Pharmacology",
-    "get_dailymed_drug_label": "DailyMed",
-    "get_clingen_gene_curation": "ClinGen",
-    "get_string_interactions": "STRING",
-    "get_intact_interactions": "IntAct",
-    "get_biogrid_interactions": "BioGRID",
-    "search_uniprot_proteins": "UniProt",
-    "get_uniprot_protein_profile": "UniProt",
-}
-
 
 PLANNER_INSTRUCTION_TEMPLATE = """
 You are the internal planner for biomedical investigation.
@@ -770,17 +301,41 @@ Output requirements:
     "step_id": "S1",
     "reasoning_trace": "REASON: <why you chose this approach>\\nACT: <what tool you called and with what parameters>\\nOBSERVE: <what the results showed>\\nCONCLUDE: <your conclusion and whether the step goal is met>",
     "tools_called": ["tool_name_1", "tool_name_2"],
+    "data_sources_queried": ["<human-readable database/source names or dataset identifiers, e.g. Open Targets Platform, open_targets_platform.associationByOverallDirect>"],
     "status": "completed" | "blocked",
     "step_progress_note": "<1-2 sentence progress update>",
     "result_summary": "<concise findings summary>",
     "evidence_ids": ["PMID:...", "NCT:...", "UniProt:...", "rs...", "CHEMBL..."],
     "open_gaps": ["..."],
-    "suggested_next_searches": ["..."]
+    "suggested_next_searches": ["..."],
+    "structured_observations": [
+      {
+        "observation_type": "<atomic claim family such as drug_response, phenotype_association, interaction, or translational_model>",
+        "subject": { "type": "<entity type>", "label": "<entity label>", "id": "<optional canonical ID>" },
+        "predicate": "<atomic predicate such as sensitive_in, interacts_with, associated_with, has_phenotype, or has_ortholog>",
+        "object": { "type": "<entity type>", "label": "<entity label>", "id": "<optional canonical ID>" },
+        "object_literal": "<optional literal instead of object>",
+        "supporting_ids": ["PMID:...", "CHEMBL...", "HP:..."],
+        "source_tool": "<tool name>",
+        "confidence": "low" | "medium" | "high",
+        "qualifiers": { "dataset": "...", "metric": "...", "direction": "...", "species": "..." }
+      }
+    ]
   }
 - The reasoning_trace MUST use labeled phases (REASON, ACT, OBSERVE, CONCLUDE). Keep it concise:
   summarize intermediate tool calls briefly (one line each) and only expand on the final conclusion.
   Do NOT repeat full query results in the trace — just note what was found. This avoids output truncation.
+- Never embed raw tool response envelopes or copied payload objects inside your JSON fields.
+  Do NOT copy fields like `*_response`, `content`, `structuredContent`, or `isError`;
+  summarize tool results in plain sentences instead.
 - The tools_called list MUST contain the names of every MCP tool you invoked during this step.
+- `data_sources_queried` SHOULD name the actual databases, datasets, or registries that materially supported the step.
+  Prefer concrete source names like `Open Targets Platform`, `ClinVar`, `ChEMBL`, or dataset identifiers like
+  `open_targets_platform.associationByOverallDirect` over generic transport labels like `BigQuery`.
+- `structured_observations` is optional, but include it whenever you used high-overlap tools whose outputs naturally support atomic claims
+  (especially drug response/screening, phenotype/rare-disease, interaction, or translational model-organism tools).
+- Each structured observation MUST be grounded directly in the tool output for this step. Do not invent or infer unsupported claims.
+- Prefer a small number of high-signal observations (usually 1-8) over exhaustive extraction.
 """
 
 
@@ -801,7 +356,7 @@ Then provide a subsection for EACH step with a status indicator in the heading (
 - The data source (use the human-readable source name, not tool names).
 - Key findings (with specific identifiers (PMID, DOI, NCT numbers) inline).
 - Significance: why these findings matter for the research question.
-- Limiatations: any uncertainties or limitations specific to that step.
+- Limitations: any uncertainties or limitations specific to that step.
 Mark failed/blocked steps clearly with what went wrong.
 
 ## Limitations
@@ -812,6 +367,9 @@ Numbered list of 3+ actionable follow-ups (confirmatory checks, risk reduction, 
 
 Rules:
 - Ground every claim in the provided evidence. Do not invent unsupported claims.
+- Use `claim_synthesis_summary` as the primary arbitration layer for substantive findings. It already consolidates overlapping claims, weights sources by evidence type, and flags mixed-evidence findings.
+- Do not treat all sources as equal. When claims disagree, prefer the interpretation backed by higher-weighted sources and stronger claim support, but still surface the disagreement explicitly.
+- If `mixed_evidence_claims` are present, call them out in the Summary or Limitations instead of silently choosing one side.
 - Be specific and thorough — avoid terse output.
 - Use ONLY human-readable database/source names (e.g. "PubMed", "ClinicalTrials.gov"). NEVER mention tool names (like run_bigquery_select_query, search_clinical_trials, etc.).
 - Include specific identifiers inline when available (PMID, DOI, NCT numbers).
@@ -1156,6 +714,20 @@ def _sanitize_json_string(text: str) -> str:
     return _INVALID_JSON_ESCAPES.sub("", text)
 
 
+def _parse_python_literal_object(raw_text: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Fallback parser for Python-literal dicts emitted by the model."""
+    raw = str(raw_text or "").strip()
+    if not raw:
+        return None, "Empty model output."
+    try:
+        parsed = ast.literal_eval(raw)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Python literal parse error: {exc}"
+    if not isinstance(parsed, dict):
+        return None, "Top-level Python literal value must be an object."
+    return parsed, None
+
+
 def _parse_json_object_from_text(raw_text: str) -> tuple[dict[str, Any] | None, str | None]:
     raw = str(raw_text or "").strip()
     if not raw:
@@ -1185,6 +757,11 @@ def _parse_json_object_from_text(raw_text: str) -> tuple[dict[str, Any] | None, 
                 last_error = "Top-level JSON value must be an object."
                 continue
             return parsed, None
+        parsed, err = _parse_python_literal_object(_sanitize_json_string(candidate))
+        if parsed is not None:
+            return parsed, None
+        if err:
+            last_error = err
     return None, last_error
 
 
@@ -1265,7 +842,7 @@ def _validate_plan_internal(raw: dict[str, Any]) -> dict[str, Any]:
         raw_domains = step.get("domains")
         if isinstance(raw_domains, list):
             domains = [str(d).strip().lower() for d in raw_domains if str(d).strip()]
-            domains = [d for d in domains if d in TOOL_DOMAINS]
+            domains = [d for d in domains if d in tool_registry.TOOL_DOMAINS]
         else:
             domains = []
         steps.append(
@@ -1306,11 +883,16 @@ def _initialize_task_state_from_plan(plan: dict[str, Any], *, objective_text: st
             "step_progress_note": "",
             "reasoning_trace": "",
             "tools_called": [],
+            "data_sources_queried": [],
+            "structured_observations": [],
+            "entity_ids": [],
+            "claim_ids": [],
+            "execution_metrics": {},
         }
         for step in validated["steps"]
     ]
     objective = validated["objective"] or objective_text
-    return {
+    task_state = {
         "schema": WORKFLOW_TASK_SCHEMA,
         "objective": objective,
         "objective_fingerprint": _normalize_user_text(objective_text or objective),
@@ -1320,7 +902,1762 @@ def _initialize_task_state_from_plan(plan: dict[str, Any], *, objective_text: st
         "steps": steps,
         "success_criteria": validated["success_criteria"],
         "latest_synthesis": None,
+        "evidence_store": _new_evidence_store(),
+        "execution_metrics": _new_execution_metrics_bundle(),
     }
+    _refresh_task_state_derived_state(task_state)
+    return task_state
+
+
+def _new_evidence_store() -> dict[str, Any]:
+    return {
+        "entities": {},
+        "claims": {},
+        "evidence": [],
+    }
+
+
+def _new_execution_metrics_bundle() -> dict[str, Any]:
+    return {
+        "steps": [],
+        "summary": {
+            "step_count": 0,
+            "completed_count": 0,
+            "blocked_count": 0,
+            "tool_hint_accuracy": None,
+            "tool_hint_first_accuracy": None,
+            "fallback_rate": 0.0,
+            "avg_tools_per_step": 0.0,
+            "avg_evidence_ids_per_step": 0.0,
+            "avg_structured_observations_per_step": 0.0,
+            "avg_parse_retries_per_step": 0.0,
+            "clusters": [],
+            "specialization_watchlist": [],
+        },
+    }
+
+
+def _slugify_token(text: str) -> str:
+    normalized = _normalize_user_text(text)
+    token = re.sub(r"[^a-z0-9:]+", "_", normalized).strip("_")
+    return token or "unknown"
+
+
+def _canonical_entity_key(entity_type: str, label: str) -> str:
+    return f"{_slugify_token(entity_type)}:{_slugify_token(label)}"
+
+
+def _merge_str_values(existing: Any, new_values: list[Any] | None = None, *, limit: int = 50) -> list[str]:
+    items: list[Any] = []
+    if isinstance(existing, list):
+        items.extend(existing)
+    elif existing not in (None, "", {}):
+        items.append(existing)
+    if new_values:
+        items.extend(new_values)
+    return _dedupe_str_list(items, limit=limit)
+
+
+def _merge_attr_payload(existing: dict[str, Any] | None, new_attrs: dict[str, Any] | None) -> dict[str, Any]:
+    merged = dict(existing or {})
+    for key, value in (new_attrs or {}).items():
+        if value in (None, "", [], {}):
+            continue
+        prior = merged.get(key)
+        if isinstance(prior, dict) and isinstance(value, dict):
+            merged[key] = {**prior, **value}
+            continue
+        if isinstance(prior, list) or isinstance(value, list):
+            merged[key] = _merge_str_values(prior, value if isinstance(value, list) else [value])
+            continue
+        merged[key] = value
+    return merged
+
+
+def _upsert_entity(
+    store: dict[str, Any],
+    entity_type: str,
+    label: str,
+    *,
+    aliases: list[str] | None = None,
+    attrs: dict[str, Any] | None = None,
+    canonical_key: str | None = None,
+) -> dict[str, Any]:
+    cleaned_label = _as_nonempty_str(label, "label")
+    canonical = str(canonical_key or _canonical_entity_key(entity_type, cleaned_label)).strip()
+    entity_id = f"entity:{canonical}"
+    existing = store["entities"].get(entity_id)
+    if not existing:
+        existing = {
+            "id": entity_id,
+            "type": str(entity_type).strip() or "record",
+            "label": cleaned_label,
+            "canonical_key": canonical,
+            "aliases": [],
+            "attrs": {},
+        }
+        store["entities"][entity_id] = existing
+    existing["aliases"] = _merge_str_values(existing.get("aliases"), aliases or [])
+    existing["attrs"] = _merge_attr_payload(existing.get("attrs"), attrs)
+    return existing
+
+
+def _canonical_claim_key(
+    subject_id: str,
+    predicate: str,
+    *,
+    object_id: str = "",
+    object_literal: str = "",
+) -> str:
+    object_key = object_id or object_literal or "none"
+    return "|".join(
+        [
+            _slugify_token(subject_id),
+            _slugify_token(predicate),
+            _slugify_token(object_key),
+        ]
+    )
+
+
+def _merge_status(existing: str, new_status: str) -> str:
+    priority = {
+        "supported": 4,
+        "completed": 3,
+        "observed": 2,
+        "blocked": 1,
+        "pending": 0,
+    }
+    existing_clean = str(existing or "").strip().lower()
+    new_clean = str(new_status or "").strip().lower()
+    if priority.get(new_clean, -1) >= priority.get(existing_clean, -1):
+        return new_clean or existing_clean
+    return existing_clean
+
+
+def _merge_confidence(existing: str, new_value: str) -> str:
+    priority = {
+        "high": 3,
+        "medium": 2,
+        "low": 1,
+        "unknown": 0,
+        "": 0,
+    }
+    existing_clean = str(existing or "").strip().lower()
+    new_clean = str(new_value or "").strip().lower()
+    if priority.get(new_clean, -1) >= priority.get(existing_clean, -1):
+        return new_clean or existing_clean or "unknown"
+    return existing_clean or "unknown"
+
+
+def _normalize_observation_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return re.sub(r"\s+", " ", value.strip())
+    if isinstance(value, list):
+        normalized_list: list[Any] = []
+        for item in value:
+            normalized_item = _normalize_observation_value(item)
+            if normalized_item in (None, "", [], {}):
+                continue
+            normalized_list.append(normalized_item)
+        return normalized_list
+    if isinstance(value, dict):
+        normalized_dict = {}
+        for key, nested in value.items():
+            key_text = re.sub(r"\s+", " ", str(key or "").strip())
+            if not key_text:
+                continue
+            normalized_nested = _normalize_observation_value(nested)
+            if normalized_nested in (None, "", [], {}):
+                continue
+            normalized_dict[key_text] = normalized_nested
+        return normalized_dict
+    if value is None:
+        return None
+    return re.sub(r"\s+", " ", str(value).strip())
+
+
+def _normalize_observation_qualifiers(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("structured_observations[*].qualifiers must be an object")
+    normalized = _normalize_observation_value(value)
+    return normalized if isinstance(normalized, dict) else {}
+
+
+def _validate_structured_entity_ref(value: Any, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be an object")
+    entity_type = _as_nonempty_str(value.get("type"), f"{field_name}.type")
+    raw_id = re.sub(r"\s+", " ", str(value.get("id", "")).strip())
+    raw_label = re.sub(r"\s+", " ", str(value.get("label", "")).strip())
+    label = raw_label or raw_id
+    if not label:
+        raise ValueError(f"{field_name}.label or {field_name}.id must be provided")
+    aliases = _as_string_list(value.get("aliases"), f"{field_name}.aliases", limit=12)
+    if raw_id:
+        aliases = _merge_str_values(aliases, [raw_id], limit=12)
+    attrs = _normalize_observation_qualifiers(value.get("attrs"))
+    if raw_id:
+        attrs = _merge_attr_payload(attrs, {"identifier": raw_id})
+    return {
+        "type": entity_type,
+        "label": label,
+        "id": raw_id,
+        "aliases": aliases,
+        "attrs": attrs,
+    }
+
+
+def _validate_structured_observations(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("structured_observations must be a list")
+
+    observations: list[dict[str, Any]] = []
+    for idx, observation in enumerate(value[:12]):
+        if not isinstance(observation, dict):
+            raise ValueError(f"structured_observations[{idx}] must be an object")
+        subject = _validate_structured_entity_ref(
+            observation.get("subject"),
+            f"structured_observations[{idx}].subject",
+        )
+        predicate = _as_nonempty_str(
+            observation.get("predicate"),
+            f"structured_observations[{idx}].predicate",
+        )
+        object_value = observation.get("object")
+        object_ref = None
+        if object_value is not None:
+            object_ref = _validate_structured_entity_ref(
+                object_value,
+                f"structured_observations[{idx}].object",
+            )
+        object_literal = re.sub(r"\s+", " ", str(observation.get("object_literal", "")).strip())
+        if object_ref is None and not object_literal:
+            raise ValueError(
+                f"structured_observations[{idx}] must include either object or object_literal"
+            )
+        confidence = re.sub(r"\s+", " ", str(observation.get("confidence", "medium")).strip()).lower()
+        if confidence not in {"low", "medium", "high"}:
+            raise ValueError(
+                f"structured_observations[{idx}].confidence must be low, medium, or high"
+            )
+        source_tool = re.sub(r"\s+", " ", str(observation.get("source_tool", "")).strip())
+        observation_type = _as_nonempty_str(
+            observation.get("observation_type", "observation"),
+            f"structured_observations[{idx}].observation_type",
+        )
+        observations.append(
+            {
+                "observation_type": observation_type,
+                "subject": subject,
+                "predicate": predicate,
+                "object": object_ref,
+                "object_literal": object_literal,
+                "supporting_ids": _as_string_list(
+                    observation.get("supporting_ids"),
+                    f"structured_observations[{idx}].supporting_ids",
+                    limit=20,
+                ),
+                "source_tool": source_tool,
+                "confidence": confidence,
+                "qualifiers": _normalize_observation_qualifiers(observation.get("qualifiers")),
+            }
+        )
+    return observations
+
+
+def _format_observation_qualifiers(qualifiers: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in sorted(qualifiers):
+        value = qualifiers.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, list):
+            value_text = ", ".join(str(item) for item in value[:6])
+        elif isinstance(value, dict):
+            nested = ", ".join(f"{nested_key}={nested_value}" for nested_key, nested_value in list(value.items())[:6])
+            value_text = nested
+        else:
+            value_text = str(value)
+        parts.append(f"{key}: {value_text}")
+    return "; ".join(parts[:8])
+
+
+def _upsert_claim(
+    store: dict[str, Any],
+    subject_id: str,
+    predicate: str,
+    *,
+    object_id: str = "",
+    object_literal: str = "",
+    status: str = "supported",
+    confidence: str = "medium",
+    step_id: str = "",
+    source_tool: str = "",
+    source_label: str = "",
+    observation_type: str = "",
+) -> dict[str, Any]:
+    claim_key = _canonical_claim_key(
+        subject_id,
+        predicate,
+        object_id=object_id,
+        object_literal=object_literal,
+    )
+    claim_id = f"claim:{claim_key}"
+    existing = store["claims"].get(claim_id)
+    if not existing:
+        existing = {
+            "id": claim_id,
+            "subject_entity_id": subject_id,
+            "predicate": str(predicate).strip(),
+            "object_entity_id": object_id,
+            "object_literal": str(object_literal or "").strip(),
+            "status": str(status or "supported").strip().lower(),
+            "confidence": str(confidence or "medium").strip().lower(),
+            "step_ids": [],
+            "source_tools": [],
+            "source_labels": [],
+            "evidence_count": 0,
+            "observation_types": [],
+        }
+        store["claims"][claim_id] = existing
+    existing["status"] = _merge_status(existing.get("status", ""), status)
+    existing["confidence"] = _merge_confidence(existing.get("confidence", ""), confidence)
+    existing["step_ids"] = _merge_str_values(existing.get("step_ids"), [step_id] if step_id else [])
+    existing["source_tools"] = _merge_str_values(existing.get("source_tools"), [source_tool] if source_tool else [])
+    existing["source_labels"] = _merge_str_values(existing.get("source_labels"), [source_label] if source_label else [])
+    existing["observation_types"] = _merge_str_values(
+        existing.get("observation_types"),
+        [observation_type] if observation_type else [],
+    )
+    return existing
+
+
+def _append_evidence_record(
+    store: dict[str, Any],
+    *,
+    claim_id: str,
+    step_id: str,
+    source_tool: str,
+    source_label: str,
+    evidence_ids: list[str] | None,
+    summary_text: str,
+    score: float | None = None,
+    qualifiers: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    record = {
+        "id": f"evidence:{step_id or 'step'}:{len(store['evidence']) + 1}",
+        "claim_id": claim_id,
+        "step_id": str(step_id or "").strip(),
+        "source_tool": str(source_tool or "").strip(),
+        "source_label": str(source_label or "").strip(),
+        "evidence_ids": _merge_str_values([], evidence_ids or [], limit=20),
+        "summary_text": str(summary_text or "").strip(),
+        "score": score,
+        "qualifiers": _normalize_observation_qualifiers(qualifiers),
+    }
+    store["evidence"].append(record)
+    claim = store["claims"].get(claim_id)
+    if claim:
+        claim["evidence_count"] = int(claim.get("evidence_count", 0) or 0) + 1
+        claim["source_tools"] = _merge_str_values(claim.get("source_tools"), [record["source_tool"]] if record["source_tool"] else [])
+        claim["source_labels"] = _merge_str_values(claim.get("source_labels"), [record["source_label"]] if record["source_label"] else [])
+    return record
+
+
+def _infer_entity_from_identifier(identifier: str) -> dict[str, Any] | None:
+    normalized = re.sub(r"\s*:\s*", ":", str(identifier or "").strip())
+    if not normalized:
+        return None
+
+    identifier_map: list[tuple[re.Pattern[str], str, str]] = [
+        (re.compile(r"(?i)^PMID:(\d{4,9})$"), "paper", "paper:pmid:{}"),
+        (re.compile(r"(?i)^DOI:(10\..+)$"), "paper", "paper:doi:{}"),
+        (re.compile(r"(?i)^(?:PMC:)?(PMC\d+)$"), "paper", "paper:{}"),
+        (re.compile(r"(?i)^OpenAlex:(W\d+)$"), "paper", "paper:{}"),
+        (re.compile(r"(?i)^(?:NCT:)?(NCT\d{8})$"), "trial", "trial:{}"),
+        (re.compile(r"(?i)^UniProt:([A-Z][A-Z0-9]{2,9})$"), "protein", "protein:uniprot:{}"),
+        (re.compile(r"(?i)^PubChem:(\d+)$"), "compound", "compound:pubchem:{}"),
+        (re.compile(r"(?i)^(CHEMBL\d+)$"), "compound", "compound:{}"),
+        (re.compile(r"(?i)^PDB:([A-Z0-9]{4,8})$"), "structure", "structure:pdb:{}"),
+        (re.compile(r"(?i)^(rs\d{3,})$"), "variant", "variant:{}"),
+        (re.compile(r"(?i)^Reactome:(R-[A-Z]{3}-\d+)$"), "pathway", "pathway:{}"),
+        (re.compile(r"(?i)^(GCST\d{4,})$"), "study", "study:{}"),
+        (re.compile(r"(?i)^(HP:\d+)$"), "phenotype", "phenotype:{}"),
+        (re.compile(r"(?i)^(MONDO:\d+)$"), "disease", "disease:{}"),
+        (re.compile(r"(?i)^(EFO:\d+)$"), "disease", "disease:{}"),
+        (re.compile(r"(?i)^(ORPHA:\d+)$"), "disease", "disease:{}"),
+        (re.compile(r"(?i)^(ORDO:\d+)$"), "disease", "disease:{}"),
+        (re.compile(r"(?i)^(MESH:[A-Z0-9]+)$"), "disease", "disease:{}"),
+        (re.compile(r"(?i)^(ds\d{6,})$"), "dataset", "dataset:{}"),
+        (re.compile(r"(?i)^(nm\d{6,})$"), "dataset", "dataset:{}"),
+        (re.compile(r"(?i)^(braincode_[A-Za-z0-9_]+)$"), "dataset", "dataset:{}"),
+        (re.compile(r"(?i)^(DANDI:\d+)$"), "dataset", "dataset:{}"),
+    ]
+    for pattern, entity_type, key_template in identifier_map:
+        match = pattern.match(normalized)
+        if not match:
+            continue
+        captured = match.group(1).strip()
+        canonical_value = captured.lower() if entity_type == "paper" and normalized.upper().startswith("DOI:") else captured
+        return {
+            "entity_type": entity_type,
+            "label": normalized if ":" in normalized or normalized.lower().startswith("ds") else captured,
+            "canonical_key": key_template.format(_slugify_token(canonical_value)),
+            "aliases": [normalized],
+            "attrs": {
+                "identifier": normalized,
+                "namespace": normalized.split(":", 1)[0] if ":" in normalized else entity_type,
+            },
+        }
+
+    curie_match = re.match(r"(?i)^([A-Z][A-Z0-9_-]{1,24}):([A-Za-z0-9._/-]+)$", normalized)
+    if curie_match:
+        prefix = curie_match.group(1).upper()
+        return {
+            "entity_type": "record",
+            "label": normalized,
+            "canonical_key": f"record:{_slugify_token(normalized)}",
+            "aliases": [normalized],
+            "attrs": {
+                "identifier": normalized,
+                "namespace": prefix,
+            },
+        }
+
+    return {
+        "entity_type": "record",
+        "label": normalized,
+        "canonical_key": f"record:{_slugify_token(normalized)}",
+        "aliases": [normalized],
+        "attrs": {
+            "identifier": normalized,
+            "namespace": "opaque",
+        },
+    }
+
+
+OVERLAP_GROUP_TO_EXECUTOR_CLUSTER: dict[str, str] = {
+    "literature_search": "literature",
+    "pathway_context": "interactions_pathways",
+    "molecular_interactions": "interactions_pathways",
+    "compound_pharmacology": "compound_pharmacology",
+    "drug_safety_regulatory": "clinical_regulatory",
+    "variant_evidence": "variant_and_genomics",
+    "expression_context": "expression_and_datasets",
+    "target_vulnerability": "drug_response_screens",
+    "phenotype_rare_disease": "phenotype_rare_disease",
+    "translational_model_evidence": "translational_models",
+}
+
+
+DOMAIN_TO_EXECUTOR_CLUSTER: dict[str, str] = {
+    "literature": "literature",
+    "clinical": "clinical_regulatory",
+    "protein": "interactions_pathways",
+    "genomics": "variant_and_genomics",
+    "chemistry": "compound_pharmacology",
+    "neuroscience": "neuroscience_datasets",
+    "data": "structured_data",
+}
+
+
+STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP: dict[str, dict[str, Any]] = {
+    "target_vulnerability": {
+        "label": "drug-response and screening evidence",
+        "predicates": ["sensitive_in", "resistant_in", "depends_on", "screen_hit_in"],
+        "entity_types": ["compound", "gene", "cell_line", "tissue", "disease"],
+        "when_to_emit": (
+            "Emit observations when the tool reports a top sensitive tissue, a top sensitive cell line, "
+            "or a direct gene-dependency / screen-hit statement."
+        ),
+        "extraction_rules": [
+            "Use the compound or gene as the subject, and the tissue, disease, or cell line as the object.",
+            "Prefer `sensitive_in` or `resistant_in` for compound response; prefer `depends_on` or `screen_hit_in` for gene-centric screening evidence.",
+            "Capture screening context in qualifiers such as dataset, metric, direction, tissue, or screen name.",
+        ],
+        "example": {
+            "observation_type": "drug_response",
+            "subject": {"type": "compound", "label": "Paclitaxel", "id": "CHEMBL3658657"},
+            "predicate": "sensitive_in",
+            "object": {"type": "cell_line", "label": "A549"},
+            "supporting_ids": ["CHEMBL3658657"],
+            "source_tool": "get_pharmacodb_compound_response",
+            "confidence": "high",
+            "qualifiers": {"dataset": "PharmacoDB", "metric": "AAC", "direction": "more_sensitive", "tissue": "lung"},
+        },
+    },
+    "phenotype_rare_disease": {
+        "label": "phenotype and rare-disease evidence",
+        "predicates": ["associated_with", "has_phenotype", "causal_gene_for", "correlated_gene_for"],
+        "entity_types": ["phenotype", "disease", "gene"],
+        "when_to_emit": (
+            "Emit observations when the tool resolves a phenotype, returns a curated disease-gene association, "
+            "or reports a phenotype-driven disease/gene link."
+        ),
+        "extraction_rules": [
+            "Use the phenotype or disease as the subject when the source is phenotype-first; use the disease as the subject for curated disease-gene links.",
+            "Prefer `causal_gene_for` for curated disease-causing links, `associated_with` for broader phenotype/disease links, and `has_phenotype` for disease-to-phenotype statements.",
+            "Capture query mode, association type, and evidence-count style fields in qualifiers instead of overloading the predicate.",
+        ],
+        "example": {
+            "observation_type": "phenotype_association",
+            "subject": {"type": "disease", "label": "Rett syndrome", "id": "ORPHA:778"},
+            "predicate": "causal_gene_for",
+            "object": {"type": "gene", "label": "MECP2"},
+            "supporting_ids": ["ORPHA:778"],
+            "source_tool": "get_orphanet_disease_profile",
+            "confidence": "high",
+            "qualifiers": {"association_type": "disease-causing germline mutation", "mode": "disease_to_gene"},
+        },
+    },
+    "translational_model_evidence": {
+        "label": "translational model-organism evidence",
+        "predicates": ["has_ortholog", "has_model", "has_phenotype", "associated_with"],
+        "entity_types": ["gene", "species", "model", "disease", "phenotype"],
+        "when_to_emit": (
+            "Emit observations when the tool reports representative orthologs, disease models, or cross-species phenotype context."
+        ),
+        "extraction_rules": [
+            "Use the source gene as the subject for ortholog and model relationships.",
+            "Prefer `has_ortholog` for ortholog rows and `has_model` for disease-model rows; use qualifiers for species, provider, or disease labels.",
+            "Only emit observations for the top orthologs or models that are actually summarized in the tool output.",
+        ],
+        "example": {
+            "observation_type": "translational_model",
+            "subject": {"type": "gene", "label": "TP53", "id": "HGNC:11998"},
+            "predicate": "has_ortholog",
+            "object": {"type": "gene", "label": "Trp53", "id": "MGI:98834"},
+            "supporting_ids": ["HGNC:11998"],
+            "source_tool": "get_alliance_genome_gene_profile",
+            "confidence": "high",
+            "qualifiers": {"species": "Mus musculus", "has_disease_annotations": True},
+        },
+    },
+    "molecular_interactions": {
+        "label": "molecular interaction evidence",
+        "predicates": ["interacts_with"],
+        "entity_types": ["gene", "protein"],
+        "when_to_emit": (
+            "Emit observations when the tool returns a top interaction partner with explicit experimental support."
+        ),
+        "extraction_rules": [
+            "Use one observation per top distinct partner rather than one observation per raw interaction row.",
+            "Use `interacts_with` as the predicate and store detection methods, interaction types, species, or miscore values in qualifiers.",
+            "Include PMIDs in supporting_ids when the source reports them directly.",
+        ],
+        "example": {
+            "observation_type": "interaction",
+            "subject": {"type": "gene", "label": "TP53"},
+            "predicate": "interacts_with",
+            "object": {"type": "gene", "label": "MDM2"},
+            "supporting_ids": ["PMID:10722742"],
+            "source_tool": "get_intact_interactions",
+            "confidence": "high",
+            "qualifiers": {"detection_method": "anti bait coimmunoprecipitation", "interaction_type": "physical association", "species": "human"},
+        },
+    },
+    "pathway_context": {
+        "label": "pathway and network context",
+        "predicates": ["participates_in", "associated_with"],
+        "entity_types": ["gene", "protein", "pathway"],
+        "when_to_emit": (
+            "Emit observations when the tool returns a specific named pathway or curated pathway context that clearly contains the queried gene/protein."
+        ),
+        "extraction_rules": [
+            "Use the gene or protein as the subject and the named pathway as the object.",
+            "Prefer `participates_in` for explicit pathway membership and reserve `associated_with` for broader network context.",
+            "Store provider, rank, or score information in qualifiers rather than the predicate.",
+        ],
+        "example": {
+            "observation_type": "pathway_context",
+            "subject": {"type": "gene", "label": "EGFR"},
+            "predicate": "participates_in",
+            "object": {"type": "pathway", "label": "EGFR signaling pathway", "id": "Reactome:R-HSA-177929"},
+            "supporting_ids": ["Reactome:R-HSA-177929"],
+            "source_tool": "search_pathway_commons_top_pathways",
+            "confidence": "medium",
+            "qualifiers": {"provider": "Reactome", "rank": 1},
+        },
+    },
+}
+
+
+def _determine_executor_cluster(step: dict[str, Any], tool_names: list[str]) -> str:
+    for tool_name in tool_names:
+        overlap_group = str(tool_registry.TOOL_ROUTING_METADATA.get(tool_name, {}).get("overlap_group", "")).strip()
+        if overlap_group and overlap_group in OVERLAP_GROUP_TO_EXECUTOR_CLUSTER:
+            return OVERLAP_GROUP_TO_EXECUTOR_CLUSTER[overlap_group]
+
+    for domain in step.get("domains", []) or []:
+        cluster = DOMAIN_TO_EXECUTOR_CLUSTER.get(str(domain).strip().lower())
+        if cluster:
+            return cluster
+
+    return "general"
+
+
+def _build_step_execution_metrics(
+    step: dict[str, Any],
+    validated_result: dict[str, Any],
+    *,
+    parse_retry_count: int = 0,
+) -> dict[str, Any]:
+    step_snapshot = dict(step)
+    step_snapshot.update(validated_result)
+    tool_hint = str(step.get("tool_hint", "")).strip()
+    tools_called = _dedupe_str_list(validated_result.get("tools_called", []) or [], limit=20)
+    tool_names_for_cluster = tools_called[:]
+    if tool_hint:
+        tool_names_for_cluster = _dedupe_str_list([tool_hint] + tool_names_for_cluster, limit=20)
+
+    fallback_tools = tool_registry.TOOL_ROUTING_METADATA.get(tool_hint, {}).get("fallback_tools", []) if tool_hint else []
+    used_tool_hint = bool(tool_hint and tool_hint in tools_called)
+    used_tool_hint_first = bool(tool_hint and tools_called and tools_called[0] == tool_hint)
+    fallback_used = bool(
+        tool_hint
+        and any(tool_name in set(fallback_tools) or tool_name != tool_hint for tool_name in tools_called)
+    )
+
+    return {
+        "step_id": str(validated_result.get("step_id", "")).strip(),
+        "status": str(validated_result.get("status", "")).strip().lower(),
+        "tool_hint": tool_hint,
+        "tool_hint_source": _resolve_source_label(tool_hint),
+        "tools_called": tools_called,
+        "tool_sources": _derive_step_data_sources(step_snapshot),
+        "overlap_groups": _dedupe_str_list(
+            [
+                tool_registry.TOOL_ROUTING_METADATA.get(tool_name, {}).get("overlap_group", "")
+                for tool_name in tool_names_for_cluster
+            ],
+            limit=10,
+        ),
+        "executor_cluster": _determine_executor_cluster(step, tool_names_for_cluster),
+        "used_tool_hint": used_tool_hint,
+        "used_tool_hint_first": used_tool_hint_first,
+        "fallback_used": fallback_used,
+        "tool_count": len(tools_called),
+        "evidence_count": len(validated_result.get("evidence_ids", []) or []),
+        "structured_observation_count": len(validated_result.get("structured_observations", []) or []),
+        "open_gap_count": len(validated_result.get("open_gaps", []) or []),
+        "parse_retry_count": max(0, int(parse_retry_count or 0)),
+    }
+
+
+def _summarize_evidence_store(store: dict[str, Any]) -> dict[str, Any]:
+    entities = list((store or {}).get("entities", {}).values())
+    claims = list((store or {}).get("claims", {}).values())
+    evidence_records = list((store or {}).get("evidence", []))
+    entities_by_type: dict[str, int] = {}
+    claims_by_predicate: dict[str, int] = {}
+    label_by_entity = {entity["id"]: entity.get("label", entity["id"]) for entity in entities}
+
+    for entity in entities:
+        entity_type = str(entity.get("type", "record")).strip() or "record"
+        entities_by_type[entity_type] = entities_by_type.get(entity_type, 0) + 1
+
+    for claim in claims:
+        predicate = str(claim.get("predicate", "related_to")).strip() or "related_to"
+        claims_by_predicate[predicate] = claims_by_predicate.get(predicate, 0) + 1
+
+    top_claims = []
+    for claim in sorted(
+        claims,
+        key=lambda item: (
+            int(item.get("evidence_count", 0) or 0),
+            len(item.get("source_labels", []) or []),
+            str(item.get("predicate", "")),
+        ),
+        reverse=True,
+    )[:10]:
+        object_id = str(claim.get("object_entity_id", "")).strip()
+        top_claims.append(
+            {
+                "predicate": claim.get("predicate", ""),
+                "subject": label_by_entity.get(claim.get("subject_entity_id", ""), claim.get("subject_entity_id", "")),
+                "object": label_by_entity.get(object_id, claim.get("object_literal", "")),
+                "status": claim.get("status", ""),
+                "support_count": int(claim.get("evidence_count", 0) or 0),
+                "source_count": len(claim.get("source_labels", []) or []),
+            }
+        )
+
+    sources = _dedupe_str_list(
+        [record.get("source_label", "") for record in evidence_records if record.get("source_label")],
+        limit=20,
+    )
+
+    return {
+        "entity_count": len(entities),
+        "claim_count": len(claims),
+        "evidence_count": len(evidence_records),
+        "entities_by_type": entities_by_type,
+        "claims_by_predicate": claims_by_predicate,
+        "sources": sources,
+        "top_claims": top_claims,
+    }
+
+
+SYNTHESIS_META_PREDICATES = {
+    "investigated_by",
+    "queried_source",
+    "supported_by",
+}
+
+
+CLAIM_SOURCE_TOOL_WEIGHTS: dict[str, float] = {
+    "get_clingen_gene_curation": 1.0,
+    "get_guidetopharmacology_target": 1.0,
+    "get_orphanet_disease_profile": 0.98,
+    "get_intact_interactions": 0.95,
+    "get_biogrid_interactions": 0.95,
+    "get_gdsc_drug_sensitivity": 0.95,
+    "get_depmap_gene_dependency": 0.93,
+    "get_chembl_bioactivities": 0.92,
+    "get_human_protein_atlas_gene": 0.9,
+    "search_reactome_pathways": 0.88,
+    "search_civic_variants": 0.88,
+    "search_civic_genes": 0.88,
+    "get_pharmacodb_compound_response": 0.87,
+    "get_gene_tissue_expression": 0.84,
+    "get_biogrid_orcs_gene_summary": 0.84,
+    "get_alliance_genome_gene_profile": 0.82,
+    "query_monarch_associations": 0.8,
+    "search_pathway_commons_top_pathways": 0.76,
+    "get_prism_repurposing_response": 0.74,
+    "annotate_variants_vep": 0.72,
+    "search_hpo_terms": 0.68,
+    "get_string_interactions": 0.65,
+    "get_variant_annotations": 0.62,
+    "search_drug_gene_interactions": 0.6,
+    "get_pubchem_compound": 0.45,
+}
+
+
+CLAIM_OVERLAP_GROUP_WEIGHTS: dict[str, float] = {
+    "compound_pharmacology": 0.8,
+    "variant_evidence": 0.78,
+    "molecular_interactions": 0.82,
+    "pathway_context": 0.72,
+    "expression_context": 0.78,
+    "target_vulnerability": 0.8,
+    "phenotype_rare_disease": 0.8,
+    "translational_model_evidence": 0.75,
+    "literature_search": 0.7,
+}
+
+
+CLAIM_PREDICATE_STRENGTH_BONUS: dict[str, float] = {
+    "causal_gene_for": 0.24,
+    "depends_on": 0.16,
+    "has_function": 0.14,
+    "sensitive_in": 0.12,
+    "resistant_in": 0.12,
+    "has_ortholog": 0.12,
+    "has_model": 0.12,
+    "interacts_with": 0.1,
+    "participates_in": 0.08,
+    "has_phenotype": 0.05,
+    "screen_hit_in": 0.05,
+    "correlated_gene_for": -0.02,
+}
+
+
+CLAIM_CONFLICT_GROUPS: dict[str, dict[str, set[str]]] = {
+    "response_direction": {
+        "supporting": {"sensitive_in"},
+        "opposing": {"resistant_in"},
+    },
+}
+
+
+CLAIM_CONFLICT_LEAN_THRESHOLD = 0.3
+
+
+CLAIM_DISPLAY_PREDICATE_BONUS: dict[str, float] = {
+    "causal_gene_for": 0.85,
+    "associated_with": 0.75,
+    "depends_on": 0.6,
+    "has_function": 0.5,
+    "participates_in": 0.35,
+    "sensitive_in": 0.35,
+    "resistant_in": 0.35,
+    "has_ortholog": 0.25,
+    "has_model": 0.25,
+    "has_phenotype": 0.2,
+    "interacts_with": 0.05,
+    "cross_referenced_in": -0.8,
+}
+
+
+OBJECTIVE_FOCUS_STOPWORDS = {
+    "about",
+    "across",
+    "agent",
+    "and",
+    "are",
+    "assess",
+    "assessment",
+    "by",
+    "clinical",
+    "considered",
+    "conviction",
+    "determine",
+    "development",
+    "disease",
+    "evaluate",
+    "evaluating",
+    "evidence",
+    "for",
+    "function",
+    "genetic",
+    "high",
+    "if",
+    "is",
+    "landscape",
+    "of",
+    "or",
+    "parkinson",
+    "parkinsons",
+    "pd",
+    "protein",
+    "target",
+    "therapeutic",
+    "therapy",
+    "trial",
+    "trials",
+    "whether",
+}
+
+
+GENERIC_MODEL_SUMMARY_MARKERS = {
+    "this is a vague model summary",
+    "no final summary was produced",
+    "the collected evidence is not yet sufficient",
+    "the following key findings were identified",
+    "the following findings were identified",
+}
+
+
+def _source_support_weight(source_tool: str, source_label: str) -> float:
+    tool_name = str(source_tool or "").strip()
+    if tool_name in CLAIM_SOURCE_TOOL_WEIGHTS:
+        return CLAIM_SOURCE_TOOL_WEIGHTS[tool_name]
+    overlap_group = str(tool_registry.TOOL_ROUTING_METADATA.get(tool_name, {}).get("overlap_group", "")).strip()
+    if overlap_group in CLAIM_OVERLAP_GROUP_WEIGHTS:
+        return CLAIM_OVERLAP_GROUP_WEIGHTS[overlap_group]
+    label = str(source_label or "").strip()
+    for known_tool, known_label in tool_registry.TOOL_SOURCE_NAMES.items():
+        if label and label == known_label and known_tool in CLAIM_SOURCE_TOOL_WEIGHTS:
+            return CLAIM_SOURCE_TOOL_WEIGHTS[known_tool]
+    return 0.6
+
+
+def _humanize_claim_predicate(predicate: str) -> str:
+    mapping = {
+        "associated_with": "is associated with",
+        "causal_gene_for": "is a causal gene for",
+        "correlated_gene_for": "is correlated with",
+        "depends_on": "depends on",
+        "has_model": "has model",
+        "has_ortholog": "has ortholog",
+        "has_phenotype": "has phenotype",
+        "interacts_with": "interacts with",
+        "participates_in": "participates in",
+        "queried_source": "queried source",
+        "resistant_in": "is resistant in",
+        "screen_hit_in": "is a screen hit in",
+        "sensitive_in": "is sensitive in",
+        "supported_by": "is supported by",
+    }
+    cleaned = str(predicate or "").strip()
+    return mapping.get(cleaned, cleaned.replace("_", " "))
+
+
+def _claim_object_key(claim: dict[str, Any]) -> str:
+    object_entity_id = str(claim.get("object_entity_id", "") or "").strip()
+    if object_entity_id:
+        return object_entity_id
+    object_literal = str(claim.get("object_literal", "") or "").strip()
+    if object_literal:
+        return f"literal:{_slugify_token(object_literal)}"
+    return "none"
+
+
+def _looks_like_identifier_text(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+    if not cleaned:
+        return False
+    patterns = [
+        r"^[A-Z][A-Z0-9_-]{1,24}:[A-Za-z0-9._/-]+$",
+        r"^CHEMBL\d+$",
+        r"^rs\d+$",
+        r"^[OPQ][0-9][A-Z0-9]{3}[0-9](?:-\d+)?$",
+        r"^[A-NR-Z]\d[A-Z0-9]{3}\d(?:-\d+)?$",
+        r"^ENS[A-Z]*\d+$",
+    ]
+    return any(re.match(pattern, cleaned, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _extract_objective_focus_terms(objective_text: str) -> list[str]:
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", str(objective_text or ""))
+    focus: list[str] = []
+    for token in tokens:
+        lowered = token.lower()
+        if lowered in OBJECTIVE_FOCUS_STOPWORDS:
+            continue
+        focus.append(lowered)
+    return _dedupe_str_list(focus, limit=12)
+
+
+def _claim_display_priority_score(claim: dict[str, Any], objective_text: str) -> float:
+    score = float(claim.get("support_score", 0.0) or 0.0)
+    predicate = str(claim.get("predicate", "")).strip()
+    score += CLAIM_DISPLAY_PREDICATE_BONUS.get(predicate, 0.0)
+
+    focus_terms = _extract_objective_focus_terms(objective_text)
+    haystack = " ".join(
+        [
+            str(claim.get("statement", "")).lower(),
+            str(claim.get("subject", "")).lower(),
+            str(claim.get("object", "")).lower(),
+            " ".join(str(source).lower() for source in (claim.get("primary_sources", []) or [])),
+        ]
+    )
+    matched_focus_terms = sum(1 for term in focus_terms if term in haystack)
+    score += min(0.75, 0.2 * matched_focus_terms)
+
+    objective_lower = str(objective_text or "").lower()
+    if any(term in objective_lower for term in ["target", "conviction", "therapeutic"]):
+        score += {
+            "causal_gene_for": 0.25,
+            "associated_with": 0.2,
+            "has_function": 0.12,
+            "participates_in": 0.08,
+            "cross_referenced_in": -0.3,
+            "interacts_with": -0.1,
+        }.get(predicate, 0.0)
+    if "trial" in objective_lower:
+        score += {"tested_in": 0.25, "associated_with": 0.05}.get(predicate, 0.0)
+    if "genetic" in objective_lower:
+        score += {"causal_gene_for": 0.2, "associated_with": 0.1}.get(predicate, 0.0)
+    if "function" in objective_lower:
+        score += {"has_function": 0.18, "participates_in": 0.08}.get(predicate, 0.0)
+
+    identifier_penalty = 0.0
+    if _looks_like_identifier_text(str(claim.get("subject", ""))):
+        identifier_penalty += 0.2
+    if _looks_like_identifier_text(str(claim.get("object", ""))):
+        identifier_penalty += 0.2
+    score -= min(0.4, identifier_penalty)
+    return round(score, 3)
+
+
+def _first_substantive_paragraph(text: str) -> str:
+    for block in re.split(r"\n\s*\n", str(text or "").strip()):
+        cleaned = block.strip()
+        if not cleaned:
+            continue
+        if cleaned.startswith("#") or cleaned.startswith("- ") or re.match(r"^\d+\.\s", cleaned):
+            continue
+        return re.sub(r"\s+", " ", cleaned).strip()
+    return ""
+
+
+def _first_sentence(text: str, *, max_chars: int = 280) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+    if not cleaned:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", cleaned)
+    sentence = parts[0].strip() if parts else cleaned
+    if len(sentence) > max_chars:
+        sentence = sentence[: max_chars - 3].rstrip() + "..."
+    return sentence
+
+
+def _step_highlight_priority(step: dict[str, Any], summary: str) -> float:
+    goal = _normalize_user_text(str(step.get("goal", "")).strip())
+    summary_text = _normalize_user_text(summary)
+    combined = f"{goal} {summary_text}".strip()
+    score = min(len(summary_text), 220) / 220.0 if summary_text else 0.0
+
+    high_signal_markers = [
+        "associated",
+        "pathway",
+        "mechanism",
+        "target class",
+        "clinical",
+        "trial",
+        "publication",
+        "review",
+        "literature",
+        "dataset",
+        "cohort",
+        "function",
+        "interaction",
+        "sensitivity",
+        "resistant",
+        "dependency",
+        "expression",
+        "recruiting",
+        "completed",
+    ]
+    score += 0.18 * min(4, sum(1 for marker in high_signal_markers if marker in combined))
+
+    foundational_markers = [
+        "retrieve the disease id",
+        "determine the disease id",
+        "disease identifier",
+        "standardized reference",
+        "enable subsequent",
+        "lookup identifier",
+        "mapping identifier",
+        "mondo id",
+        "efo id",
+    ]
+    if any(marker in combined for marker in foundational_markers):
+        score -= 1.0
+    if re.search(r"\b(?:mondo|efo|mesh|doid|hp)[_: -]?[a-z0-9]+\b", combined):
+        score -= 0.35
+    if _looks_like_identifier_text(summary):
+        score -= 0.35
+
+    return round(score, 3)
+
+
+def _build_step_result_highlights(task_state: dict[str, Any], *, limit: int = 4) -> list[dict[str, str]]:
+    candidates: list[tuple[float, int, dict[str, str]]] = []
+    seen: set[str] = set()
+    for idx, step in enumerate(task_state.get("steps", [])):
+        if str(step.get("status", "")).strip() != "completed":
+            continue
+        summary = _first_sentence(str(step.get("result_summary", "")).strip())
+        if not summary:
+            summary = _first_sentence(str(step.get("step_progress_note", "")).strip())
+        if not summary:
+            continue
+        normalized = _normalize_user_text(summary)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        source = _format_step_source_display(step)
+        candidates.append((
+            _step_highlight_priority(step, summary),
+            idx,
+            {
+                "summary": summary,
+                "source": source,
+            },
+        ))
+    candidates.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    highlights = [item[2] for item in candidates[:limit]]
+    return highlights
+
+
+def _is_informative_model_summary(objective_text: str, model_summary: str) -> bool:
+    paragraph = _first_substantive_paragraph(model_summary)
+    if not paragraph:
+        return False
+    lowered = paragraph.lower()
+    if any(marker in lowered for marker in GENERIC_MODEL_SUMMARY_MARKERS):
+        return False
+    if lowered.endswith(":"):
+        return False
+    if re.match(r"^(to|in order to)\b", lowered) and ("the following" in lowered or "findings were identified" in lowered):
+        return False
+    if len(paragraph) < 90:
+        return False
+    focus_terms = _extract_objective_focus_terms(objective_text)
+    if any(term in lowered for term in focus_terms[:6]):
+        return True
+    informative_cues = ["suggests", "supports", "indicates", "appears", "likely", "unlikely", "high-conviction", "not high-conviction"]
+    if sum(1 for cue in informative_cues if cue in lowered) >= 1 and len(re.findall(r"[.!?]", paragraph)) >= 1:
+        return True
+    return False
+
+
+def _build_claim_statement(claim: dict[str, Any], label_by_entity: dict[str, str]) -> tuple[str, str, str]:
+    subject = label_by_entity.get(claim.get("subject_entity_id", ""), claim.get("subject_entity_id", ""))
+    object_entity_id = str(claim.get("object_entity_id", "") or "").strip()
+    object_text = label_by_entity.get(object_entity_id, "") if object_entity_id else ""
+    if not object_text:
+        object_text = str(claim.get("object_literal", "") or "").strip()
+    predicate_text = _humanize_claim_predicate(str(claim.get("predicate", "") or "").strip())
+    statement = f"{subject} {predicate_text} {object_text}".strip()
+    return statement, subject, object_text
+
+
+def _claim_conflict_signature(predicate: str) -> tuple[str, str] | None:
+    predicate_name = str(predicate or "").strip()
+    for group_name, polarity_map in CLAIM_CONFLICT_GROUPS.items():
+        for polarity, predicates in polarity_map.items():
+            if predicate_name in predicates:
+                return group_name, polarity
+    return None
+
+
+def _score_adjudicated_claim(claim: dict[str, Any], evidence_records: list[dict[str, Any]], label_by_entity: dict[str, str]) -> dict[str, Any]:
+    source_details: dict[str, dict[str, Any]] = {}
+    supporting_ids = _dedupe_str_list(
+        [
+            identifier
+            for record in evidence_records
+            for identifier in (record.get("evidence_ids") or [])
+        ],
+        limit=12,
+    )
+    for record in evidence_records:
+        source_tool = str(record.get("source_tool", "") or "").strip()
+        source_label = str(record.get("source_label", "") or "").strip() or _resolve_source_label(source_tool)
+        source_key = source_label or source_tool or "Unknown source"
+        weight = _source_support_weight(source_tool, source_label)
+        existing = source_details.get(source_key)
+        detail = {
+            "source": source_key,
+            "source_tool": source_tool,
+            "weight": round(weight, 3),
+            "overlap_group": str(tool_registry.TOOL_ROUTING_METADATA.get(source_tool, {}).get("overlap_group", "")).strip(),
+        }
+        if existing is None or detail["weight"] > float(existing.get("weight", 0.0) or 0.0):
+            source_details[source_key] = detail
+
+    sorted_sources = sorted(
+        source_details.values(),
+        key=lambda item: (float(item.get("weight", 0.0) or 0.0), item.get("source", "")),
+        reverse=True,
+    )
+    source_score = sum(float(item.get("weight", 0.0) or 0.0) for item in sorted_sources[:4])
+    evidence_bonus = min(0.3, 0.05 * len(supporting_ids))
+    observation_bonus = min(0.2, 0.04 * len(evidence_records))
+    confidence_bonus = {
+        "high": 0.25,
+        "medium": 0.12,
+        "low": 0.03,
+    }.get(str(claim.get("confidence", "unknown")).strip().lower(), 0.0)
+    predicate_bonus = CLAIM_PREDICATE_STRENGTH_BONUS.get(str(claim.get("predicate", "")).strip(), 0.0)
+    support_score = round(source_score + evidence_bonus + observation_bonus + confidence_bonus + predicate_bonus, 3)
+
+    if support_score >= 2.0 or (len(sorted_sources) >= 2 and len(supporting_ids) >= 2):
+        support_strength = "high"
+    elif support_score >= 1.0:
+        support_strength = "medium"
+    else:
+        support_strength = "low"
+
+    statement, subject_text, object_text = _build_claim_statement(claim, label_by_entity)
+    return {
+        "claim_id": str(claim.get("id", "")).strip(),
+        "statement": statement,
+        "subject": subject_text,
+        "predicate": str(claim.get("predicate", "")).strip(),
+        "object": object_text,
+        "status": str(claim.get("status", "")).strip(),
+        "claim_confidence": str(claim.get("confidence", "unknown")).strip(),
+        "support_score": support_score,
+        "support_strength": support_strength,
+        "source_count": len(sorted_sources),
+        "evidence_count": len(evidence_records),
+        "primary_sources": [item.get("source", "") for item in sorted_sources[:3] if item.get("source")],
+        "supporting_ids": supporting_ids,
+        "source_weights": sorted_sources[:5],
+        "subject_entity_id": str(claim.get("subject_entity_id", "")).strip(),
+        "object_key": _claim_object_key(claim),
+    }
+
+
+def _detect_claim_conflicts(adjudicated_claims: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], set[str]]:
+    buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for claim in adjudicated_claims:
+        signature = _claim_conflict_signature(claim.get("predicate", ""))
+        if signature is None:
+            continue
+        group_name, polarity = signature
+        bucket_key = (
+            str(claim.get("subject_entity_id", "")).strip(),
+            str(claim.get("object_key", "")).strip(),
+            group_name,
+        )
+        bucket = buckets.setdefault(
+            bucket_key,
+            {
+                "group": group_name,
+                "subject": claim.get("subject", ""),
+                "object": claim.get("object", ""),
+                "claims_by_polarity": {},
+            },
+        )
+        bucket["claims_by_polarity"].setdefault(polarity, []).append(claim)
+
+    conflicts: list[dict[str, Any]] = []
+    mixed_claim_ids: set[str] = set()
+    for bucket in buckets.values():
+        claims_by_polarity = bucket.get("claims_by_polarity", {})
+        if len(claims_by_polarity) < 2:
+            continue
+        polarity_scores = {
+            polarity: round(sum(float(claim.get("support_score", 0.0) or 0.0) for claim in claims), 3)
+            for polarity, claims in claims_by_polarity.items()
+        }
+        ordered_polarities = sorted(
+            polarity_scores.items(),
+            key=lambda item: (item[1], item[0]),
+            reverse=True,
+        )
+        leading_polarity, leading_score = ordered_polarities[0]
+        trailing_polarity, trailing_score = ordered_polarities[1]
+        support_gap = round(leading_score - trailing_score, 3)
+        if support_gap >= CLAIM_CONFLICT_LEAN_THRESHOLD:
+            preferred_claim = max(
+                claims_by_polarity.get(leading_polarity, []),
+                key=lambda claim: (float(claim.get("support_score", 0.0) or 0.0), claim.get("statement", "")),
+            )
+            assessment = f"mixed_lean_{leading_polarity}"
+            preferred_interpretation = preferred_claim.get("statement", "")
+        else:
+            assessment = "mixed_equivocal"
+            preferred_interpretation = ""
+
+        conflict_claims = []
+        for polarity, claims in sorted(claims_by_polarity.items()):
+            for claim in sorted(
+                claims,
+                key=lambda item: (float(item.get("support_score", 0.0) or 0.0), item.get("statement", "")),
+                reverse=True,
+            ):
+                mixed_claim_ids.add(str(claim.get("claim_id", "")).strip())
+                conflict_claims.append(
+                    {
+                        "statement": claim.get("statement", ""),
+                        "predicate": claim.get("predicate", ""),
+                        "support_score": claim.get("support_score", 0.0),
+                        "support_strength": claim.get("support_strength", ""),
+                        "primary_sources": list(claim.get("primary_sources", []) or [])[:3],
+                        "polarity": polarity,
+                    }
+                )
+
+        conflicts.append(
+            {
+                "subject": bucket.get("subject", ""),
+                "object": bucket.get("object", ""),
+                "conflict_group": bucket.get("group", ""),
+                "assessment": assessment,
+                "preferred_interpretation": preferred_interpretation,
+                "leading_support_score": leading_score,
+                "trailing_support_score": trailing_score,
+                "support_gap": support_gap,
+                "claims": conflict_claims,
+            }
+        )
+
+    conflicts.sort(
+        key=lambda item: (
+            float(item.get("support_gap", 0.0) or 0.0),
+            float(item.get("leading_support_score", 0.0) or 0.0),
+            str(item.get("subject", "")),
+        ),
+        reverse=True,
+    )
+    return conflicts, mixed_claim_ids
+
+
+def _build_claim_synthesis_summary(store: dict[str, Any], objective_text: str = "") -> dict[str, Any]:
+    claims = list((store or {}).get("claims", {}).values())
+    evidence_records = list((store or {}).get("evidence", []))
+    label_by_entity = {
+        entity_id: str(entity.get("label", entity_id)).strip()
+        for entity_id, entity in ((store or {}).get("entities", {}) or {}).items()
+    }
+    evidence_by_claim: dict[str, list[dict[str, Any]]] = {}
+    for record in evidence_records:
+        claim_id = str(record.get("claim_id", "")).strip()
+        if not claim_id:
+            continue
+        evidence_by_claim.setdefault(claim_id, []).append(record)
+
+    substantive_claims = [
+        claim
+        for claim in claims
+        if str(claim.get("predicate", "")).strip() not in SYNTHESIS_META_PREDICATES
+    ]
+    adjudicated_claims = [
+        _score_adjudicated_claim(claim, evidence_by_claim.get(str(claim.get("id", "")).strip(), []), label_by_entity)
+        for claim in substantive_claims
+    ]
+    conflicts, mixed_claim_ids = _detect_claim_conflicts(adjudicated_claims)
+
+    for claim in adjudicated_claims:
+        claim["mixed_evidence"] = str(claim.get("claim_id", "")).strip() in mixed_claim_ids
+        claim["display_priority_score"] = _claim_display_priority_score(claim, objective_text)
+
+    ranked_claims = sorted(
+        adjudicated_claims,
+        key=lambda claim: (
+            float(claim.get("display_priority_score", 0.0) or 0.0),
+            1 if not claim.get("mixed_evidence") else 0,
+            int(claim.get("source_count", 0) or 0),
+            str(claim.get("statement", "")),
+        ),
+        reverse=True,
+    )
+
+    source_weight_reference: dict[str, dict[str, Any]] = {}
+    for claim in adjudicated_claims:
+        for source in claim.get("source_weights", []) or []:
+            source_name = str(source.get("source", "")).strip()
+            if not source_name:
+                continue
+            existing = source_weight_reference.get(source_name)
+            if existing is None or float(source.get("weight", 0.0) or 0.0) > float(existing.get("weight", 0.0) or 0.0):
+                source_weight_reference[source_name] = {
+                    "source": source_name,
+                    "weight": round(float(source.get("weight", 0.0) or 0.0), 3),
+                    "overlap_group": str(source.get("overlap_group", "") or "").strip(),
+                }
+
+    strength_counts = {"high": 0, "medium": 0, "low": 0}
+    for claim in adjudicated_claims:
+        strength = str(claim.get("support_strength", "low")).strip().lower()
+        if strength in strength_counts:
+            strength_counts[strength] += 1
+
+    def _public_claim_summary(claim: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "statement": claim.get("statement", ""),
+            "predicate": claim.get("predicate", ""),
+            "support_score": claim.get("support_score", 0.0),
+            "support_strength": claim.get("support_strength", ""),
+            "mixed_evidence": bool(claim.get("mixed_evidence")),
+            "source_count": int(claim.get("source_count", 0) or 0),
+            "evidence_count": int(claim.get("evidence_count", 0) or 0),
+            "display_priority_score": claim.get("display_priority_score", 0.0),
+            "primary_sources": list(claim.get("primary_sources", []) or [])[:3],
+            "supporting_ids": list(claim.get("supporting_ids", []) or [])[:8],
+        }
+
+    return {
+        "substantive_claim_count": len(adjudicated_claims),
+        "high_support_count": strength_counts["high"],
+        "medium_support_count": strength_counts["medium"],
+        "low_support_count": strength_counts["low"],
+        "mixed_evidence_count": len(conflicts),
+        "top_supported_claims": [_public_claim_summary(claim) for claim in ranked_claims[:8]],
+        "mixed_evidence_claims": conflicts[:6],
+        "source_weighting_reference": sorted(
+            source_weight_reference.values(),
+            key=lambda item: (float(item.get("weight", 0.0) or 0.0), item.get("source", "")),
+            reverse=True,
+        )[:10],
+    }
+
+
+def _aggregate_executor_metrics(step_metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    if not step_metrics:
+        return _new_execution_metrics_bundle()["summary"]
+
+    summary = {
+        "step_count": len(step_metrics),
+        "completed_count": sum(1 for metric in step_metrics if metric.get("status") == "completed"),
+        "blocked_count": sum(1 for metric in step_metrics if metric.get("status") == "blocked"),
+        "tool_hint_accuracy": None,
+        "tool_hint_first_accuracy": None,
+        "fallback_rate": 0.0,
+        "avg_tools_per_step": 0.0,
+        "avg_evidence_ids_per_step": 0.0,
+        "avg_structured_observations_per_step": 0.0,
+        "avg_parse_retries_per_step": 0.0,
+        "clusters": [],
+        "specialization_watchlist": [],
+    }
+    hinted = [metric for metric in step_metrics if metric.get("tool_hint")]
+    if hinted:
+        summary["tool_hint_accuracy"] = round(
+            sum(1 for metric in hinted if metric.get("used_tool_hint")) / len(hinted),
+            3,
+        )
+        summary["tool_hint_first_accuracy"] = round(
+            sum(1 for metric in hinted if metric.get("used_tool_hint_first")) / len(hinted),
+            3,
+        )
+    summary["fallback_rate"] = round(
+        sum(1 for metric in step_metrics if metric.get("fallback_used")) / len(step_metrics),
+        3,
+    )
+    summary["avg_tools_per_step"] = round(
+        sum(int(metric.get("tool_count", 0) or 0) for metric in step_metrics) / len(step_metrics),
+        3,
+    )
+    summary["avg_evidence_ids_per_step"] = round(
+        sum(int(metric.get("evidence_count", 0) or 0) for metric in step_metrics) / len(step_metrics),
+        3,
+    )
+    summary["avg_structured_observations_per_step"] = round(
+        sum(int(metric.get("structured_observation_count", 0) or 0) for metric in step_metrics) / len(step_metrics),
+        3,
+    )
+    summary["avg_parse_retries_per_step"] = round(
+        sum(int(metric.get("parse_retry_count", 0) or 0) for metric in step_metrics) / len(step_metrics),
+        3,
+    )
+
+    cluster_groups: dict[str, list[dict[str, Any]]] = {}
+    for metric in step_metrics:
+        cluster_groups.setdefault(str(metric.get("executor_cluster", "general")), []).append(metric)
+
+    cluster_summaries = []
+    watchlist: list[str] = []
+    for cluster_name in sorted(cluster_groups):
+        metrics = cluster_groups[cluster_name]
+        hinted_metrics = [metric for metric in metrics if metric.get("tool_hint")]
+        tool_hint_accuracy = None
+        if hinted_metrics:
+            tool_hint_accuracy = round(
+                sum(1 for metric in hinted_metrics if metric.get("used_tool_hint")) / len(hinted_metrics),
+                3,
+            )
+        fallback_rate = round(
+            sum(1 for metric in metrics if metric.get("fallback_used")) / len(metrics),
+            3,
+        )
+        blocked_rate = round(
+            sum(1 for metric in metrics if metric.get("status") == "blocked") / len(metrics),
+            3,
+        )
+        cluster_summary = {
+            "cluster": cluster_name,
+            "step_count": len(metrics),
+            "blocked_rate": blocked_rate,
+            "fallback_rate": fallback_rate,
+            "tool_hint_accuracy": tool_hint_accuracy,
+            "avg_tools_per_step": round(
+                sum(int(metric.get("tool_count", 0) or 0) for metric in metrics) / len(metrics),
+                3,
+            ),
+            "avg_structured_observations_per_step": round(
+                sum(int(metric.get("structured_observation_count", 0) or 0) for metric in metrics) / len(metrics),
+                3,
+            ),
+            "avg_parse_retries_per_step": round(
+                sum(int(metric.get("parse_retry_count", 0) or 0) for metric in metrics) / len(metrics),
+                3,
+            ),
+        }
+        cluster_summaries.append(cluster_summary)
+        if len(metrics) >= 2 and (
+            (tool_hint_accuracy is not None and tool_hint_accuracy < 0.85)
+            or fallback_rate > 0.25
+            or blocked_rate > 0.2
+        ):
+            watchlist.append(cluster_name)
+
+    summary["clusters"] = cluster_summaries
+    summary["specialization_watchlist"] = watchlist
+    return summary
+
+
+def _append_structured_observation_claims(
+    store: dict[str, Any],
+    *,
+    step: dict[str, Any],
+    observations: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    entity_ids: list[str] = []
+    claim_ids: list[str] = []
+    step_id = str(step.get("id", "")).strip()
+    default_tool = str(step.get("tool_hint", "")).strip()
+    default_summary = str(step.get("result_summary", "")).strip()
+
+    for observation in observations:
+        subject_ref = observation.get("subject") or {}
+        subject_entity = _upsert_entity(
+            store,
+            subject_ref.get("type", "record"),
+            subject_ref.get("label") or subject_ref.get("id") or "Unknown subject",
+            aliases=subject_ref.get("aliases"),
+            attrs=subject_ref.get("attrs"),
+            canonical_key=_canonical_entity_key(
+                subject_ref.get("type", "record"),
+                subject_ref.get("id") or subject_ref.get("label") or "unknown_subject",
+            ),
+        )
+        entity_ids.append(subject_entity["id"])
+
+        object_ref = observation.get("object")
+        object_entity_id = ""
+        object_literal = str(observation.get("object_literal", "")).strip()
+        if isinstance(object_ref, dict):
+            object_entity = _upsert_entity(
+                store,
+                object_ref.get("type", "record"),
+                object_ref.get("label") or object_ref.get("id") or "Unknown object",
+                aliases=object_ref.get("aliases"),
+                attrs=object_ref.get("attrs"),
+                canonical_key=_canonical_entity_key(
+                    object_ref.get("type", "record"),
+                    object_ref.get("id") or object_ref.get("label") or "unknown_object",
+                ),
+            )
+            object_entity_id = object_entity["id"]
+            entity_ids.append(object_entity["id"])
+
+        source_tool = str(observation.get("source_tool", "")).strip() or default_tool
+        source_label = _preferred_step_source_label(step, source_tool)
+        claim = _upsert_claim(
+            store,
+            subject_entity["id"],
+            str(observation.get("predicate", "")).strip(),
+            object_id=object_entity_id,
+            object_literal=object_literal,
+            status="supported",
+            confidence=str(observation.get("confidence", "medium")).strip().lower(),
+            step_id=step_id,
+            source_tool=source_tool,
+            source_label=source_label,
+            observation_type=str(observation.get("observation_type", "")).strip(),
+        )
+        claim_ids.append(claim["id"])
+
+        qualifier_text = _format_observation_qualifiers(observation.get("qualifiers", {}))
+        evidence_summary = default_summary
+        if qualifier_text:
+            evidence_summary = f"{default_summary} | {qualifier_text}" if default_summary else qualifier_text
+        _append_evidence_record(
+            store,
+            claim_id=claim["id"],
+            step_id=step_id,
+            source_tool=source_tool,
+            source_label=source_label,
+            evidence_ids=observation.get("supporting_ids", []),
+            summary_text=evidence_summary,
+            qualifiers=observation.get("qualifiers", {}),
+        )
+
+    return _merge_str_values([], entity_ids), _merge_str_values([], claim_ids)
+
+
+def _extract_v1_evidence_from_step(
+    task_state: dict[str, Any],
+    step: dict[str, Any],
+    store: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    status = str(step.get("status", "")).strip().lower()
+    if status not in {"completed", "blocked"}:
+        return [], []
+
+    entity_ids: list[str] = []
+    claim_ids: list[str] = []
+    objective = str(task_state.get("objective", "")).strip()
+    objective_fingerprint = str(task_state.get("objective_fingerprint", "")).strip()
+    objective_entity = _upsert_entity(
+        store,
+        "objective",
+        objective or "Research objective",
+        attrs={"fingerprint": objective_fingerprint},
+        canonical_key=f"objective:{_slugify_token(objective_fingerprint or objective or 'objective')}",
+    )
+    entity_ids.append(objective_entity["id"])
+
+    step_id = str(step.get("id", "")).strip()
+    step_goal = str(step.get("goal", "")).strip() or step_id or "Workflow step"
+    step_entity = _upsert_entity(
+        store,
+        "step",
+        f"{step_id}: {step_goal}" if step_id else step_goal,
+        aliases=[step_id] if step_id else [],
+        attrs={
+            "step_id": step_id,
+            "status": status,
+            "tool_hint": step.get("tool_hint", ""),
+            "domains": step.get("domains", []),
+            "completion_condition": step.get("completion_condition", ""),
+        },
+        canonical_key=f"step:{_slugify_token(step_id or step_goal)}",
+    )
+    entity_ids.append(step_entity["id"])
+
+    investigated_claim = _upsert_claim(
+        store,
+        objective_entity["id"],
+        "investigated_by",
+        object_id=step_entity["id"],
+        status="observed",
+        confidence="high",
+        step_id=step_id,
+        source_tool=str(step.get("tool_hint", "")).strip(),
+        source_label=_preferred_step_source_label(step, str(step.get("tool_hint", "")).strip()),
+    )
+    claim_ids.append(investigated_claim["id"])
+
+    observed_tools = _dedupe_str_list(
+        ([step.get("tool_hint")] if step.get("tool_hint") else []) + list(step.get("tools_called", []) or []),
+        limit=20,
+    )
+    for tool_name in observed_tools:
+        source_label = _preferred_step_source_label(step, tool_name)
+        source_entity = _upsert_entity(
+            store,
+            "source",
+            source_label,
+            aliases=[tool_name],
+            attrs={
+                "tool_names": [tool_name],
+                "domains": tool_registry.TOOL_TO_DOMAINS.get(tool_name, []),
+                "overlap_group": tool_registry.TOOL_ROUTING_METADATA.get(tool_name, {}).get("overlap_group", ""),
+            },
+            canonical_key=f"source:{_slugify_token(source_label)}",
+        )
+        entity_ids.append(source_entity["id"])
+        queried_claim = _upsert_claim(
+            store,
+            step_entity["id"],
+            "queried_source",
+            object_id=source_entity["id"],
+            status="observed",
+            confidence="high",
+            step_id=step_id,
+            source_tool=tool_name,
+            source_label=source_label,
+        )
+        claim_ids.append(queried_claim["id"])
+        _append_evidence_record(
+            store,
+            claim_id=queried_claim["id"],
+            step_id=step_id,
+            source_tool=tool_name,
+            source_label=source_label,
+            evidence_ids=list(step.get("evidence_ids", []) or [])[:5],
+            summary_text=str(step.get("step_progress_note", "") or step.get("result_summary", "")).strip(),
+        )
+
+    if status != "completed":
+        return _merge_str_values([], entity_ids), _merge_str_values([], claim_ids)
+
+    evidence_ids = _dedupe_str_list(step.get("evidence_ids", []) or [], limit=30)
+    primary_tool = observed_tools[0] if observed_tools else str(step.get("tool_hint", "")).strip()
+    primary_source = _preferred_step_source_label(step, primary_tool)
+    claim_confidence = "high" if len(evidence_ids) >= 3 else ("medium" if evidence_ids else "low")
+    for identifier in evidence_ids:
+        inferred = _infer_entity_from_identifier(identifier)
+        if inferred is None:
+            continue
+        evidence_entity = _upsert_entity(
+            store,
+            inferred["entity_type"],
+            inferred["label"],
+            aliases=inferred.get("aliases"),
+            attrs=inferred.get("attrs"),
+            canonical_key=inferred.get("canonical_key"),
+        )
+        entity_ids.append(evidence_entity["id"])
+        support_claim = _upsert_claim(
+            store,
+            objective_entity["id"],
+            "supported_by",
+            object_id=evidence_entity["id"],
+            status="supported",
+            confidence=claim_confidence,
+            step_id=step_id,
+            source_tool=primary_tool,
+            source_label=primary_source,
+        )
+        claim_ids.append(support_claim["id"])
+        _append_evidence_record(
+            store,
+            claim_id=support_claim["id"],
+            step_id=step_id,
+            source_tool=primary_tool,
+            source_label=primary_source,
+            evidence_ids=[identifier],
+            summary_text=str(step.get("result_summary", "")).strip(),
+        )
+
+    if not evidence_ids and primary_tool:
+        source_entity = _upsert_entity(
+            store,
+            "source",
+            primary_source,
+            aliases=[primary_tool],
+            attrs={"tool_names": [primary_tool]},
+            canonical_key=f"source:{_slugify_token(primary_source)}",
+        )
+        entity_ids.append(source_entity["id"])
+        support_claim = _upsert_claim(
+            store,
+            objective_entity["id"],
+            "supported_by",
+            object_id=source_entity["id"],
+            status="supported",
+            confidence="low",
+            step_id=step_id,
+            source_tool=primary_tool,
+            source_label=primary_source,
+        )
+        claim_ids.append(support_claim["id"])
+        _append_evidence_record(
+            store,
+            claim_id=support_claim["id"],
+            step_id=step_id,
+            source_tool=primary_tool,
+            source_label=primary_source,
+            evidence_ids=[],
+            summary_text=str(step.get("result_summary", "")).strip(),
+        )
+
+    structured_entity_ids, structured_claim_ids = _append_structured_observation_claims(
+        store,
+        step=step,
+        observations=list(step.get("structured_observations", []) or []),
+    )
+    entity_ids = _merge_str_values(entity_ids, structured_entity_ids, limit=80)
+    claim_ids = _merge_str_values(claim_ids, structured_claim_ids, limit=80)
+
+    return _merge_str_values([], entity_ids), _merge_str_values([], claim_ids)
+
+
+def _rebuild_evidence_store(task_state: dict[str, Any]) -> dict[str, Any]:
+    store = _new_evidence_store()
+    objective = str(task_state.get("objective", "")).strip()
+    objective_fingerprint = str(task_state.get("objective_fingerprint", "")).strip()
+    if objective:
+        _upsert_entity(
+            store,
+            "objective",
+            objective,
+            attrs={"fingerprint": objective_fingerprint},
+            canonical_key=f"objective:{_slugify_token(objective_fingerprint or objective)}",
+        )
+
+    for step in task_state.get("steps", []):
+        entity_ids, claim_ids = _extract_v1_evidence_from_step(task_state, step, store)
+        step["entity_ids"] = entity_ids
+        step["claim_ids"] = claim_ids
+
+    return store
+
+
+def _rebuild_execution_metrics_bundle(task_state: dict[str, Any]) -> dict[str, Any]:
+    step_metrics = [
+        dict(step.get("execution_metrics", {}))
+        for step in task_state.get("steps", [])
+        if isinstance(step.get("execution_metrics"), dict) and step.get("execution_metrics")
+    ]
+    return {
+        "steps": step_metrics,
+        "summary": _aggregate_executor_metrics(step_metrics),
+    }
+
+
+def _refresh_task_state_derived_state(task_state: dict[str, Any]) -> None:
+    task_state["evidence_store"] = _rebuild_evidence_store(task_state)
+    task_state["execution_metrics"] = _rebuild_execution_metrics_bundle(task_state)
 
 
 def _get_task_state(callback_context: CallbackContext) -> dict[str, Any] | None:
@@ -1537,7 +2874,7 @@ def _render_react_trace_block(
     if tools_called:
         source_labels = []
         for tool_name in tools_called:
-            source = TOOL_SOURCE_NAMES.get(tool_name, "")
+            source = tool_registry.TOOL_SOURCE_NAMES.get(tool_name, "")
             if source and source not in source_labels:
                 source_labels.append(source)
         tools_display = ", ".join(f"`{t}`" for t in tools_called)
@@ -2129,7 +3466,7 @@ def _build_methodology_overview(task_state: dict[str, Any], completed: int, tota
     for step in task_state.get("steps", []):
         goal = str(step.get("goal", "")).strip()
         status = str(step.get("status", "")).strip()
-        source = _resolve_source_label(str(step.get("tool_hint", "")))
+        source = _format_step_source_display(step)
         source_note = f" via {source}" if source else ""
         if status == "completed":
             step_summaries.append(f"{goal}{source_note}")
@@ -2156,6 +3493,33 @@ def _build_methodology_overview(task_state: dict[str, Any], completed: int, tota
     else:
         overview_parts.append(f" All {total} planned steps completed successfully.")
 
+    evidence_summary = _summarize_evidence_store(task_state.get("evidence_store", {}))
+    if evidence_summary.get("evidence_count") or evidence_summary.get("claim_count"):
+        source_count = len(evidence_summary.get("sources", []) or [])
+        overview_parts.append(
+            " The workflow normalized "
+            f"{evidence_summary.get('entity_count', 0)} entities, "
+            f"{evidence_summary.get('claim_count', 0)} claims, and "
+            f"{evidence_summary.get('evidence_count', 0)} evidence records"
+            + (f" across {source_count} source(s)." if source_count else ".")
+        )
+    claim_summary = _build_claim_synthesis_summary(
+        task_state.get("evidence_store", {}),
+        str(task_state.get("objective", "")).strip(),
+    )
+    if claim_summary.get("mixed_evidence_count"):
+        overview_parts.append(
+            f" Claim adjudication flagged {claim_summary.get('mixed_evidence_count', 0)} mixed-evidence finding(s) that require cautious interpretation."
+        )
+    top_claims = claim_summary.get("top_supported_claims", []) or []
+    if top_claims:
+        lead_claim = top_claims[0]
+        overview_parts.append(
+            " The strongest adjudicated claim was "
+            f"'{lead_claim.get('statement', '')}' "
+            f"({lead_claim.get('source_count', 0)} source(s))."
+        )
+
     return "".join(overview_parts)
 
 
@@ -2165,7 +3529,7 @@ def _render_step_subsection(step: dict[str, Any]) -> list[str]:
     goal = str(step.get("goal", "")).strip()
     status = str(step.get("status", "")).strip()
     summary = str(step.get("result_summary", "")).strip()
-    source = _resolve_source_label(str(step.get("tool_hint", "")))
+    source = _format_step_source_display(step)
     evidence_ids = [str(x).strip() for x in (step.get("evidence_ids") or []) if str(x).strip()]
     open_gaps = [str(x).strip() for x in (step.get("open_gaps") or []) if str(x).strip()]
 
@@ -2179,7 +3543,8 @@ def _render_step_subsection(step: dict[str, Any]) -> list[str]:
     lines = [heading, ""]
 
     if source:
-        lines.append(f"**Source:** {source}")
+        source_label = "Sources" if "; " in source else "Source"
+        lines.append(f"**{source_label}:** {source}")
         lines.append("")
 
     if status == "blocked":
@@ -2210,6 +3575,461 @@ def _render_step_subsection(step: dict[str, Any]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+
+
+def _normalize_top_level_heading_key(heading: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(heading or "").strip()).lower()
+    mapping = {
+        "summary": "summary",
+        "evidence and methodology": "evidence_and_methodology",
+        "evidence & methodology": "evidence_and_methodology",
+        "limitations": "limitations",
+        "potential next steps": "next_steps",
+        "next steps": "next_steps",
+        "next actions": "next_steps",
+        "references": "references",
+    }
+    return mapping.get(normalized, normalized.replace(" ", "_"))
+
+
+def _extract_top_level_markdown_sections(markdown: str) -> dict[str, str]:
+    text = str(markdown or "").strip()
+    if not text:
+        return {}
+    matches = list(re.finditer(r"^##\s+(.+?)\s*$", text, flags=re.MULTILINE))
+    sections: dict[str, str] = {}
+    for idx, match in enumerate(matches):
+        heading_key = _normalize_top_level_heading_key(match.group(1))
+        body_start = match.end()
+        body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        body = text[body_start:body_end].strip()
+        if body:
+            sections[heading_key] = body
+    return sections
+
+
+STEP_SECTION_HEADING_RE = re.compile(
+    r"^(?:###\s*)?(Step\s+\d+:\s+.+?)(?:\s*[—-]\s*(COMPLETED|FAILED|PENDING|BLOCKED))?\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_evidence_step_block(lines: list[str]) -> str:
+    if not lines:
+        return ""
+    heading_match = STEP_SECTION_HEADING_RE.match(str(lines[0] or "").strip())
+    if not heading_match:
+        return "\n".join(line.rstrip() for line in lines).strip()
+
+    heading = heading_match.group(1).strip()
+    status = str(heading_match.group(2) or "").strip().upper()
+    rendered: list[str] = [f"### {heading}{f' — {status}' if status else ''}", ""]
+
+    field_map = {
+        "data source": "data_source",
+        "key findings": "key_findings",
+        "significance": "significance",
+        "limitations": "limitations",
+        "limiatations": "limitations",
+    }
+    fields: dict[str, list[str]] = {
+        "data_source": [],
+        "key_findings": [],
+        "significance": [],
+        "limitations": [],
+    }
+    preamble: list[str] = []
+    active_field = ""
+
+    for raw_line in lines[1:]:
+        stripped = str(raw_line or "").strip()
+        if not stripped:
+            continue
+        field_match = re.match(r"^([A-Za-z ]+):\s*(.*)$", stripped)
+        if field_match:
+            label_key = field_map.get(field_match.group(1).strip().lower())
+            if label_key:
+                active_field = label_key
+                value = field_match.group(2).strip()
+                if value:
+                    fields[label_key].append(value)
+                continue
+        if active_field:
+            fields[active_field].append(re.sub(r"^[-*]\s+", "", stripped))
+        else:
+            preamble.append(stripped)
+
+    if preamble:
+        rendered.append(" ".join(preamble))
+        rendered.append("")
+
+    data_source = " ".join(fields["data_source"]).strip()
+    if data_source:
+        rendered.append(f"**Data Source:** {data_source}")
+        rendered.append("")
+
+    key_findings = [item for item in fields["key_findings"] if item]
+    if key_findings:
+        rendered.append("**Key Findings:**")
+        for item in key_findings:
+            rendered.append(f"- {item}")
+        rendered.append("")
+
+    significance = " ".join(fields["significance"]).strip()
+    if significance:
+        rendered.append(f"**Significance:** {significance}")
+        rendered.append("")
+
+    limitations = " ".join(fields["limitations"]).strip()
+    if limitations:
+        rendered.append(f"**Limitations:** {limitations}")
+        rendered.append("")
+
+    return "\n".join(rendered).strip()
+
+
+def _normalize_evidence_section_markdown(markdown: str) -> str:
+    text = str(markdown or "").strip()
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    first_step_idx = -1
+    for idx, raw_line in enumerate(lines):
+        if STEP_SECTION_HEADING_RE.match(str(raw_line or "").strip()):
+            first_step_idx = idx
+            break
+    if first_step_idx < 0:
+        return text
+
+    preamble = "\n".join(line.rstrip() for line in lines[:first_step_idx]).strip()
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for raw_line in lines[first_step_idx:]:
+        stripped = str(raw_line or "").strip()
+        if STEP_SECTION_HEADING_RE.match(stripped):
+            if current:
+                blocks.append(current)
+            current = [raw_line]
+        else:
+            current.append(raw_line)
+    if current:
+        blocks.append(current)
+
+    rendered: list[str] = []
+    if preamble:
+        rendered.append(preamble)
+        rendered.append("")
+    for block in blocks:
+        normalized = _normalize_evidence_step_block(block)
+        if normalized:
+            rendered.append(normalized)
+            rendered.append("")
+    return "\n".join(rendered).strip()
+
+
+def _extract_markdown_list_items(markdown: str) -> list[str]:
+    items: list[str] = []
+    for line in str(markdown or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        bullet_match = re.match(r"^(?:[-*+]\s+|\d+\.\s+)(.+)$", stripped)
+        if bullet_match:
+            items.append(bullet_match.group(1).strip())
+    return _dedupe_str_list(items, limit=12)
+
+
+def _human_join(items: list[str]) -> str:
+    cleaned = _dedupe_str_list(items, limit=6)
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
+
+
+def _build_structured_summary_markdown(
+    task_state: dict[str, Any],
+    claim_summary: dict[str, Any],
+    *,
+    model_summary: str = "",
+) -> str:
+    lines: list[str] = []
+    top_claims = list(claim_summary.get("top_supported_claims", []) or [])
+    step_highlights = _build_step_result_highlights(task_state)
+    model_summary_paragraph = _first_substantive_paragraph(model_summary)
+    if not top_claims:
+        objective = str(task_state.get("objective", "")).strip()
+        if _is_informative_model_summary(objective, model_summary):
+            lines.append(model_summary_paragraph)
+            if step_highlights:
+                lines.append("")
+                lines.append("Key evidence strands:")
+                lines.append("")
+                for highlight in step_highlights:
+                    source_text = f" (source: {highlight['source']})" if highlight.get("source") else ""
+                    lines.append(f"- {highlight['summary']}{source_text}")
+        elif step_highlights:
+            source_text = _human_join([item.get("source", "") for item in step_highlights if item.get("source")])
+            if objective:
+                if source_text:
+                    lines.append(
+                        f"For the question of {objective}, the completed searches across {source_text} identified these directly relevant findings:"
+                    )
+                else:
+                    lines.append(
+                        f"For the question of {objective}, the completed searches identified these directly relevant findings:"
+                    )
+            else:
+                lines.append("The completed searches identified these directly relevant findings:")
+            lines.append("")
+            for highlight in step_highlights:
+                source_suffix = f" (source: {highlight['source']})" if highlight.get("source") else ""
+                lines.append(f"- {highlight['summary']}{source_suffix}")
+        else:
+            fallback = str(model_summary_paragraph or model_summary or "").strip()
+            if fallback:
+                lines.append(fallback)
+            elif objective:
+                lines.append(
+                    f"The collected evidence is not yet sufficient to make a strong, claim-level conclusion for {objective}."
+                )
+            else:
+                lines.append("The collected evidence is not yet sufficient to make a strong, claim-level conclusion.")
+        return "\n".join(lines).strip()
+
+    lead_claim = top_claims[0]
+    mixed_claims = list(claim_summary.get("mixed_evidence_claims", []) or [])
+    if _is_informative_model_summary(str(task_state.get("objective", "")).strip(), model_summary):
+        lines.append(model_summary_paragraph)
+    else:
+        lead_sources = _human_join(list(lead_claim.get("primary_sources", []) or [])[:3]) or "the available sources"
+        objective = str(task_state.get("objective", "")).strip()
+        if objective:
+            lines.append(
+                f"For the question of {objective}, the strongest directly grounded finding is "
+                f"{lead_claim.get('statement', '')}. "
+                f"This interpretation is driven primarily by {lead_sources}."
+            )
+        else:
+            lines.append(
+                "In practical terms, the current evidence points to "
+                f"{lead_claim.get('statement', '')}. "
+                f"This interpretation is driven primarily by {lead_sources}."
+            )
+
+    if mixed_claims:
+        conflict = mixed_claims[0]
+        conflict_claims = list(conflict.get("claims", []) or [])
+        conflict_descriptions: list[str] = []
+        for claim in conflict_claims[:2]:
+            claim_sources = _human_join(list(claim.get("primary_sources", []) or [])[:2]) or "another source"
+            conflict_descriptions.append(
+                f"{claim_sources} supports {claim.get('statement', '')}"
+            )
+        focus = " and ".join(
+            part
+            for part in [
+                str(conflict.get("subject", "")).strip(),
+                str(conflict.get("object", "")).strip(),
+            ]
+            if part
+        ) or "the main claim"
+        preferred = str(conflict.get("preferred_interpretation", "")).strip()
+        if len(conflict_descriptions) >= 2:
+            lines.append(
+                f"The main caveat is that evidence is mixed for {focus}: "
+                f"{conflict_descriptions[0]}, whereas {conflict_descriptions[1]}. "
+                + (
+                    f"The report therefore treats {preferred} as the leading interpretation rather than a definitive conclusion."
+                    if preferred
+                    else "The report therefore treats this finding as unresolved."
+                )
+            )
+        elif preferred:
+            lines.append(
+                f"Evidence is mixed for {focus}, so the report treats {preferred} as the leading interpretation rather than a definitive conclusion."
+            )
+        else:
+            lines.append(
+                f"Evidence is mixed for {focus}, and the report therefore treats this finding as unresolved."
+            )
+    if step_highlights:
+        lines.append("")
+        lines.append("Key evidence strands:")
+        lines.append("")
+        for highlight in step_highlights:
+            source_suffix = f" (source: {highlight['source']})" if highlight.get("source") else ""
+            lines.append(f"- {highlight['summary']}{source_suffix}")
+
+    return "\n".join(lines).strip()
+
+
+def _format_markdown_table_cell(value: Any) -> str:
+    if value is None:
+        return "-"
+    text = re.sub(r"\s+", " ", str(value).strip())
+    if not text:
+        return "-"
+    return text.replace("|", "\\|")
+
+
+def _render_markdown_table(headers: list[str], rows: list[list[Any]]) -> str:
+    if not headers or not rows:
+        return ""
+    cleaned_headers = [_format_markdown_table_cell(header) for header in headers]
+    lines = [
+        "| " + " | ".join(cleaned_headers) + " |",
+        "| " + " | ".join("---" for _ in cleaned_headers) + " |",
+    ]
+    for row in rows:
+        cells = [_format_markdown_table_cell(value) for value in row[: len(cleaned_headers)]]
+        if len(cells) < len(cleaned_headers):
+            cells.extend("-" for _ in range(len(cleaned_headers) - len(cells)))
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def _build_top_supported_claims_markdown(claim_summary: dict[str, Any]) -> str:
+    lines: list[str] = []
+    for claim in list(claim_summary.get("top_supported_claims", []) or [])[:5]:
+        source_text = ", ".join(list(claim.get("primary_sources", []) or [])[:3]) or "not specified"
+        suffix = "; mixed evidence" if claim.get("mixed_evidence") else ""
+        lines.append(f"- {claim.get('statement', '')} (sources: {source_text}{suffix})")
+    return "\n".join(lines)
+
+
+def _build_mixed_evidence_claims_table(claim_summary: dict[str, Any]) -> str:
+    rows: list[list[Any]] = []
+    for conflict in list(claim_summary.get("mixed_evidence_claims", []) or [])[:5]:
+        focus = " and ".join(
+            part
+            for part in [
+                str(conflict.get("subject", "")).strip(),
+                str(conflict.get("object", "")).strip(),
+            ]
+            if part
+        ) or "Claim"
+        source_fragments: list[str] = []
+        for claim in list(conflict.get("claims", []) or [])[:2]:
+            sources = ", ".join(list(claim.get("primary_sources", []) or [])[:2])
+            if sources:
+                source_fragments.append(f"{claim.get('predicate', '')}: {sources}")
+        rows.append(
+            [
+                focus,
+                str(conflict.get("assessment", "")).replace("_", " "),
+                conflict.get("preferred_interpretation", "") or "No clear lean",
+                "; ".join(source_fragments) or "-",
+            ]
+        )
+    return _render_markdown_table(
+        ["Claim focus", "Assessment", "Current lean", "Leading sources"],
+        rows,
+    )
+
+
+def _build_structured_limitations(
+    task_state: dict[str, Any],
+    claim_summary: dict[str, Any],
+    model_limitations: list[str] | None = None,
+) -> list[str]:
+    items: list[str] = []
+    if model_limitations:
+        items.extend(model_limitations)
+
+    total = _total_step_count(task_state)
+    completed = _completed_step_count(task_state)
+    failed = _failed_step_count(task_state)
+    if total and completed < total:
+        if failed:
+            items.append(f"Only {completed} of {total} planned steps completed successfully; {failed} step(s) failed or were blocked.")
+        else:
+            items.append(f"Only {completed} of {total} planned steps completed before synthesis, so coverage is still partial.")
+
+    for conflict in list(claim_summary.get("mixed_evidence_claims", []) or [])[:3]:
+        preferred = str(conflict.get("preferred_interpretation", "")).strip()
+        subject = str(conflict.get("subject", "")).strip()
+        object_text = str(conflict.get("object", "")).strip()
+        focus = " and ".join(part for part in [subject, object_text] if part)
+        if preferred:
+            items.append(
+                f"Cross-source evidence is mixed for {focus or 'a key claim'}; the current interpretation only leans toward `{preferred}`."
+            )
+        else:
+            items.append(
+                f"Cross-source evidence remains equivocal for {focus or 'a key claim'}, with no clear preferred interpretation."
+            )
+
+    seen_gaps: set[str] = set()
+    for step in task_state.get("steps", []):
+        for gap in step.get("open_gaps", []) or []:
+            gap_text = re.sub(r"\s+", " ", str(gap or "").strip())
+            if not gap_text:
+                continue
+            lowered = gap_text.lower()
+            if lowered in seen_gaps:
+                continue
+            seen_gaps.add(lowered)
+            items.append(f"Open gap: {gap_text}")
+            if len(seen_gaps) >= 3:
+                break
+        if len(seen_gaps) >= 3:
+            break
+
+    return _dedupe_str_list(items, limit=8)
+
+
+def _build_structured_next_actions(
+    task_state: dict[str, Any],
+    claim_summary: dict[str, Any],
+    model_next_actions: list[str] | None = None,
+) -> list[str]:
+    actions: list[str] = []
+    for conflict in list(claim_summary.get("mixed_evidence_claims", []) or [])[:3]:
+        subject = str(conflict.get("subject", "")).strip()
+        object_text = str(conflict.get("object", "")).strip()
+        focus = " and ".join(part for part in [subject, object_text] if part) or "the mixed-evidence claim"
+        actions.append(
+            f"Resolve the mixed evidence for {focus} using an orthogonal source or confirmatory experiment."
+        )
+
+    actions.extend(_fallback_next_actions_from_task_state(task_state))
+    if model_next_actions:
+        actions.extend(model_next_actions)
+    return _dedupe_str_list(actions, limit=6)
+
+
+def _build_structured_final_synthesis(task_state: dict[str, Any], raw_markdown: str) -> dict[str, Any]:
+    sections = _extract_top_level_markdown_sections(raw_markdown)
+    claim_summary = _build_claim_synthesis_summary(
+        task_state.get("evidence_store", {}),
+        str(task_state.get("objective", "")).strip(),
+    )
+
+    return {
+        "coverage_status": _compute_coverage_status(task_state),
+        "claim_synthesis_summary": claim_summary,
+        "direct_answer": _build_structured_summary_markdown(
+            task_state,
+            claim_summary,
+            model_summary=sections.get("summary", ""),
+        ),
+        "evidence_section_markdown": _normalize_evidence_section_markdown(sections.get("evidence_and_methodology", "")),
+        "limitations": _build_structured_limitations(
+            task_state,
+            claim_summary,
+            _extract_markdown_list_items(sections.get("limitations", "")),
+        ),
+        "next_actions": _build_structured_next_actions(
+            task_state,
+            claim_summary,
+            _extract_markdown_list_items(sections.get("next_steps", "")),
+        ),
+    }
 
 
 def _fallback_next_actions_from_task_state(task_state: dict[str, Any]) -> list[str]:
@@ -2244,76 +4064,19 @@ def _fallback_next_actions_from_task_state(task_state: dict[str, Any]) -> list[s
 
     if not actions:
         actions.append("Review the compiled evidence for decision readiness and identify any confirmatory analyses worth running.")
-        actions.append("Document confidence level and assumptions before making a downstream decision or recommendation.")
+        actions.append("Document key assumptions and uncertainties before making a downstream decision or recommendation.")
     return actions[:5]
 
 
 def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -> str:
     """Post-process the LLM's markdown output into the final report format."""
-    text = str(raw_markdown or "").strip()
-    if not text:
-        text = "# AI Co-Scientist Report\n\n## Summary\n\nNo final summary was produced."
-
-    # Ensure title
-    has_title = "# AI Co-Scientist Report" in text
-    has_old_heading = "## Final Summary" in text or "# Final Summary" in text
-    if not has_title and not has_old_heading:
-        text = "# AI Co-Scientist Report\n\n" + text
-    elif has_old_heading and not has_title:
-        text = text.replace("## Final Summary", "## Summary").replace("# Final Summary", "## Summary")
-        text = "# AI Co-Scientist Report\n\n" + text
-
-    # Inject research question callout (query only, no coverage) beneath the title
-    objective = str(task_state.get("objective", "")).strip()
-    if objective and "**Research Question:**" not in text:
-        callout = f"\n\n> **Research Question:** {objective}\n\n---"
-        title_pos = text.find("# AI Co-Scientist Report")
-        if title_pos != -1:
-            title_end = text.find("\n", title_pos)
-            if title_end != -1:
-                text = text[:title_end] + callout + text[title_end:]
-            else:
-                text += callout
-
-    # Strip any old-style coverage lines the LLM may have placed at the top callout
-    text = re.sub(r">\s*\n>\s*\*\*Coverage:\*\*[^\n]*\n?", "", text)
-
-    # References: only literature IDs get numbered entries in the References section;
-    # database IDs (UniProt, PubChem, PDB, rs, ChEMBL, Reactome, GCST) become
-    # clickable inline links handled by _hyperlink_inline_ids.
-    inline_ids = _extract_inline_ids_from_text(text)
-    lit_ids = [eid for eid in inline_ids if _is_literature_id(eid)]
-    ref_map = _build_ref_map(lit_ids)
-    if "## References" not in text:
-        refs = _build_references_section(lit_ids)
-        if refs:
-            next_steps_pattern = re.compile(
-                r"(\n#{1,3}\s+(?:Potential\s+)?Next\s+(?:Steps?|Actions?)\b)",
-                re.IGNORECASE,
-            )
-            m = next_steps_pattern.search(text)
-            if m:
-                text = text[: m.start()] + "\n\n" + refs + text[m.start() :]
-            else:
-                text += "\n\n" + refs
-
-    text = _hyperlink_inline_ids(text, ref_map)
-
-    # Ensure Next Steps section exists
-    lowered = text.lower()
-    if "potential next steps" not in lowered and "next steps" not in lowered and "next actions" not in lowered:
-        fallback_next = _fallback_next_actions_from_task_state(task_state)
-        if fallback_next:
-            text += "\n\n## Potential Next Steps\n\n"
-            text += "\n".join(f"{i}. {item}" for i, item in enumerate(fallback_next[:20], start=1))
-
-    return text.strip()
+    synthesis = _build_structured_final_synthesis(task_state, raw_markdown)
+    return _render_final_synthesis_markdown(task_state, synthesis)
 
 
 def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict[str, Any]) -> str:
     """Fallback renderer: builds the report from structured synthesis fields."""
     objective = str(task_state.get("objective", "")).strip()
-    coverage = str(synthesis.get("coverage_status", "partial_plan"))
     completed = _completed_step_count(task_state)
     total = _total_step_count(task_state)
     failed = _failed_step_count(task_state)
@@ -2329,13 +4092,22 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
     if direct_answer:
         lines.append(direct_answer)
         lines.append("")
+    claim_summary = dict(synthesis.get("claim_synthesis_summary", {}) or {})
+    mixed_claims_table = _build_mixed_evidence_claims_table(claim_summary)
+    if mixed_claims_table:
+        lines += ["### Mixed-Evidence Claims", "", mixed_claims_table, ""]
 
     # Evidence and Methodology
     lines += ["## Evidence and Methodology", ""]
-    lines.append(_build_methodology_overview(task_state, completed, total, failed))
-    lines.append("")
-    for step in task_state.get("steps", []):
-        lines += _render_step_subsection(step)
+    evidence_section_markdown = str(synthesis.get("evidence_section_markdown", "")).strip()
+    if evidence_section_markdown:
+        lines.append(evidence_section_markdown)
+        lines.append("")
+    else:
+        lines.append(_build_methodology_overview(task_state, completed, total, failed))
+        lines.append("")
+        for step in task_state.get("steps", []):
+            lines += _render_step_subsection(step)
 
     # Limitations
     limitations = [str(x).strip() for x in synthesis.get("limitations", []) if str(x).strip()]
@@ -2395,7 +4167,7 @@ def _planner_json_instruction_suffix() -> str:
     return (
         "Return ONLY valid JSON matching `plan_internal.v1` for this objective. "
         "Each step MUST include a \"domains\" array with 1-3 domain names from: "
-        f"{', '.join(ALL_DOMAIN_NAMES)}. "
+        f"{', '.join(tool_registry.ALL_DOMAIN_NAMES)}. "
         "Do not include markdown fences or commentary."
     )
 
@@ -2417,6 +4189,7 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
 
     focused_catalog = _format_tool_catalog(focused_tools)
     routing_guidance = _format_step_routing_guidance(tool_hint, focused_tools)
+    structured_observation_guidance = _format_structured_observation_guidance(tool_hint, focused_tools)
 
     payload = {
         "schema": "react_step_context.v1",
@@ -2446,6 +4219,8 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
         )
     if routing_guidance:
         instructions.append(routing_guidance)
+    if structured_observation_guidance:
+        instructions.append(structured_observation_guidance)
 
     instructions.append(
         f"Execute ONLY step {active_step.get('id')}. "
@@ -2462,40 +4237,160 @@ def _resolve_source_label(tool_hint: str) -> str:
     tool_hint = str(tool_hint or "").strip()
     if not tool_hint:
         return ""
-    label = TOOL_SOURCE_NAMES.get(tool_hint)
+    label = tool_registry.TOOL_SOURCE_NAMES.get(tool_hint)
     if label:
         return label
     # BigQuery tool_hints can be dataset.table (e.g. open_targets_platform.disease)
     if "." in tool_hint:
         base = tool_hint.split(".", 1)[0]
-        label = TOOL_SOURCE_NAMES.get(base)
+        label = tool_registry.TOOL_SOURCE_NAMES.get(base)
         if label:
             return label
     return tool_hint
 
 
+def _extract_source_labels_from_text(text: str) -> list[str]:
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return []
+
+    labels: list[str] = []
+    for key, label in tool_registry.TOOL_SOURCE_NAMES.items():
+        if not label or label == "BigQuery":
+            continue
+        if re.search(rf"\b{re.escape(key)}\b", raw_text):
+            labels.append(label)
+    for match in re.finditer(r"bigquery://([A-Za-z0-9._-]+)", raw_text):
+        labels.extend(_normalize_source_label_candidates([match.group(1)]))
+    return _dedupe_str_list(labels, limit=20)
+
+
+def _normalize_source_label_candidates(values: list[Any] | None, *, allow_verbatim_labels: bool = False) -> list[str]:
+    specific: list[str] = []
+    generic: list[str] = []
+
+    def add_label(label: str) -> None:
+        cleaned = str(label or "").strip()
+        if not cleaned:
+            return
+        if cleaned == "BigQuery":
+            generic.append(cleaned)
+        else:
+            specific.append(cleaned)
+
+    for value in values or []:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        if raw == "BigQuery":
+            generic.append(raw)
+            continue
+        if re.search(r"\s", raw) or "bigquery://" in raw:
+            for label in _extract_source_labels_from_text(raw):
+                add_label(label)
+
+        cleaned = raw[11:] if raw.startswith("bigquery://") else raw
+        parts = [part for part in cleaned.split(".") if part]
+        candidates = [cleaned]
+        if len(parts) >= 3:
+            candidates.extend([".".join(parts[-2:]), parts[-2]])
+        elif len(parts) == 2:
+            candidates.extend([parts[1], parts[0]])
+
+        for candidate in candidates:
+            label = _resolve_source_label(candidate)
+            if label and label != candidate:
+                add_label(label)
+            elif candidate in tool_registry.TOOL_SOURCE_NAMES:
+                add_label(label)
+
+        if raw in tool_registry.TOOL_SOURCE_NAMES:
+            add_label(_resolve_source_label(raw))
+            continue
+
+        if allow_verbatim_labels and raw not in {"run_bigquery_select_query", "list_bigquery_tables"}:
+            add_label(raw)
+
+    normalized = _dedupe_str_list(specific, limit=20)
+    if normalized:
+        return normalized
+    return _dedupe_str_list(generic, limit=5)
+
+
+def _derive_step_data_sources(step: dict[str, Any]) -> list[str]:
+    explicit_labels = _normalize_source_label_candidates(
+        list(step.get("data_sources_queried", []) or []),
+        allow_verbatim_labels=True,
+    )
+    refs: list[Any] = []
+    for observation in list(step.get("structured_observations", []) or []):
+        if not isinstance(observation, dict):
+            continue
+        refs.append(observation.get("source_tool"))
+        qualifiers = observation.get("qualifiers") or {}
+        if isinstance(qualifiers, dict):
+            refs.extend([
+                qualifiers.get("dataset"),
+                qualifiers.get("source"),
+                qualifiers.get("database"),
+            ])
+    refs.append(step.get("tool_hint"))
+    refs.extend(list(step.get("tools_called", []) or []))
+
+    labels = _merge_str_values(explicit_labels, _normalize_source_label_candidates(refs), limit=20)
+    if labels:
+        return labels
+    fallback = _resolve_source_label(step.get("tool_hint", ""))
+    return [fallback] if fallback else []
+
+
+def _preferred_step_source_label(step: dict[str, Any], source_tool: str = "") -> str:
+    source_tool = str(source_tool or "").strip()
+    direct = _resolve_source_label(source_tool)
+    if direct and direct != "BigQuery":
+        return direct
+    derived = _derive_step_data_sources(step)
+    if derived:
+        return derived[0]
+    return direct or source_tool
+
+
+def _format_step_source_display(step: dict[str, Any]) -> str:
+    return "; ".join(_derive_step_data_sources(step))
+
+
 def _synth_context_instructions(task_state: dict[str, Any], callback_context: CallbackContext | None = None) -> list[str]:
+    evidence_store_summary = _summarize_evidence_store(task_state.get("evidence_store", {}))
+    claim_synthesis_summary = _build_claim_synthesis_summary(
+        task_state.get("evidence_store", {}),
+        str(task_state.get("objective", "")).strip(),
+    )
+    execution_metrics_summary = dict((task_state.get("execution_metrics") or {}).get("summary", {}))
     payload = {
         "schema": "synthesis_context.v1",
         "objective": task_state.get("objective", ""),
         "plan_status": task_state.get("plan_status", "ready"),
         "coverage_status": _compute_coverage_status(task_state),
+        "evidence_store_summary": evidence_store_summary,
+        "claim_synthesis_summary": claim_synthesis_summary,
+        "execution_metrics_summary": execution_metrics_summary,
         "steps": [
             {
                 "id": step.get("id"),
                 "goal": step.get("goal"),
                 "tool_hint": step.get("tool_hint", ""),
-                "source": _resolve_source_label(step.get("tool_hint", "")),
+                "source": _preferred_step_source_label(step, str(step.get("tool_hint", ""))),
                 "status": step.get("status"),
                 "reasoning_trace": step.get("reasoning_trace", ""),
                 "tools_called": list(step.get("tools_called", []) or []),
-                "data_sources_queried": _dedupe_str_list(
-                    [TOOL_SOURCE_NAMES.get(t, t) for t in (step.get("tools_called") or [])],
-                    limit=10,
-                ),
+                "data_sources_queried": _derive_step_data_sources(step),
                 "result_summary": step.get("result_summary", ""),
                 "evidence_ids": list(step.get("evidence_ids", []) or [])[:20],
                 "open_gaps": list(step.get("open_gaps", []) or [])[:10],
+                "structured_observations": list(step.get("structured_observations", []) or [])[:8],
+                "entity_ids": list(step.get("entity_ids", []) or [])[:20],
+                "claim_ids": list(step.get("claim_ids", []) or [])[:20],
+                "execution_metrics": dict(step.get("execution_metrics", {}) or {}),
             }
             for step in task_state.get("steps", [])
         ],
@@ -2505,7 +4400,7 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
     for step in task_state.get("steps", []):
         hint = str(step.get("tool_hint", "")).strip()
         if hint and hint not in used_sources:
-            used_sources[hint] = TOOL_SOURCE_NAMES.get(hint, hint)
+            used_sources[hint] = tool_registry.TOOL_SOURCE_NAMES.get(hint, hint)
     if used_sources:
         payload["source_reference"] = {
             tool: source for tool, source in used_sources.items()
@@ -2514,6 +4409,7 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
     instructions = [
         "Synthesis context (authoritative; use this instead of inferring from prior prose):",
         _serialize_pretty_json(payload),
+        "Use `claim_synthesis_summary` as the normalized claim arbitration layer. Prioritize its top-supported claims for the direct answer, and explicitly describe any `mixed_evidence_claims` as conflicting or mixed evidence rather than flattening them into one-sided prose.",
     ]
 
     prior: list[dict[str, Any]] = []
@@ -2557,6 +4453,7 @@ def _validate_step_execution_result(raw: dict[str, Any]) -> dict[str, Any]:
     status = str(raw.get("status", "")).strip().lower()
     if status not in {"completed", "blocked"}:
         raise ValueError("status must be `completed` or `blocked`")
+    tools_called = _as_string_list(raw.get("tools_called"), "tools_called", limit=20)
     return {
         "schema": STEP_RESULT_SCHEMA,
         "step_id": _as_nonempty_str(raw.get("step_id"), "step_id"),
@@ -2570,7 +4467,9 @@ def _validate_step_execution_result(raw: dict[str, Any]) -> dict[str, Any]:
             "suggested_next_searches",
             limit=15,
         ),
-        "tools_called": _as_string_list(raw.get("tools_called"), "tools_called", limit=20),
+        "tools_called": tools_called,
+        "data_sources_queried": _as_string_list(raw.get("data_sources_queried"), "data_sources_queried", limit=15),
+        "structured_observations": _validate_structured_observations(raw.get("structured_observations")),
     }
 
 
@@ -2578,6 +4477,8 @@ def _validate_step_execution_result(raw: dict[str, Any]) -> dict[str, Any]:
 def _apply_step_execution_result_to_task_state(
     task_state: dict[str, Any],
     step_result: dict[str, Any],
+    *,
+    parse_retry_count: int = 0,
 ) -> dict[str, Any]:
     validated = _validate_step_execution_result(step_result)
     current_step_id = str(task_state.get("current_step_id") or "").strip()
@@ -2594,6 +4495,13 @@ def _apply_step_execution_result_to_task_state(
     step["open_gaps"] = validated["open_gaps"]
     step["suggested_next_searches"] = validated["suggested_next_searches"]
     step["tools_called"] = validated.get("tools_called", [])
+    step["data_sources_queried"] = validated.get("data_sources_queried", [])
+    step["structured_observations"] = validated.get("structured_observations", [])
+    step["execution_metrics"] = _build_step_execution_metrics(
+        step,
+        validated,
+        parse_retry_count=parse_retry_count,
+    )
 
     if validated["status"] == "completed":
         task_state["last_completed_step_id"] = validated["step_id"]
@@ -2604,6 +4512,7 @@ def _apply_step_execution_result_to_task_state(
         task_state["current_step_id"] = validated["step_id"]
         task_state["plan_status"] = "blocked"
 
+    _refresh_task_state_derived_state(task_state)
     return validated
 
 
@@ -3068,14 +4977,27 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
                 _, step = _find_step(task_state, active_step_id)
                 step["status"] = "completed"
                 step["result_summary"] = last_prose[:1500]
+                step["step_progress_note"] = "Recovered step result from prose after repeated JSON formatting failures."
                 step["reasoning_trace"] = (
                     f"Partial result (JSON formatting failed after {MAX_REACT_PARSE_RETRIES + 1} "
                     f"attempts). {error_label}: {error_msg}"
+                )
+                step["execution_metrics"] = _build_step_execution_metrics(
+                    step,
+                    {
+                        "step_id": active_step_id,
+                        "status": "completed",
+                        "tools_called": list(step.get("tools_called", []) or []),
+                        "evidence_ids": list(step.get("evidence_ids", []) or []),
+                        "open_gaps": list(step.get("open_gaps", []) or []),
+                    },
+                    parse_retry_count=MAX_REACT_PARSE_RETRIES + 1,
                 )
                 next_id = _next_pending_step_id(task_state)
                 task_state["current_step_id"] = next_id
                 new_plan_status = "completed" if next_id is None else "ready"
                 task_state["plan_status"] = new_plan_status
+                _refresh_task_state_derived_state(task_state)
                 callback_context.state[STATE_WORKFLOW_TASK] = task_state
                 if new_plan_status == "completed":
                     callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
@@ -3096,12 +5018,25 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
             try:
                 _, step = _find_step(task_state, active_step_id)
                 step["status"] = "blocked"
+                step["step_progress_note"] = f"Execution failed after repeated JSON formatting errors: {error_label}"
                 step["result_summary"] = f"Step failed after {MAX_REACT_PARSE_RETRIES + 1} attempts: {error_msg}"
                 step["reasoning_trace"] = f"Execution failed: {error_label}. {error_msg}"
+                step["execution_metrics"] = _build_step_execution_metrics(
+                    step,
+                    {
+                        "step_id": active_step_id,
+                        "status": "blocked",
+                        "tools_called": list(step.get("tools_called", []) or []),
+                        "evidence_ids": [],
+                        "open_gaps": list(step.get("open_gaps", []) or []),
+                    },
+                    parse_retry_count=MAX_REACT_PARSE_RETRIES + 1,
+                )
                 next_id = _next_pending_step_id(task_state)
                 task_state["current_step_id"] = next_id
                 new_plan_status = "completed" if next_id is None else "blocked"
                 task_state["plan_status"] = new_plan_status
+                _refresh_task_state_derived_state(task_state)
                 callback_context.state[STATE_WORKFLOW_TASK] = task_state
                 if new_plan_status == "completed":
                     callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
@@ -3128,7 +5063,11 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
         parsed["schema"] = STEP_RESULT_SCHEMA
 
     try:
-        validated = _apply_step_execution_result_to_task_state(task_state, parsed)
+        validated = _apply_step_execution_result_to_task_state(
+            task_state,
+            parsed,
+            parse_retry_count=retries,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("[react:after] validation error: %s", exc)
         return _handle_step_error("Validation error", str(exc))
@@ -3210,10 +5149,14 @@ def _synth_after_model_callback(*, callback_context: CallbackContext, llm_respon
 
     buffered = str(callback_context.state.get(STATE_SYNTH_BUFFER, "") or "")
     callback_context.state[STATE_SYNTH_BUFFER] = ""
-    final_markdown = _postprocess_synth_markdown(task_state, (buffered + text).strip())
+    raw_markdown = (buffered + text).strip()
+    structured_synthesis = _build_structured_final_synthesis(task_state, raw_markdown)
+    final_markdown = _render_final_synthesis_markdown(task_state, structured_synthesis)
     task_state["latest_synthesis"] = {
         "schema": "final_synthesis_text.v1",
         "coverage_status": _compute_coverage_status(task_state),
+        "claim_synthesis_summary": structured_synthesis.get("claim_synthesis_summary", {}),
+        "structured_synthesis": structured_synthesis,
         "markdown": final_markdown,
     }
     callback_context.state[STATE_WORKFLOW_TASK] = task_state
@@ -3379,18 +5322,14 @@ prefer this over BigQuery fda_drug for adverse event reports)."""
 def _format_tool_catalog(tool_hints: list[str]) -> str:
     lines = []
     for name in tool_hints[:80]:
-        desc = TOOL_DESCRIPTIONS.get(name)
+        desc = tool_registry.TOOL_DESCRIPTIONS.get(name)
         lines.append(f"- {name} — {desc}" if desc else f"- {name}")
     return "\n".join(lines) or "- No tools available."
 
 
 def _format_source_precedence_rules(tool_hints: list[str]) -> str:
-    active_tools = set(tool_hints)
     lines = []
-    for rule in SOURCE_PRECEDENCE_RULES:
-        rule_tools = [tool for tool in rule.get("tools", []) if tool in active_tools]
-        if len(rule_tools) < 2:
-            continue
+    for rule in tool_registry.iter_active_source_precedence_rules(tool_hints):
         lines.append(f"- {rule['topic']}: {rule['summary']}")
     return "\n".join(lines) or "- No special overlap rules configured for the current tool set."
 
@@ -3402,7 +5341,7 @@ def _prioritize_tools_for_step(tool_names: list[str], tool_hint: str) -> list[st
         return ordered
 
     prioritized = [hint]
-    fallback_tools = TOOL_ROUTING_METADATA.get(hint, {}).get("fallback_tools", [])
+    fallback_tools = tool_registry.TOOL_ROUTING_METADATA.get(hint, {}).get("fallback_tools", [])
     prioritized.extend(str(name).strip() for name in fallback_tools if str(name).strip())
 
     seen: set[str] = set()
@@ -3417,7 +5356,7 @@ def _prioritize_tools_for_step(tool_names: list[str], tool_hint: str) -> list[st
 
 def _format_step_routing_guidance(tool_hint: str, available_tools: list[str]) -> str:
     hint = str(tool_hint or "").strip()
-    meta = TOOL_ROUTING_METADATA.get(hint)
+    meta = tool_registry.TOOL_ROUTING_METADATA.get(hint)
     if not meta:
         return ""
 
@@ -3448,6 +5387,78 @@ def _format_step_routing_guidance(tool_hint: str, available_tools: list[str]) ->
     return "\n".join(parts)
 
 
+def _resolve_structured_observation_overlap_groups(tool_hint: str, available_tools: list[str]) -> list[str]:
+    hint = str(tool_hint or "").strip()
+    overlap_groups: list[str] = []
+
+    if hint:
+        hint_group = str(tool_registry.TOOL_ROUTING_METADATA.get(hint, {}).get("overlap_group", "")).strip()
+        if hint_group and hint_group in STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP:
+            overlap_groups.append(hint_group)
+
+        for fallback_tool in tool_registry.TOOL_ROUTING_METADATA.get(hint, {}).get("fallback_tools", [])[:4]:
+            fallback_group = str(tool_registry.TOOL_ROUTING_METADATA.get(fallback_tool, {}).get("overlap_group", "")).strip()
+            if fallback_group and fallback_group in STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP:
+                overlap_groups.append(fallback_group)
+
+    if not overlap_groups:
+        for tool_name in available_tools[:12]:
+            overlap_group = str(tool_registry.TOOL_ROUTING_METADATA.get(tool_name, {}).get("overlap_group", "")).strip()
+            if overlap_group and overlap_group in STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP:
+                overlap_groups.append(overlap_group)
+
+    return _dedupe_str_list(overlap_groups, limit=3)
+
+
+def _format_structured_observation_example(example: dict[str, Any]) -> str:
+    return _serialize_pretty_json(example)
+
+
+def _format_structured_observation_guidance(tool_hint: str, available_tools: list[str]) -> str:
+    overlap_groups = _resolve_structured_observation_overlap_groups(tool_hint, available_tools)
+    if not overlap_groups:
+        return ""
+
+    lines = [
+        "Structured observation guidance for this step:",
+        "- Include `structured_observations` in the step JSON if the tool outputs support grounded atomic claims.",
+        "- Keep each observation to one claim grounded directly in the current step's tool results.",
+        "- Do not invent observations that are not explicitly supported by the retrieved data.",
+        "- Prefer 1-4 high-signal observations by default; only emit more if the step explicitly asks for breadth.",
+        "- Use exact entity labels or IDs that appeared in the tool output whenever possible.",
+    ]
+    for overlap_group in overlap_groups:
+        guidance = STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP[overlap_group]
+        predicates = ", ".join(f"`{predicate}`" for predicate in guidance.get("predicates", [])[:6])
+        entity_types = ", ".join(f"`{entity_type}`" for entity_type in guidance.get("entity_types", [])[:6])
+        lines.append(f"- Family: {guidance['label']}.")
+        lines.append(f"  Emit when: {guidance.get('when_to_emit', '')}")
+        lines.append(f"  Prefer predicates: {predicates}.")
+        lines.append(f"  Typical entity types: {entity_types}.")
+        for rule in guidance.get("extraction_rules", [])[:3]:
+            lines.append(f"  Extraction rule: {rule}")
+        example = guidance.get("example")
+        if isinstance(example, dict):
+            lines.append(f"  Example observation for {guidance['label']}:")
+            lines.append(_format_structured_observation_example(example))
+    lines.append("Recommended observation template:")
+    lines.append(
+        _format_structured_observation_example(
+            {
+                "observation_type": "...",
+                "subject": {"type": "...", "label": "...", "id": "..."},
+                "predicate": "...",
+                "object": {"type": "...", "label": "...", "id": "..."},
+                "supporting_ids": ["..."],
+                "source_tool": "...",
+                "confidence": "medium",
+                "qualifiers": {"dataset": "...", "metric": "..."},
+            }
+        )
+    )
+    return "\n".join(lines)
+
+
 def _resolve_step_tools(domains: list[str] | None, *, available_tools: set[str] | None = None) -> list[str]:
     """Resolve a list of domain names into a deduplicated, ordered tool list.
 
@@ -3458,13 +5469,13 @@ def _resolve_step_tools(domains: list[str] | None, *, available_tools: set[str] 
     if not domains:
         return list(KNOWN_MCP_TOOLS)
 
-    target_domains = set(domains) | ALWAYS_AVAILABLE_DOMAINS
+    target_domains = set(domains) | tool_registry.ALWAYS_AVAILABLE_DOMAINS
     seen: set[str] = set()
     tools: list[str] = []
-    for domain in ALL_DOMAIN_NAMES:
+    for domain in tool_registry.ALL_DOMAIN_NAMES:
         if domain not in target_domains:
             continue
-        for tool in TOOL_DOMAINS.get(domain, []):
+        for tool in tool_registry.TOOL_DOMAINS.get(domain, []):
             if tool in seen:
                 continue
             if available_tools is not None and tool not in available_tools:
@@ -3492,10 +5503,10 @@ def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: 
 
 def _format_domain_catalog() -> str:
     lines = []
-    for domain in ALL_DOMAIN_NAMES:
-        tools = TOOL_DOMAINS.get(domain, [])
+    for domain in tool_registry.ALL_DOMAIN_NAMES:
+        tools = tool_registry.TOOL_DOMAINS.get(domain, [])
         tool_names = ", ".join(tools[:12])
-        always = " (always included)" if domain in ALWAYS_AVAILABLE_DOMAINS else ""
+        always = " (always included)" if domain in tool_registry.ALWAYS_AVAILABLE_DOMAINS else ""
         lines.append(f"- {domain}{always}: {tool_names}")
     return "\n".join(lines)
 

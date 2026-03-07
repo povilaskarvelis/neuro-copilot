@@ -16,6 +16,8 @@ const state = {
   reportStatusTaskId: null,
   reportStatusText: "",
   reportStatusError: false,
+  debugOpen: false,
+  debugByTaskId: {},
   activityExpandedByTask: {},
 };
 
@@ -33,6 +35,10 @@ const el = {
   reportTitle: document.getElementById("reportTitle"),
   reportStatus: document.getElementById("reportStatus"),
   reportContent: document.getElementById("reportContent"),
+  debugToggleBtn: document.getElementById("debugToggleBtn"),
+  debugPanel: document.getElementById("debugPanel"),
+  debugSummary: document.getElementById("debugSummary"),
+  debugJson: document.getElementById("debugJson"),
   exportPdfBtn: document.getElementById("exportPdfBtn"),
 };
 
@@ -78,8 +84,48 @@ function markdownToHtml(markdown) {
   const closeBlockquote = () => {
     if (inBlockquote) { html.push("</blockquote>"); inBlockquote = false; }
   };
+  const looksLikeTableRow = (value) => {
+    const text = String(value || "").trim();
+    if (!text.includes("|")) return false;
+    const pipeCount = (text.match(/\|/g) || []).length;
+    return pipeCount >= 2 || (pipeCount === 1 && text.startsWith("|"));
+  };
+  const isTableSeparator = (value) => {
+    const text = String(value || "").trim();
+    if (!looksLikeTableRow(text)) return false;
+    const normalized = text.replace(/^\|/, "").replace(/\|$/, "");
+    const cells = normalized.split("|").map((cell) => cell.trim());
+    if (!cells.length) return false;
+    return cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+  };
+  const splitTableCells = (value) => {
+    const text = String(value || "").trim().replace(/^\|/, "").replace(/\|$/, "");
+    const cells = [];
+    let current = "";
+    let escaped = false;
+    for (const ch of text) {
+      if (escaped) {
+        current += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === "|") {
+        cells.push(current.trim());
+        current = "";
+        continue;
+      }
+      current += ch;
+    }
+    cells.push(current.trim());
+    return cells;
+  };
 
-  for (const rawLine of lines) {
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const rawLine = lines[idx];
     const line = String(rawLine || "");
     let trimmed = line.trim();
 
@@ -161,6 +207,43 @@ function markdownToHtml(markdown) {
     }
 
     closeBlockquote();
+
+    const nextLine = idx + 1 < lines.length ? String(lines[idx + 1] || "") : "";
+    if (looksLikeTableRow(trimmed) && isTableSeparator(nextLine)) {
+      closeLists();
+      const headerCells = splitTableCells(trimmed);
+      const rows = [];
+      idx += 2;
+      while (idx < lines.length) {
+        const candidate = String(lines[idx] || "");
+        const candidateTrimmed = candidate.trim();
+        if (!candidateTrimmed || !looksLikeTableRow(candidateTrimmed) || isTableSeparator(candidateTrimmed)) {
+          idx -= 1;
+          break;
+        }
+        rows.push(splitTableCells(candidateTrimmed));
+        idx += 1;
+      }
+
+      html.push("<table><thead><tr>");
+      headerCells.forEach((cell) => {
+        html.push(`<th>${inlineMarkdown(cell)}</th>`);
+      });
+      html.push("</tr></thead>");
+      if (rows.length) {
+        html.push("<tbody>");
+        rows.forEach((row) => {
+          html.push("<tr>");
+          headerCells.forEach((_, cellIdx) => {
+            html.push(`<td>${inlineMarkdown(row[cellIdx] || "")}</td>`);
+          });
+          html.push("</tr>");
+        });
+        html.push("</tbody>");
+      }
+      html.push("</table>");
+      continue;
+    }
 
     const ul = trimmed.match(/^[-*]\s+(.+)$/);
     if (ul) {
@@ -289,7 +372,7 @@ function planHtmlForIteration(iteration) {
       : [];
   if (!steps.length) return "";
 
-  let html = "<p>Here is the proposed plan:</p><ol class=\"plan-steps\">";
+  let html = "<p>To answer your query I will:</p><ol class=\"plan-steps\">";
   steps.forEach((step, idx) => {
     const title = escapeHtml(String(step?.title || `Step ${idx + 1}`).trim());
     let source = String(step?.source || "").trim();
@@ -321,7 +404,7 @@ function planHtmlForIteration(iteration) {
     }
     html += `</li>`;
   });
-  html += `</ol>`;
+  html += `</ol><p class="plan-followup">You can revise the plan, share suggestions, or continue when you're ready.</p>`;
   return html;
 }
 
@@ -947,9 +1030,116 @@ function currentReportIteration() {
   return latestIteration(detail);
 }
 
+function currentDebugTaskId() {
+  const iteration = currentReportIteration();
+  return String(iteration?.task?.task_id || "").trim();
+}
+
+function countCollectionItems(value) {
+  if (Array.isArray(value)) return value.length;
+  if (value && typeof value === "object") return Object.keys(value).length;
+  return 0;
+}
+
+function escapePreformattedJson(value) {
+  return escapeHtml(JSON.stringify(value || {}, null, 2));
+}
+
+function debugSummaryHtml(debugPayload) {
+  const payload = debugPayload && typeof debugPayload === "object" ? debugPayload : {};
+  const rawState = payload.state && typeof payload.state === "object" ? payload.state : {};
+  const workflow = rawState.workflow_task_state && typeof rawState.workflow_task_state === "object"
+    ? rawState.workflow_task_state
+    : {};
+  const evidenceStore = workflow.evidence_store && typeof workflow.evidence_store === "object"
+    ? workflow.evidence_store
+    : {};
+  const executionMetrics = workflow.execution_metrics && typeof workflow.execution_metrics === "object"
+    ? workflow.execution_metrics
+    : {};
+  const executionSummary = executionMetrics.summary && typeof executionMetrics.summary === "object"
+    ? executionMetrics.summary
+    : {};
+  const steps = Array.isArray(workflow.steps) ? workflow.steps : [];
+  const completedSteps = steps.filter((step) => String(step?.status || "").trim() === "completed").length;
+  const priorResearch = Array.isArray(rawState.co_scientist_prior_research) ? rawState.co_scientist_prior_research : [];
+  const watchlist = Array.isArray(executionSummary.specialization_watchlist)
+    ? executionSummary.specialization_watchlist
+    : [];
+  const metrics = [
+    { label: "Source", value: String(payload.source || "none") || "none" },
+    { label: "Plan", value: String(workflow.plan_status || "unknown") || "unknown" },
+    { label: "Steps", value: steps.length ? `${completedSteps}/${steps.length}` : "0" },
+    {
+      label: "Evidence",
+      value: `${countCollectionItems(evidenceStore.entities)} entities / ${countCollectionItems(evidenceStore.claims)} claims / ${countCollectionItems(evidenceStore.evidence)} evidence`,
+    },
+    {
+      label: "Exec metrics",
+      value: String(executionSummary.total_steps || steps.length || 0),
+    },
+    { label: "Prior research", value: String(priorResearch.length) },
+    { label: "Approval pending", value: rawState.co_scientist_plan_pending_approval ? "yes" : "no" },
+    {
+      label: "Persisted",
+      value: payload.persisted_updated_at ? formatDate(payload.persisted_updated_at) : "n/a",
+    },
+  ];
+
+  const metricHtml = metrics
+    .map((item) => `
+      <div class="debug-metric">
+        <span class="debug-metric-label">${escapeHtml(item.label)}</span>
+        <span class="debug-metric-value">${escapeHtml(item.value)}</span>
+      </div>
+    `)
+    .join("");
+
+  const watchlistHtml = watchlist.length
+    ? `
+      <div class="debug-watchlist">
+        ${watchlist.slice(0, 6).map((item) => `<span class="debug-pill">${escapeHtml(String(item || "").trim())}</span>`).join("")}
+      </div>
+    `
+    : "";
+
+  return `
+    <div class="debug-metrics-grid">${metricHtml}</div>
+    ${watchlistHtml}
+  `;
+}
+
+async function refreshCurrentDebugState({ force = false } = {}) {
+  const taskId = currentDebugTaskId();
+  if (!taskId || !state.debugOpen) return;
+  const existing = state.debugByTaskId[taskId];
+  if (existing?.loading) return;
+  if (!force && existing && existing.data) return;
+
+  state.debugByTaskId[taskId] = { loading: true, error: "", data: null };
+  renderReportPanel();
+
+  try {
+    const payload = await api(`/api/tasks/${encodeURIComponent(taskId)}/debug/workflow-state`);
+    state.debugByTaskId[taskId] = { loading: false, error: "", data: payload };
+  } catch (err) {
+    state.debugByTaskId[taskId] = {
+      loading: false,
+      error: String(err?.message || "Failed to load debug state."),
+      data: null,
+    };
+  }
+
+  renderReportPanel();
+}
+
 function renderReportPanel() {
   const iteration = currentReportIteration();
   const showPanel = Boolean(state.selectedConversationId && iteration && iteration?.report?.has_report);
+  const debugTaskId = currentDebugTaskId();
+  const debugEntry = debugTaskId ? state.debugByTaskId[debugTaskId] : null;
+  const showDebugToggle = Boolean(showPanel && debugTaskId);
+  const showDebugPanel = Boolean(showPanel && state.debugOpen && debugTaskId);
 
   el.workspace.classList.toggle("report-open", showPanel);
   el.reportPanel.classList.toggle("hidden", !showPanel);
@@ -958,8 +1148,12 @@ function renderReportPanel() {
     el.reportTitle.textContent = "Research Report";
     el.reportContent.innerHTML = "";
     el.exportPdfBtn.classList.add("hidden");
+    el.debugToggleBtn.classList.add("hidden");
     el.reportStatus.classList.add("hidden");
     el.reportStatus.classList.remove("error");
+    el.debugPanel.classList.add("hidden");
+    el.debugSummary.innerHTML = "";
+    el.debugJson.textContent = "";
     return;
   }
 
@@ -970,11 +1164,36 @@ function renderReportPanel() {
   el.reportContent.innerHTML = markdownToHtml(reportMarkdown);
   el.exportPdfBtn.classList.toggle("hidden", !taskId);
   el.exportPdfBtn.disabled = state.exportingPdf;
+  el.debugToggleBtn.classList.toggle("hidden", !showDebugToggle);
+  el.debugToggleBtn.textContent = state.debugOpen ? "Hide Debug" : "Show Debug";
 
   const shouldShowStatus = state.reportStatusTaskId === taskId && String(state.reportStatusText || "").trim().length > 0;
   el.reportStatus.classList.toggle("hidden", !shouldShowStatus);
   el.reportStatus.classList.toggle("error", shouldShowStatus && state.reportStatusError);
   el.reportStatus.textContent = shouldShowStatus ? state.reportStatusText : "";
+
+  el.debugPanel.classList.toggle("hidden", !showDebugPanel);
+  if (!showDebugPanel) {
+    el.debugSummary.innerHTML = "";
+    el.debugJson.textContent = "";
+    return;
+  }
+
+  if (!debugEntry || debugEntry.loading) {
+    el.debugSummary.innerHTML = '<div class="debug-empty">Loading workflow debug state...</div>';
+    el.debugJson.textContent = "";
+    return;
+  }
+
+  if (debugEntry.error) {
+    el.debugSummary.innerHTML = `<div class="debug-empty debug-error">${escapeHtml(debugEntry.error)}</div>`;
+    el.debugJson.textContent = "";
+    return;
+  }
+
+  const debugPayload = debugEntry.data || {};
+  el.debugSummary.innerHTML = debugSummaryHtml(debugPayload);
+  el.debugJson.textContent = JSON.stringify(debugPayload.state || {}, null, 2);
 }
 
 function renderAll() {
@@ -1063,6 +1282,7 @@ async function selectConversation(conversationId, { silent = false } = {}) {
     state.pendingUserMessage = "";
     state.clarificationMessage = "";
     renderAll();
+    refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
   } catch (err) {
     if (!silent) setNotice(`Failed to load conversation: ${err.message}`, true);
   }
@@ -1152,6 +1372,11 @@ function ensurePollTimerRunning() {
       updateLoadingSpinnerLabel();
       await handleTerminalRunState(run);
     }
+    if (state.debugOpen) {
+      refreshCurrentDebugState({ force: true }).catch((err) => {
+        setNotice(`Failed to load debug state: ${err.message}`, true);
+      });
+    }
     if (state.activeRunIds.size === 0 && state.pollTimer) {
       clearInterval(state.pollTimer);
       state.pollTimer = null;
@@ -1238,21 +1463,38 @@ async function submitNewQuery(query, { conversationId = null, parentTaskId = nul
 }
 
 async function submitContinue(taskId) {
+  const normalizedTaskId = String(taskId || "").trim();
+  if (!normalizedTaskId) return;
   const detail = state.selectedConversationDetail;
-  const iteration = findIteration(detail, taskId);
+  const iteration = findIteration(detail, normalizedTaskId);
+  const task = iteration?.task || null;
+  const previousAwaiting = Boolean(task?.awaiting_hitl);
+  if (task) task.awaiting_hitl = false;
+  renderMessages();
+
   const planVersionId = iteration?.active_plan_version?.version_id || null;
   let payload;
   try {
-    payload = await api(`/api/tasks/${encodeURIComponent(taskId)}/start`, {
+    payload = await api(`/api/tasks/${encodeURIComponent(normalizedTaskId)}/start`, {
       method: "POST",
       body: JSON.stringify({ plan_version_id: planVersionId }),
     });
   } catch (err) {
-    if (String(err?.message || "").trim() !== "Not Found") throw err;
-    payload = await api(`/api/tasks/${encodeURIComponent(taskId)}/continue`, {
-      method: "POST",
-      body: JSON.stringify({}),
-    });
+    if (String(err?.message || "").trim() !== "Not Found") {
+      if (task) task.awaiting_hitl = previousAwaiting;
+      renderMessages();
+      throw err;
+    }
+    try {
+      payload = await api(`/api/tasks/${encodeURIComponent(normalizedTaskId)}/continue`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    } catch (fallbackErr) {
+      if (task) task.awaiting_hitl = previousAwaiting;
+      renderMessages();
+      throw fallbackErr;
+    }
   }
   storeRunData(payload);
   renderMessages();
@@ -1282,6 +1524,8 @@ function clearDraft() {
   state.selectedConversationId = null;
   state.selectedConversationDetail = null;
   state.selectedReportTaskId = null;
+  state.debugOpen = false;
+  state.debugByTaskId = {};
   stopRunPolling();
   state.runsByRunId = {};
   state.runsByTaskId = {};
@@ -1322,12 +1566,10 @@ function bindEvents() {
       if (startBtn.disabled) return;
       const taskId = String(startBtn.dataset.taskId || "").trim();
       if (!taskId) return;
-      const originalLabel = startBtn.textContent;
       startBtn.disabled = true;
-      startBtn.textContent = "Starting...";
+      startBtn.remove();
       submitContinue(taskId).catch((err) => {
-        startBtn.disabled = false;
-        startBtn.textContent = originalLabel;
+        renderMessages();
         setNotice(`Start failed: ${err.message}`, true);
       });
       return;
@@ -1340,6 +1582,7 @@ function bindEvents() {
       const scrollTop = el.messages.scrollTop;
       state.selectedReportTaskId = taskId;
       renderAll();
+      refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
       el.messages.scrollTop = scrollTop;
     }
   });
@@ -1368,6 +1611,7 @@ function bindEvents() {
     const scrollTop = el.messages.scrollTop;
     state.selectedReportTaskId = taskId;
     renderAll();
+    refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
     el.messages.scrollTop = scrollTop;
   });
 
@@ -1419,6 +1663,12 @@ function bindEvents() {
     const taskId = String(iteration?.task?.task_id || "").trim();
     if (!taskId) return;
     exportFinalReportPdf(taskId);
+  });
+
+  el.debugToggleBtn.addEventListener("click", () => {
+    state.debugOpen = !state.debugOpen;
+    renderReportPanel();
+    refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
   });
 
   const exampleContainer = document.getElementById("exampleQueries");

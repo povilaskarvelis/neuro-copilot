@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AI Co-Scientist UI</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260304-5" />
+    <link rel="stylesheet" href="/static/styles.css?v=__UI_VERSION__" />
     <!-- GA4_SNIPPET -->
   </head>
   <body>
@@ -119,15 +119,18 @@
             <div id="exampleQueries" class="example-queries">
               <span class="example-queries-label">Example queries</span>
               <div class="example-queries-grid">
-                <div class="example-query" data-query="For BRAF V600E, where does evidence support standard-of-care actionability versus off-label uncertainty, stratified by tumor type and line of therapy?">BRAF V600E actionability by context</div>
-                <div class="example-query" data-query="If we were selecting one new cardiometabolic target beyond PCSK9, which candidates have the best genetics-to-tractability profile and lowest anticipated safety liabilities?">Cardiometabolic target triage beyond PCSK9</div>
-                <div class="example-query" data-query="For KRAS G12C inhibitors, compare sotorasib and adagrasib on efficacy durability, resistance mechanisms, CNS activity, and adverse event patterns; highlight likely class effects versus molecule-specific effects.">KRAS G12C drugs — class vs molecule effects</div>
-                <div class="example-query" data-query="Use cBioPortal, GTEx, and Reactome to identify TP53-altered tumor contexts where pathway co-dependencies suggest plausible combination strategies rather than TP53 restoration alone.">TP53 contexts with combination rationale</div>
-                <div class="example-query" data-query="Rank type 2 diabetes targets by translational confidence, then run a sensitivity analysis showing which assumptions most change the top-three ranking.">T2D targets with sensitivity analysis</div>
-                <div class="example-query" data-query="Across approved JAK inhibitors, where does kinase selectivity plausibly explain observed safety differences, and where do dose, indication, or patient mix look like stronger explanations?">JAK safety signals — selectivity or confounding?</div>
-                <div class="example-query" data-query="Is LRRK2 still a high-conviction Parkinson's target after accounting for human genetics, CNS target engagement constraints, and biomarker feasibility for proof-of-mechanism studies?">LRRK2 conviction after translational constraints</div>
-                <div class="example-query" data-query="Find schizophrenia EEG/MEG and MRI datasets suitable for cross-cohort replication, and propose a realistic first analysis plan with harmonization risks and expected effect sizes.">Schizophrenia datasets for replication-ready analyses</div>
-                <div class="example-query" data-query="For Alzheimer disease, which target classes currently have the strongest mechanism-to-clinic bridge, and what near-term experiments would most reduce uncertainty for each class?">Alzheimer target classes and de-risking experiments</div>
+                <div class="example-query" data-query="For obesity, which next-generation incretin programs look truly differentiated from semaglutide and tirzepatide on efficacy ceiling, tolerability, oral potential, and cardiometabolic expansion opportunities?">Obesity drugs beyond semaglutide and tirzepatide</div>
+                <div class="example-query" data-query="Why do KRAS G12C inhibitors underperform in colorectal cancer relative to lung cancer, and which combination strategies look best-supported by resistance biology, trial signals, and pathway context?">KRAS G12C: why CRC lags NSCLC</div>
+                <div class="example-query" data-query="In Alzheimer disease, which target classes currently have the strongest genetics-to-biomarker-to-clinic bridge, and what near-term experiments would most reduce uncertainty for each?">Alzheimer targets with the strongest bridge to clinic</div>
+                <div class="example-query" data-query="Beyond GLP-1 and PCSK9, which cardiometabolic targets have the strongest combined case from human genetics, tractability, and early clinical signals, and where are the main safety unknowns?">Cardiometabolic targets beyond GLP-1 and PCSK9</div>
+                <div class="example-query" data-query="Across TYK2, JAK, and IL-23 pathway drugs, where do efficacy and safety differences look mechanistically real versus more likely driven by dose, indication, or patient mix?">TYK2, JAK, and IL-23 - mechanism or confounding?</div>
+                <div class="example-query" data-query="For antibody-drug conjugates in solid tumors, what seems to distinguish the programs that change practice from the ones that stall, and which toxicities look target-specific versus payload- or platform-driven?">ADC winners and platform liabilities</div>
+                <div class="example-query" data-query="For sickle cell disease, how should a translational team compare CRISPR editing versus lentiviral gene addition on efficacy durability, conditioning burden, toxicity, manufacturing complexity, and access constraints?">Sickle cell gene therapy tradeoffs</div>
+                <div class="example-query" data-query="For BRAF V600E, where does evidence support standard-of-care actionability versus off-label uncertainty, stratified by tumor type, co-mutations, and line of therapy?">BRAF V600E actionability by context</div>
+                <div class="example-query" data-query="Is LRRK2 still a high-conviction Parkinson disease target after accounting for human genetics, brain-region expression, peripheral safety liabilities, biomarker feasibility, and competitive crowding?">LRRK2 after safety and biomarker constraints</div>
+                <div class="example-query" data-query="Use public MRI, EEG/MEG, and cohort metadata to identify replication-ready schizophrenia datasets, then propose a realistic first analysis plan with harmonization risks and likely effect-size constraints.">Schizophrenia datasets for replication-ready analysis</div>
+                <div class="example-query" data-query="Which rare-disease genes look most compelling for a new translational program once human phenotype data, curated disease knowledge, and model-organism evidence are integrated, and where is the biggest human-validation gap?">Rare-disease programs ranked by cross-species evidence</div>
+                <div class="example-query" data-query="For TREM2-directed neurodegeneration programs, which cell states, tissues, and disease stages make agonism look compelling versus risky, and where does the mechanism appear broader than Alzheimer disease alone?">TREM2: broad neurodegeneration play or narrow niche?</div>
               </div>
             </div>
           </section>
@@ -135,15 +138,22 @@
           <aside id="reportPanel" class="report-panel hidden" aria-live="polite">
             <header class="report-head">
               <h3 id="reportTitle" class="report-title">Research Report</h3>
-              <button id="exportPdfBtn" type="button" class="ghost-btn hidden">Export PDF</button>
+              <div class="report-actions">
+                <button id="exportPdfBtn" type="button" class="ghost-btn hidden">Export PDF</button>
+                <button id="debugToggleBtn" type="button" class="ghost-btn hidden">Show Debug</button>
+              </div>
             </header>
             <div id="reportStatus" class="report-status hidden"></div>
+            <section id="debugPanel" class="debug-panel hidden" aria-live="polite">
+              <div id="debugSummary" class="debug-summary"></div>
+              <pre id="debugJson" class="debug-json"></pre>
+            </section>
             <div id="reportContent" class="report-content markdown-body"></div>
           </aside>
         </div>
       </main>
     </div>
 
-    <script src="/static/app.js?v=20260304-17" defer></script>
+    <script src="/static/app.js?v=__UI_VERSION__" defer></script>
   </body>
 </html>

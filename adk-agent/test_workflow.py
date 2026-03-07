@@ -1,3 +1,5 @@
+import json
+
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 
 import co_scientist.workflow as workflow
@@ -134,6 +136,12 @@ def test_initialize_and_advance_task_state_one_step_at_a_time():
     assert task_state["current_step_id"] == "S1"
     assert [step["status"] for step in task_state["steps"]] == ["pending", "pending"]
     assert task_state["plan_status"] == "ready"
+    assert "evidence_store" in task_state
+    assert "execution_metrics" in task_state
+    assert task_state["execution_metrics"]["summary"]["step_count"] == 0
+    assert task_state["steps"][0]["entity_ids"] == []
+    assert task_state["steps"][0]["claim_ids"] == []
+    assert task_state["steps"][0]["execution_metrics"] == {}
 
     result_s1 = {
         "schema": workflow.STEP_RESULT_SCHEMA,
@@ -144,6 +152,7 @@ def test_initialize_and_advance_task_state_one_step_at_a_time():
         "evidence_ids": ["PMID:123", "GWAS:study-1"],
         "open_gaps": ["Need effect direction consistency check"],
         "suggested_next_searches": ["run_bigquery_select_query for top variants"],
+        "tools_called": ["get_variant_annotations"],
     }
     workflow._apply_step_execution_result_to_task_state(task_state, result_s1)
 
@@ -151,6 +160,9 @@ def test_initialize_and_advance_task_state_one_step_at_a_time():
     assert task_state["current_step_id"] == "S2"
     assert task_state["plan_status"] == "ready"
     assert task_state["last_completed_step_id"] == "S1"
+    assert task_state["steps"][0]["execution_metrics"]["tool_count"] == 1
+    assert task_state["execution_metrics"]["summary"]["step_count"] == 1
+    assert task_state["evidence_store"]["evidence"]
 
     result_s2 = {
         "schema": workflow.STEP_RESULT_SCHEMA,
@@ -161,11 +173,13 @@ def test_initialize_and_advance_task_state_one_step_at_a_time():
         "evidence_ids": [],
         "open_gaps": ["Need trial phase/status details"],
         "suggested_next_searches": ["search_clinical_trials with alternate terms"],
+        "tools_called": ["search_clinical_trials"],
     }
     workflow._apply_step_execution_result_to_task_state(task_state, result_s2)
     assert task_state["steps"][1]["status"] == "blocked"
     assert task_state["current_step_id"] == "S2"
     assert task_state["plan_status"] == "blocked"
+    assert task_state["execution_metrics"]["summary"]["blocked_count"] == 1
 
 
 def test_coverage_status_complete_vs_partial():
@@ -227,6 +241,22 @@ def test_parse_react_phases_structured():
 def test_parse_react_phases_returns_none_for_unstructured():
     assert workflow._parse_react_phases("Just a flat reasoning string.") is None
     assert workflow._parse_react_phases("") is None
+
+
+def test_parse_json_object_from_text_accepts_python_literal_dicts():
+    raw = (
+        '{"tool_response": {"content": [{"text": "Summary", "type": "text"}], '
+        '"isError": False, "structuredContent": {"payload": {"content_part_count": 1}}}}'
+    )
+    parsed, err = workflow._parse_json_object_from_text(raw)
+    assert err is None
+    assert parsed == {
+        "tool_response": {
+            "content": [{"text": "Summary", "type": "text"}],
+            "isError": False,
+            "structuredContent": {"payload": {"content_part_count": 1}},
+        }
+    }
 
 
 def test_render_react_trace_block_with_tools():
@@ -307,6 +337,28 @@ def test_resolve_source_label():
     # BigQuery dataset.table format - use dataset's display name
     assert workflow._resolve_source_label("open_targets_platform.disease") == "Open Targets Platform"
     assert workflow._resolve_source_label("ebi_chembl.some_table") == "ChEMBL"
+
+
+def test_derive_step_data_sources_prefers_specific_bigquery_backing_source():
+    step = {
+        "tool_hint": "open_targets_platform.associationByOverallDirect",
+        "tools_called": ["run_bigquery_select_query"],
+        "data_sources_queried": [],
+        "structured_observations": [
+            {
+                "source_tool": "run_bigquery_select_query",
+                "qualifiers": {"dataset": "open_targets_platform.associationByOverallDirect"},
+            }
+        ],
+        "reasoning_trace": (
+            "REASON: Need human genetics evidence.\n"
+            "ACT: Queried `bigquery-public-data.open_targets_platform.associationByOverallDirect`.\n"
+            "OBSERVE: Returned LRRK2-Parkinson association.\n"
+            "CONCLUDE: Step complete."
+        ),
+    }
+    assert workflow._derive_step_data_sources(step) == ["Open Targets Platform"]
+    assert workflow._preferred_step_source_label(step, "run_bigquery_select_query") == "Open Targets Platform"
 
 
 def test_format_source_precedence_rules_mentions_overlap_groups():
@@ -404,6 +456,9 @@ def test_react_step_context_instructions_include_phenotype_routing_guidance():
     instructions = workflow._react_step_context_instructions(task_state, active_step)
     text = "\n".join(instructions)
     assert "Routing guidance for this step's tool_hint `query_monarch_associations`" in text
+    assert "Family: phenotype and rare-disease evidence." in text
+    assert "\"predicate\": \"causal_gene_for\"" in text
+    assert "\"source_tool\": \"get_orphanet_disease_profile\"" in text
     assert "`search_hpo_terms` (Human Phenotype Ontology)" in text
     assert "`get_orphanet_disease_profile` (Orphanet / ORDO)" in text
     assert "Start with `query_monarch_associations`" in text
@@ -496,6 +551,672 @@ def test_react_step_context_instructions_include_pharmacodb_routing_guidance():
     instructions = workflow._react_step_context_instructions(task_state, active_step)
     text = "\n".join(instructions)
     assert "Routing guidance for this step's tool_hint `get_pharmacodb_compound_response`" in text
+    assert "Structured observation guidance for this step" in text
+    assert "Family: drug-response and screening evidence." in text
+    assert "\"predicate\": \"sensitive_in\"" in text
+    assert "\"source_tool\": \"get_pharmacodb_compound_response\"" in text
     assert "`get_gdsc_drug_sensitivity` (GDSC / CancerRxGene)" in text
     assert "`get_prism_repurposing_response` (PRISM Repurposing)" in text
     assert "Start with `get_pharmacodb_compound_response`" in text
+
+
+def test_apply_step_execution_result_populates_v1_evidence_store_and_metrics():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess paclitaxel response evidence in lung cancer",
+        "success_criteria": ["Summarize pharmacogenomic response evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Collect pharmacogenomic response evidence",
+                "tool_hint": "get_gdsc_drug_sensitivity",
+                "domains": ["genomics", "chemistry"],
+                "completion_condition": "Summarize response across major datasets",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Assess paclitaxel response evidence in lung cancer",
+    )
+    result = {
+        "schema": workflow.STEP_RESULT_SCHEMA,
+        "step_id": "S1",
+        "status": "completed",
+        "step_progress_note": "Completed a pharmacogenomic sensitivity sweep.",
+        "result_summary": "Paclitaxel shows sensitivity support across public screening datasets.",
+        "evidence_ids": ["CHEMBL3658657", "PMID:12345678", "NCT01234567"],
+        "open_gaps": ["Need biomarker stratification by tissue subtype"],
+        "suggested_next_searches": ["get_pharmacodb_compound_response for PRISM and CTRPv2 context"],
+        "tools_called": ["get_gdsc_drug_sensitivity", "get_pharmacodb_compound_response"],
+        "structured_observations": [
+            {
+                "observation_type": "drug_response",
+                "subject": {"type": "compound", "label": "Paclitaxel", "id": "CHEMBL3658657"},
+                "predicate": "sensitive_in",
+                "object": {"type": "tissue", "label": "lung"},
+                "supporting_ids": ["CHEMBL3658657", "PMID:12345678"],
+                "source_tool": "get_gdsc_drug_sensitivity",
+                "confidence": "high",
+                "qualifiers": {"dataset": "GDSC2", "metric": "AUC", "direction": "more_sensitive"},
+            },
+            {
+                "observation_type": "drug_response",
+                "subject": {"type": "compound", "label": "Paclitaxel", "id": "CHEMBL3658657"},
+                "predicate": "sensitive_in",
+                "object": {"type": "cell_line", "label": "A549"},
+                "supporting_ids": ["CHEMBL3658657"],
+                "source_tool": "get_pharmacodb_compound_response",
+                "confidence": "medium",
+                "qualifiers": {"dataset": "PharmacoDB", "metric": "AAC"},
+            },
+        ],
+    }
+
+    workflow._apply_step_execution_result_to_task_state(task_state, result, parse_retry_count=1)
+
+    metrics = task_state["steps"][0]["execution_metrics"]
+    assert metrics["executor_cluster"] == "drug_response_screens"
+    assert metrics["used_tool_hint"] is True
+    assert metrics["used_tool_hint_first"] is True
+    assert metrics["fallback_used"] is True
+    assert metrics["parse_retry_count"] == 1
+    assert metrics["structured_observation_count"] == 2
+
+    evidence_store = task_state["evidence_store"]
+    entity_types = {entity["type"] for entity in evidence_store["entities"].values()}
+    assert "objective" in entity_types
+    assert "step" in entity_types
+    assert "source" in entity_types
+    assert "compound" in entity_types
+    assert "paper" in entity_types
+    assert "trial" in entity_types
+    assert "tissue" in entity_types
+    assert "cell_line" in entity_types
+    assert any(claim["predicate"] == "supported_by" for claim in evidence_store["claims"].values())
+    assert any(claim["predicate"] == "sensitive_in" for claim in evidence_store["claims"].values())
+    assert task_state["steps"][0]["entity_ids"]
+    assert task_state["steps"][0]["claim_ids"]
+    assert task_state["steps"][0]["structured_observations"]
+
+    summary = task_state["execution_metrics"]["summary"]
+    assert summary["step_count"] == 1
+    assert summary["avg_parse_retries_per_step"] == 1.0
+    assert summary["avg_structured_observations_per_step"] == 2.0
+    assert summary["tool_hint_accuracy"] == 1.0
+    assert summary["clusters"][0]["cluster"] == "drug_response_screens"
+
+
+def test_synth_context_instructions_include_evidence_and_execution_summaries():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess ataxia rare-disease evidence",
+        "success_criteria": ["Summarize phenotype and gene evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Map ataxia phenotype and retrieve rare-disease context",
+                "tool_hint": "query_monarch_associations",
+                "domains": ["genomics"],
+                "completion_condition": "Return phenotype-linked genes and disease context",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Assess ataxia rare-disease evidence",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected phenotype-linked associations.",
+            "result_summary": "Ataxia maps to established phenotype-driven gene associations.",
+            "evidence_ids": ["HP:0001251", "ORPHA:58"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["query_monarch_associations", "search_hpo_terms"],
+            "structured_observations": [
+                {
+                    "observation_type": "phenotype_association",
+                    "subject": {"type": "phenotype", "label": "Ataxia", "id": "HP:0001251"},
+                    "predicate": "associated_with",
+                    "object": {"type": "disease", "label": "Ataxia-telangiectasia", "id": "ORPHA:100"},
+                    "supporting_ids": ["HP:0001251", "ORPHA:100"],
+                    "source_tool": "query_monarch_associations",
+                    "confidence": "medium",
+                    "qualifiers": {"mode": "phenotype_to_gene"},
+                }
+            ],
+        },
+    )
+
+    instructions = workflow._synth_context_instructions(task_state)
+    assert len(instructions) >= 2
+    payload = json.loads(instructions[1])
+    assert "evidence_store_summary" in payload
+    assert "claim_synthesis_summary" in payload
+    assert "execution_metrics_summary" in payload
+    assert payload["evidence_store_summary"]["evidence_count"] >= 1
+    assert payload["claim_synthesis_summary"]["substantive_claim_count"] >= 1
+    assert payload["execution_metrics_summary"]["step_count"] == 1
+    assert payload["execution_metrics_summary"]["avg_structured_observations_per_step"] == 1.0
+    assert payload["steps"][0]["structured_observations"]
+    assert payload["steps"][0]["entity_ids"]
+    assert payload["steps"][0]["claim_ids"]
+
+
+def test_claim_synthesis_summary_weights_sources_and_flags_mixed_evidence():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess paclitaxel response in lung cancer",
+        "success_criteria": ["Compare drug response across sources"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Retrieve GDSC sensitivity evidence",
+                "tool_hint": "get_gdsc_drug_sensitivity",
+                "domains": ["pharmacology"],
+                "completion_condition": "Return response evidence",
+            },
+            {
+                "id": "S2",
+                "goal": "Retrieve PRISM response evidence",
+                "tool_hint": "get_prism_repurposing_response",
+                "domains": ["pharmacology"],
+                "completion_condition": "Return response evidence",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Assess paclitaxel response in lung cancer",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected GDSC sensitivity evidence.",
+            "result_summary": "Paclitaxel showed sensitivity in A549.",
+            "evidence_ids": ["GDSC:Paclitaxel", "A549"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["get_gdsc_drug_sensitivity"],
+            "structured_observations": [
+                {
+                    "observation_type": "drug_response",
+                    "subject": {"type": "compound", "label": "Paclitaxel", "id": "CHEMBL:CHEMBL428647"},
+                    "predicate": "sensitive_in",
+                    "object": {"type": "cell_line", "label": "A549", "id": "A549"},
+                    "supporting_ids": ["GDSC:Paclitaxel", "A549"],
+                    "source_tool": "get_gdsc_drug_sensitivity",
+                    "confidence": "high",
+                    "qualifiers": {"tissue": "lung"},
+                }
+            ],
+        },
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S2",
+            "status": "completed",
+            "step_progress_note": "Collected PRISM response evidence.",
+            "result_summary": "PRISM reported weak or resistant response in A549.",
+            "evidence_ids": ["PRISM:Paclitaxel", "A549"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["get_prism_repurposing_response"],
+            "structured_observations": [
+                {
+                    "observation_type": "drug_response",
+                    "subject": {"type": "compound", "label": "Paclitaxel", "id": "CHEMBL:CHEMBL428647"},
+                    "predicate": "resistant_in",
+                    "object": {"type": "cell_line", "label": "A549", "id": "A549"},
+                    "supporting_ids": ["PRISM:Paclitaxel", "A549"],
+                    "source_tool": "get_prism_repurposing_response",
+                    "confidence": "medium",
+                    "qualifiers": {"tissue": "lung"},
+                }
+            ],
+        },
+    )
+
+    claim_summary = workflow._build_claim_synthesis_summary(task_state["evidence_store"])
+
+    assert claim_summary["substantive_claim_count"] >= 2
+    assert claim_summary["mixed_evidence_count"] == 1
+    assert claim_summary["top_supported_claims"][0]["statement"] == "Paclitaxel is sensitive in A549"
+    assert claim_summary["top_supported_claims"][0]["mixed_evidence"] is True
+    assert claim_summary["top_supported_claims"][0]["primary_sources"][0] == "GDSC / CancerRxGene"
+    assert claim_summary["mixed_evidence_claims"][0]["assessment"] == "mixed_lean_supporting"
+    assert claim_summary["mixed_evidence_claims"][0]["preferred_interpretation"] == "Paclitaxel is sensitive in A549"
+
+
+def test_postprocess_synth_markdown_renders_structured_sections_from_claims():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess paclitaxel response in lung cancer",
+        "success_criteria": ["Compare drug response across sources"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Retrieve GDSC sensitivity evidence",
+                "tool_hint": "get_gdsc_drug_sensitivity",
+                "domains": ["pharmacology"],
+                "completion_condition": "Return response evidence",
+            },
+            {
+                "id": "S2",
+                "goal": "Retrieve PRISM response evidence",
+                "tool_hint": "get_prism_repurposing_response",
+                "domains": ["pharmacology"],
+                "completion_condition": "Return response evidence",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Assess paclitaxel response in lung cancer",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected GDSC sensitivity evidence.",
+            "result_summary": "Paclitaxel showed sensitivity in A549.",
+            "evidence_ids": ["GDSC:Paclitaxel", "A549"],
+            "open_gaps": ["Replicate in an orthogonal assay"],
+            "suggested_next_searches": [],
+            "tools_called": ["get_gdsc_drug_sensitivity"],
+            "structured_observations": [
+                {
+                    "observation_type": "drug_response",
+                    "subject": {"type": "compound", "label": "Paclitaxel", "id": "CHEMBL:CHEMBL428647"},
+                    "predicate": "sensitive_in",
+                    "object": {"type": "cell_line", "label": "A549", "id": "A549"},
+                    "supporting_ids": ["GDSC:Paclitaxel", "A549"],
+                    "source_tool": "get_gdsc_drug_sensitivity",
+                    "confidence": "high",
+                    "qualifiers": {"tissue": "lung"},
+                }
+            ],
+        },
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S2",
+            "status": "completed",
+            "step_progress_note": "Collected PRISM response evidence.",
+            "result_summary": "PRISM reported weak or resistant response in A549.",
+            "evidence_ids": ["PRISM:Paclitaxel", "A549"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["get_prism_repurposing_response"],
+            "structured_observations": [
+                {
+                    "observation_type": "drug_response",
+                    "subject": {"type": "compound", "label": "Paclitaxel", "id": "CHEMBL:CHEMBL428647"},
+                    "predicate": "resistant_in",
+                    "object": {"type": "cell_line", "label": "A549", "id": "A549"},
+                    "supporting_ids": ["PRISM:Paclitaxel", "A549"],
+                    "source_tool": "get_prism_repurposing_response",
+                    "confidence": "medium",
+                    "qualifiers": {"tissue": "lung"},
+                }
+            ],
+        },
+    )
+
+    raw_markdown = """# AI Co-Scientist Report
+
+## Summary
+
+This is a vague model summary.
+
+## Evidence and Methodology
+
+Custom evidence narrative from the model.
+
+### Step note
+
+The model kept useful step-level prose here.
+
+## Limitations
+
+- Generic model limitation.
+
+## Potential Next Steps
+
+1. Generic model next step.
+"""
+
+    final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
+
+    assert "# AI Co-Scientist Report" in final_markdown
+    assert "## Summary" in final_markdown
+    assert "Overall confidence" not in final_markdown
+    assert "### Evidence Snapshot" not in final_markdown
+    assert "For the question of Assess paclitaxel response in lung cancer, the strongest directly grounded finding is Paclitaxel is sensitive in A549." in final_markdown
+    assert "PRISM Repurposing supports Paclitaxel is resistant in A549" in final_markdown
+    assert "whereas GDSC / CancerRxGene supports Paclitaxel is sensitive in A549." in final_markdown
+    assert "### Top Supported Claims" not in final_markdown
+    assert "Key evidence strands:" in final_markdown
+    assert "- Paclitaxel showed sensitivity in A549. (source: GDSC / CancerRxGene)" in final_markdown
+    assert "- PRISM reported weak or resistant response in A549. (source: PRISM Repurposing)" in final_markdown
+    assert "### Mixed-Evidence Claims" in final_markdown
+    assert "| Claim focus | Assessment | Current lean | Leading sources |" in final_markdown
+    assert "## Evidence and Methodology" in final_markdown
+    assert "Custom evidence narrative from the model." in final_markdown
+    assert "Generic model limitation." in final_markdown
+    assert "Resolve the mixed evidence for Paclitaxel and A549" in final_markdown
+
+
+def test_informative_model_summary_is_preserved_in_report_summary():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Determine whether LRRK2 is a high-conviction Parkinson disease target",
+        "success_criteria": ["Summarize target-conviction evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Retrieve genetics evidence",
+                "tool_hint": "open_targets_platform.associationByOverallDirect",
+                "domains": ["genomics"],
+                "completion_condition": "Return target-disease evidence",
+            },
+            {
+                "id": "S2",
+                "goal": "Retrieve protein function evidence",
+                "tool_hint": "get_protein_info",
+                "domains": ["proteomics"],
+                "completion_condition": "Return protein function evidence",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Determine whether LRRK2 is a high-conviction Parkinson disease target",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected genetics evidence.",
+            "result_summary": "LRRK2 has strong human genetic association with Parkinson disease.",
+            "evidence_ids": ["MONDO:0005180"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["open_targets_platform.associationByOverallDirect"],
+            "structured_observations": [
+                {
+                    "observation_type": "phenotype_association",
+                    "subject": {"type": "gene", "label": "LRRK2", "id": "LRRK2"},
+                    "predicate": "associated_with",
+                    "object": {"type": "disease", "label": "Parkinson disease", "id": "MONDO:0005180"},
+                    "supporting_ids": ["MONDO:0005180"],
+                    "source_tool": "open_targets_platform.associationByOverallDirect",
+                    "confidence": "high",
+                    "qualifiers": {"evidence": "human_genetics"},
+                }
+            ],
+        },
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S2",
+            "status": "completed",
+            "step_progress_note": "Collected protein function evidence.",
+            "result_summary": "LRRK2 is a kinase implicated in vesicle trafficking and neuronal biology.",
+            "evidence_ids": ["UniProt:Q5S007"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["get_protein_info"],
+            "structured_observations": [
+                {
+                    "observation_type": "pathway_context",
+                    "subject": {"type": "gene", "label": "LRRK2", "id": "LRRK2"},
+                    "predicate": "has_function",
+                    "object_literal": "kinase activity linked to vesicle trafficking and neuronal biology",
+                    "supporting_ids": ["UniProt:Q5S007"],
+                    "source_tool": "get_protein_info",
+                    "confidence": "high",
+                    "qualifiers": {"evidence": "protein_function"},
+                }
+            ],
+        },
+    )
+
+    raw_markdown = """# AI Co-Scientist Report
+
+## Summary
+
+LRRK2 appears to remain a high-conviction Parkinson disease target overall because the strongest evidence comes from human genetics, and the protein's kinase biology provides a plausible mechanistic bridge to therapeutic intervention. The main caution is that target conviction does not guarantee clinical success, so translational and trial-readiness considerations still matter.
+
+## Evidence and Methodology
+
+Model-authored evidence narrative.
+"""
+
+    final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
+
+    assert "LRRK2 appears to remain a high-conviction Parkinson disease target overall" in final_markdown
+    assert "For the question of Determine whether LRRK2 is a high-conviction Parkinson disease target" not in final_markdown
+    assert "### Top Supported Claims" not in final_markdown
+    assert "Key evidence strands:" in final_markdown
+
+
+def test_postprocess_uses_actual_bigquery_backing_source_instead_of_transport_label():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess LRRK2 genetics evidence in Parkinson disease",
+        "success_criteria": ["Summarize direct human genetics evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Retrieve Open Targets genetics evidence",
+                "tool_hint": "open_targets_platform.associationByOverallDirect",
+                "domains": ["genomics"],
+                "completion_condition": "Return target-disease evidence",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Assess LRRK2 genetics evidence in Parkinson disease",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected Open Targets genetics evidence.",
+            "result_summary": "LRRK2 has strong human genetic association with Parkinson disease.",
+            "evidence_ids": ["MONDO:0005180"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["run_bigquery_select_query"],
+            "data_sources_queried": ["open_targets_platform.associationByOverallDirect"],
+            "structured_observations": [
+                {
+                    "observation_type": "phenotype_association",
+                    "subject": {"type": "gene", "label": "LRRK2", "id": "LRRK2"},
+                    "predicate": "associated_with",
+                    "object": {"type": "disease", "label": "Parkinson disease", "id": "MONDO:0005180"},
+                    "supporting_ids": ["MONDO:0005180"],
+                    "source_tool": "run_bigquery_select_query",
+                    "confidence": "high",
+                    "qualifiers": {"dataset": "open_targets_platform.associationByOverallDirect"},
+                }
+            ],
+        },
+    )
+
+    raw_markdown = """# AI Co-Scientist Report
+
+## Summary
+
+This is a vague model summary.
+
+## Evidence and Methodology
+
+Generic methodology text.
+
+## Limitations
+
+- Generic limitation.
+
+## Potential Next Steps
+
+1. Generic next step.
+"""
+
+    final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
+
+    assert "Open Targets Platform" in final_markdown
+    assert "sources: BigQuery" not in final_markdown
+
+
+def test_generic_no_claim_summary_falls_back_to_step_highlights():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Find publicly available EEG/MEG and MRI datasets suitable for cross-cohort replication in schizophrenia",
+        "success_criteria": ["Summarize usable public datasets"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Find public MRI schizophrenia datasets",
+                "tool_hint": "search_openneuro_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return public MRI datasets",
+            },
+            {
+                "id": "S2",
+                "goal": "Find public EEG/MEG schizophrenia datasets",
+                "tool_hint": "search_nemar_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return public EEG/MEG datasets",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Find publicly available EEG/MEG and MRI datasets suitable for cross-cohort replication in schizophrenia",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected MRI dataset candidates.",
+            "result_summary": "OpenNeuro and SchizConnect expose reusable schizophrenia MRI cohorts with public structural imaging data suitable for replication-oriented analysis.",
+            "evidence_ids": ["ds000115"],
+            "open_gaps": ["Confirm overlap in acquisition metadata across cohorts"],
+            "suggested_next_searches": [],
+            "tools_called": ["search_openneuro_datasets"],
+            "structured_observations": [],
+        },
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S2",
+            "status": "completed",
+            "step_progress_note": "Collected EEG/MEG dataset candidates.",
+            "result_summary": "NEMAR and OpenNeuro provide smaller schizophrenia EEG datasets, but harmonization will be harder because task paradigms and preprocessing conventions differ substantially across studies.",
+            "evidence_ids": ["nm000002"],
+            "open_gaps": ["Confirm whether enough controls exist for matched replication"],
+            "suggested_next_searches": [],
+            "tools_called": ["search_nemar_datasets"],
+            "structured_observations": [],
+        },
+    )
+
+    raw_markdown = """# AI Co-Scientist Report
+
+## Summary
+
+To find publicly available EEG/MEG and MRI datasets suitable for cross-cohort replication in schizophrenia, the following key findings were identified:
+
+## Evidence and Methodology
+
+Generic evidence narrative.
+"""
+
+    final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
+
+    assert "the following key findings were identified" not in final_markdown
+    assert "For the question of Find publicly available EEG/MEG and MRI datasets suitable for cross-cohort replication in schizophrenia, the completed searches" in final_markdown
+    assert "Key evidence strands:" not in final_markdown
+    assert "OpenNeuro and SchizConnect expose reusable schizophrenia MRI cohorts" in final_markdown
+    assert "NEMAR and OpenNeuro provide smaller schizophrenia EEG datasets" in final_markdown
+
+
+def test_postprocess_normalizes_flat_evidence_step_blocks_into_key_findings_list():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess BRAF V600E actionability",
+        "success_criteria": ["Summarize label and trial evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Retrieve DailyMed labels",
+                "tool_hint": "get_dailymed_drug_label",
+                "domains": ["clinical"],
+                "completion_condition": "Return label evidence",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Assess BRAF V600E actionability",
+    )
+    raw_markdown = """# AI Co-Scientist Report
+
+## Summary
+
+This is a vague model summary.
+
+## Evidence and Methodology
+
+One overview paragraph.
+
+Step 4: Retrieve DailyMed labels for BRAF-directed therapies — COMPLETED
+Data Source: DailyMed
+Key Findings: DailyMed labels confirmed several BRAF-directed standard-of-care uses.
+Dabrafenib is approved for unresectable or metastatic melanoma with BRAF V600E/K mutations.
+Tovorafenib has accelerated approval for relapsed or refractory pediatric low-grade glioma with BRAF alteration.
+Significance: This clarifies which uses are on-label versus investigational.
+Limitations: Manufacturer-specific labels may differ in wording.
+
+## Limitations
+
+- Generic limitation.
+"""
+
+    final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
+
+    assert "### Step 4: Retrieve DailyMed labels for BRAF-directed therapies — COMPLETED" in final_markdown
+    assert "**Data Source:** DailyMed" in final_markdown
+    assert "**Key Findings:**" in final_markdown
+    assert "- DailyMed labels confirmed several BRAF-directed standard-of-care uses." in final_markdown
+    assert "- Dabrafenib is approved for unresectable or metastatic melanoma with BRAF V600E/K mutations." in final_markdown
+    assert "- Tovorafenib has accelerated approval for relapsed or refractory pediatric low-grade glioma with BRAF alteration." in final_markdown
+    assert "**Significance:** This clarifies which uses are on-label versus investigational." in final_markdown
+    assert "**Limitations:** Manufacturer-specific labels may differ in wording." in final_markdown

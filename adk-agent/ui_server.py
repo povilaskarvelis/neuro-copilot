@@ -9,9 +9,9 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import json
 import logging
 import os
 from pathlib import Path
@@ -31,11 +31,13 @@ from google.genai.types import Content, Part
 from pydantic import BaseModel, Field
 
 from agent import validate_runtime_configuration
+from state_store import SupportsWorkflowStateStore, create_state_store
 from report_pdf import write_markdown_pdf
+from co_scientist.tool_registry import TOOL_SOURCE_NAMES
 from co_scientist.workflow import (
+    STATE_PRIOR_RESEARCH,
     STATE_WORKFLOW_TASK,
     STATE_PLAN_PENDING_APPROVAL,
-    TOOL_SOURCE_NAMES,
     create_workflow_agent,
     _resolve_source_label,
 )
@@ -142,6 +144,12 @@ _TRANSIENT_WORKFLOW_RESPONSE_PATTERNS = (
     re.compile(r"^_?\s*rate limit hit\s+[—-]\s+waited\s+\d+s,\s+retrying[.…_ ]*$", re.IGNORECASE),
 )
 
+PERSISTED_SESSION_STATE_KEYS = (
+    STATE_WORKFLOW_TASK,
+    STATE_PRIOR_RESEARCH,
+    STATE_PLAN_PENDING_APPROVAL,
+)
+
 
 def _is_transient_workflow_response(text: str) -> bool:
     normalized = str(text or "").strip()
@@ -207,83 +215,14 @@ def _generate_chat_title(query: str) -> str:
     return " ".join(words[:8]).rstrip(".,;:!?")
 
 
-# ---------------------------------------------------------------------------
-# Simple JSON-backed store for conversations & tasks
-# ---------------------------------------------------------------------------
-
-class TaskStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._data: dict = {"conversations": {}, "tasks": {}}
-        self._load()
-
-    def _load(self) -> None:
-        if self.path.exists():
-            try:
-                self._data = json.loads(self.path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-
-    def _save(self) -> None:
-        self.path.write_text(
-            json.dumps(self._data, indent=2, ensure_ascii=False, default=str),
-            encoding="utf-8",
-        )
-
-    def save_task(self, task: dict, *, owner_ip: str = "") -> None:
-        task["updated_at"] = _utc_now()
-        self._data["tasks"][task["task_id"]] = task
-        conv_id = task.get("conversation_id", "")
-        if conv_id:
-            conv = self._data["conversations"].setdefault(conv_id, {
-                "conversation_id": conv_id,
-                "title": task.get("title", ""),
-                "task_ids": [],
-                "owner_ip": owner_ip,
-                "created_at": task.get("created_at", _utc_now()),
-                "updated_at": _utc_now(),
-            })
-            if task["task_id"] not in conv["task_ids"]:
-                conv["task_ids"].append(task["task_id"])
-            conv["updated_at"] = _utc_now()
-            conv["title"] = task.get("title") or conv.get("title", "")
-        self._save()
-
-    def get_task(self, task_id: str) -> dict | None:
-        return self._data["tasks"].get(task_id)
-
-    def list_conversations(self, *, owner_ip: str = "") -> list[dict]:
-        result = []
-        for conv in self._data["conversations"].values():
-            if owner_ip and conv.get("owner_ip", "") != owner_ip:
-                continue
-            task_ids = conv.get("task_ids", [])
-            tasks = [self._data["tasks"].get(tid) for tid in task_ids]
-            tasks = [t for t in tasks if t]
-            latest = max(tasks, key=lambda t: t.get("updated_at", "")) if tasks else None
-            result.append({
-                "conversation_id": conv["conversation_id"],
-                "title": conv.get("title", "Research"),
-                "latest_status": latest["status"] if latest else "unknown",
-                "updated_at": conv.get("updated_at", ""),
-                "iteration_count": len(tasks),
-            })
-        result.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
-        return result
-
-    def conversation_owned_by(self, conversation_id: str, owner_ip: str) -> bool:
-        conv = self._data["conversations"].get(conversation_id)
-        if not conv:
-            return False
-        return conv.get("owner_ip", "") == owner_ip
-
-    def get_conversation_tasks(self, conversation_id: str) -> list[dict]:
-        conv = self._data["conversations"].get(conversation_id)
-        if not conv:
-            return []
-        tasks = [self._data["tasks"].get(tid) for tid in conv.get("task_ids", [])]
-        return [t for t in tasks if t]
+def _extract_persistable_session_state(session_state: dict | None) -> dict:
+    persisted: dict[str, object] = {}
+    if not isinstance(session_state, dict):
+        return persisted
+    for key in PERSISTED_SESSION_STATE_KEYS:
+        if key in session_state and session_state[key] is not None:
+            persisted[key] = copy.deepcopy(session_state[key])
+    return persisted
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +490,7 @@ def _iteration_from_task(task: dict, idx: int = 1) -> dict:
 
 class UiRuntime:
     def __init__(self, state_store_path: Path) -> None:
-        self.store = TaskStore(state_store_path)
+        self.store: SupportsWorkflowStateStore = create_state_store(state_store_path)
         self.ready = False
         self.ready_error: str | None = None
         self.user_id = "researcher"
@@ -569,6 +508,11 @@ class UiRuntime:
             self.ready_error = error_message
             return
         self.session_service = InMemorySessionService()
+        interrupted = self.store.mark_incomplete_runs_failed(
+            "Run interrupted because the server restarted before completion."
+        )
+        if interrupted:
+            logger.warning("Marked %d incomplete runs as failed during startup.", interrupted)
         self.ready = True
         self.ready_error = None
 
@@ -594,6 +538,8 @@ class UiRuntime:
     async def _get_or_create_session(self, conversation_id: str) -> ConversationSession:
         if conversation_id in self.conv_sessions:
             return self.conv_sessions[conversation_id]
+        if not self.session_service:
+            raise RuntimeError("Session service is not initialized.")
         workflow_agent, mcp_tools = create_workflow_agent(require_plan_approval=True)
         app_name = f"co_scientist_ui_{conversation_id}"
         runner = Runner(
@@ -601,9 +547,16 @@ class UiRuntime:
             app_name=app_name,
             session_service=self.session_service,
         )
+        restored_session = self.store.get_workflow_session(conversation_id)
+        restored_state = None
+        if isinstance(restored_session, dict):
+            payload = restored_session.get("state")
+            if isinstance(payload, dict):
+                restored_state = _extract_persistable_session_state(payload) or None
         session = await self.session_service.create_session(
             app_name=app_name,
             user_id=self.user_id,
+            state=restored_state,
         )
         cs = ConversationSession(
             runner=runner,
@@ -614,7 +567,7 @@ class UiRuntime:
         self.conv_sessions[conversation_id] = cs
         return cs
 
-    async def _read_workflow_state(self, conversation_id: str) -> dict | None:
+    async def _read_session_state(self, conversation_id: str) -> dict | None:
         cs = self.conv_sessions.get(conversation_id)
         if not cs or not self.session_service:
             return None
@@ -625,20 +578,28 @@ class UiRuntime:
         )
         if not session:
             return None
-        return session.state.get(STATE_WORKFLOW_TASK)
+        return session.state
+
+    async def _read_workflow_state(self, conversation_id: str) -> dict | None:
+        session_state = await self._read_session_state(conversation_id)
+        if not session_state:
+            return None
+        return session_state.get(STATE_WORKFLOW_TASK)
+
+    async def _read_persistable_session_state(self, conversation_id: str) -> dict:
+        return _extract_persistable_session_state(await self._read_session_state(conversation_id))
+
+    async def _persist_conversation_state(self, conversation_id: str, *, task_id: str = "") -> None:
+        if not conversation_id:
+            return
+        state = await self._read_persistable_session_state(conversation_id)
+        self.store.save_workflow_session(conversation_id, task_id=task_id, state=state or None)
 
     async def _is_plan_pending_approval(self, conversation_id: str) -> bool:
-        cs = self.conv_sessions.get(conversation_id)
-        if not cs or not self.session_service:
+        session_state = await self._read_session_state(conversation_id)
+        if not session_state:
             return False
-        session = await self.session_service.get_session(
-            app_name=cs.app_name,
-            user_id=self.user_id,
-            session_id=cs.session_id,
-        )
-        if not session:
-            return False
-        return bool(session.state.get(STATE_PLAN_PENDING_APPROVAL, False))
+        return bool(session_state.get(STATE_PLAN_PENDING_APPROVAL, False))
 
     async def _run_workflow_turn(
         self,
@@ -1001,13 +962,31 @@ class UiRuntime:
         self, task: dict, run_id: str | None = None, *, owner_ip: str = "", merge_progress: bool = True
     ) -> None:
         """Save task to store, syncing progress data from the active run unless merge_progress=False."""
+        active_run_id = ""
         if run_id and merge_progress:
             async with self.runs_lock:
                 run = self.runs.get(run_id)
                 if run:
                     task["progress_events"] = list(run.progress_events[-600:])
                     task["progress_summaries"] = list(run.progress_summaries[-80:])
+                    if run.status in self._ACTIVE_RUN_STATUSES:
+                        active_run_id = run.run_id
+        elif run_id:
+            async with self.runs_lock:
+                run = self.runs.get(run_id)
+                if run and run.status in self._ACTIVE_RUN_STATUSES:
+                    active_run_id = run.run_id
+        if active_run_id:
+            task["active_run_id"] = active_run_id
+        else:
+            task.pop("active_run_id", None)
         self.store.save_task(task, owner_ip=owner_ip)
+        conversation_id = str(task.get("conversation_id", "") or "").strip()
+        if conversation_id:
+            await self._persist_conversation_state(
+                conversation_id,
+                task_id=str(task.get("task_id", "") or "").strip(),
+            )
 
     # -- Run management -------------------------------------------------------
 
@@ -1021,9 +1000,11 @@ class UiRuntime:
         )
         async with self.runs_lock:
             self.runs[run.run_id] = run
+        self.store.save_run(run.to_dict())
         return run
 
     async def _update_run(self, run_id: str, **updates) -> None:
+        run_payload: dict | None = None
         async with self.runs_lock:
             run = self.runs.get(run_id)
             if not run:
@@ -1031,6 +1012,9 @@ class UiRuntime:
             for key, value in updates.items():
                 setattr(run, key, value)
             run.updated_at = _utc_now()
+            run_payload = run.to_dict()
+        if run_payload:
+            self.store.save_run(run_payload)
 
     async def _append_progress_event(
         self,
@@ -1056,6 +1040,7 @@ class UiRuntime:
             "tool": "",
             "metrics": metrics or {},
         }
+        run_payload: dict | None = None
         async with self.runs_lock:
             run = self.runs.get(run_id)
             if not run:
@@ -1070,6 +1055,9 @@ class UiRuntime:
                 if len(run.logs) > 300:
                     run.logs = run.logs[-300:]
             run.updated_at = _utc_now()
+            run_payload = run.to_dict()
+        if run_payload:
+            self.store.save_run(run_payload)
         logger.info("[ui:%s] %s", run_id, event["human_line"])
 
     def _track_background_task(self, task: asyncio.Task) -> None:
@@ -1616,12 +1604,38 @@ class UiRuntime:
             "report_pdf_path": None,
         }
 
+    async def get_task_workflow_state_debug(self, task_id: str) -> dict | None:
+        task = self.store.get_task(task_id)
+        if not task:
+            return None
+        conversation_id = str(task.get("conversation_id", "") or "").strip()
+        live_state = await self._read_persistable_session_state(conversation_id)
+        persisted = self.store.get_workflow_session(conversation_id) if conversation_id else None
+        source = "none"
+        state: dict[str, object] = {}
+        if live_state:
+            source = "live"
+            state = live_state
+        elif isinstance(persisted, dict) and isinstance(persisted.get("state"), dict):
+            source = "persisted"
+            state = copy.deepcopy(persisted["state"])
+        return {
+            "task_id": task_id,
+            "conversation_id": conversation_id,
+            "source": source,
+            "state": state,
+            "persisted_updated_at": str((persisted or {}).get("updated_at", "") or ""),
+            "persisted_task_id": str((persisted or {}).get("task_id", "") or ""),
+        }
+
     async def get_run(self, run_id: str) -> dict | None:
         async with self.runs_lock:
             run = self.runs.get(run_id)
             if not run:
-                return None
-            return run.to_dict()
+                return self.store.get_run(run_id)
+            payload = run.to_dict()
+        self.store.save_run(payload)
+        return payload
 
 
 def _extract_next_steps(markdown: str) -> list[str]:
@@ -1696,11 +1710,25 @@ def _ga4_head_snippet() -> str:
     )
 
 
+def _ui_asset_version() -> str:
+    parts: list[str] = []
+    for name in ("app.js", "styles.css"):
+        try:
+            parts.append(str(int((UI_DIR / name).stat().st_mtime)))
+        except OSError:
+            continue
+    return "-".join(parts) or str(int(time.time()))
+
+
 def _render_ui_page(filename: str) -> HTMLResponse:
     html_path = UI_DIR / filename
     html = html_path.read_text(encoding="utf-8")
     html = html.replace("<!-- GA4_SNIPPET -->", _ga4_head_snippet(), 1)
-    return HTMLResponse(content=html)
+    html = html.replace("__UI_VERSION__", _ui_asset_version())
+    return HTMLResponse(
+        content=html,
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.on_event("startup")
@@ -1787,6 +1815,15 @@ async def task_detail(task_id: str, request: Request) -> dict:
     if conv_id and not runtime.store.conversation_owned_by(conv_id, ip):
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
     detail = await runtime.get_task_detail(task_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
+    return detail
+
+
+@app.get("/api/tasks/{task_id}/debug/workflow-state")
+async def task_workflow_state_debug(task_id: str, request: Request) -> dict:
+    _check_task_ownership(task_id.strip(), request)
+    detail = await runtime.get_task_workflow_state_debug(task_id.strip())
     if not detail:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
     return detail
