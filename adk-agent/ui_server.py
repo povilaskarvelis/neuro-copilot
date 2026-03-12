@@ -35,13 +35,12 @@ from state_store import SupportsWorkflowStateStore, create_state_store
 from report_pdf import write_markdown_pdf
 from co_scientist.tool_registry import TOOL_SOURCE_NAMES
 from co_scientist.workflow import (
-    MAX_REACT_PARSE_RETRIES,
     STATE_EXECUTOR_ACTIVE_STEP_ID,
-    STATE_EXECUTOR_LAST_ERROR,
     STATE_PRIOR_RESEARCH,
-    STATE_REACT_PARSE_RETRIES,
     STATE_WORKFLOW_TASK,
+    _describe_tool_call,
     STATE_PLAN_PENDING_APPROVAL,
+    _is_continue_execution_command,
     create_workflow_agent,
     _resolve_source_label,
 )
@@ -104,39 +103,6 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _resolve_tool_source(tool_name: str, args: dict) -> str:
-    """Resolve tool name + args to human-readable source. For BigQuery tools, extract dataset from args."""
-    name = str(tool_name or "").strip()
-    args = args or {}
-
-    if name == "list_bigquery_tables":
-        dataset = str(args.get("dataset", "") or "").strip()
-        if dataset:
-            parts = dataset.replace("`", "").split(".")
-            dataset_id = parts[-1] if len(parts) >= 2 else parts[0] if parts else ""
-            if dataset_id:
-                return str(TOOL_SOURCE_NAMES.get(dataset_id, dataset_id)).strip()
-        return "BigQuery"
-
-    if name == "run_bigquery_select_query":
-        query = str(args.get("query", "") or "")
-        for m in re.finditer(r"`([a-zA-Z0-9_.-]+(?:\.[a-zA-Z0-9_.-]+)*)`", query):
-            ref = m.group(1)
-            parts = ref.split(".")
-            if len(parts) >= 3:
-                dataset_id = parts[1]
-            elif len(parts) == 2:
-                dataset_id = parts[0]
-            else:
-                continue
-            label = TOOL_SOURCE_NAMES.get(dataset_id)
-            if label:
-                return str(label).strip()
-        return "BigQuery"
-
-    return str(TOOL_SOURCE_NAMES.get(name, name)).strip()
-
-
 def _compact_text(value: str, *, max_chars: int = 180) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(text) <= max_chars:
@@ -183,8 +149,8 @@ def _parse_step_event_text(text: str) -> dict:
     m = re.search(r"\*\*Goal:\*\*\s*(.+?)(?:\n|$)", normalized)
     if m:
         info["goal"] = m.group(1).strip()
-    # Key Findings
-    m = re.search(r"\*\*Key Findings\*\*\s*\n+([\s\S]*?)(?=\n\*\*|\n_Progress|\n---|\Z)", normalized)
+    # Findings (supports "Key Findings", "Detailed Findings", "Findings")
+    m = re.search(r"\*\*(?:Key |Detailed )?Findings\*\*\s*\n+([\s\S]*?)(?=\n\*\*|\n_Progress|\n---|\Z)", normalized)
     if m:
         info["findings"] = re.sub(r"\s+", " ", m.group(1)).strip()[:300]
     # Tools used: "**Tools used:** `tool1`, `tool2`"
@@ -200,7 +166,7 @@ def _parse_step_event_text(text: str) -> dict:
     if m:
         info["progress"] = m.group(1).strip()
     # ReAct trace block
-    m = re.search(r"\*\*ReAct Trace\*\*\s*\n+([\s\S]*?)(?=\n\*\*|\n_Progress|\n---|\Z)", normalized)
+    m = re.search(r"\*\*(?:ReAct Trace|Tool Trace)\*\*\s*\n+([\s\S]*?)(?=\n\*\*|\n_Progress|\n---|\Z)", normalized)
     if m:
         block = m.group(1)
         cleaned_lines: list[str] = []
@@ -262,20 +228,6 @@ def _extract_tool_error_metrics(function_response) -> dict | None:
     }
 
 
-def _extract_executor_retry_metrics(session_state: dict | None) -> dict | None:
-    """Extract active executor retry info from full session state."""
-    if not isinstance(session_state, dict):
-        return None
-    retries = int(session_state.get(STATE_REACT_PARSE_RETRIES, 0) or 0)
-    step_id = str(session_state.get(STATE_EXECUTOR_ACTIVE_STEP_ID, "") or "").strip()
-    error = str(session_state.get(STATE_EXECUTOR_LAST_ERROR, "") or "").strip()
-    if retries <= 0 or not step_id or not error:
-        return None
-    return {
-        "step_id": step_id,
-        "retry_count": retries,
-        "error": error,
-    }
 
 
 def _generate_chat_title(query: str) -> str:
@@ -425,11 +377,13 @@ def _steps_from_workflow_state(wf_state: dict | None) -> list[dict]:
             "source": _source_label(step.get("tool_hint", "")),
             "completion_condition": str(step.get("completion_condition", "")).strip(),
             "result_summary": step.get("result_summary", ""),
+            "executor_prose": step.get("executor_prose", ""),
+            "tool_reasoning": step.get("tool_reasoning", ""),
             "evidence_refs": step.get("evidence_ids", []),
             "tool_trace": [
                 {"tool": t} for t in step.get("tools_called", [])
             ],
-            "output": step.get("result_summary", ""),
+            "output": step.get("executor_prose", "") or step.get("result_summary", ""),
         }
         for step in wf_state.get("steps", [])
     ]
@@ -752,7 +706,6 @@ class UiRuntime:
         planner_seen = False
         step_started_ids: set[str] = set()
         step_completed_ids: set[str] = set()
-        retry_signatures: set[tuple[str, int, str]] = set()
         tool_error_signatures: set[tuple[str, str, str]] = set()
 
         def _step_source_label(tn: str) -> str:
@@ -796,8 +749,13 @@ class UiRuntime:
                 name = str(getattr(fc, "name", "") or "").strip()
                 if not name or name == "transfer_to_agent":
                     continue
-                source = _resolve_tool_source(name, getattr(fc, "args", None) or {})
-                human = f"Querying {source}…" if source else f"Calling {name}…"
+                args = {}
+                try:
+                    raw = getattr(fc, "args", None) or {}
+                    args = dict(raw) if not isinstance(raw, dict) else raw
+                except Exception:  # noqa: BLE001
+                    pass
+                human = _describe_tool_call(name, args)
                 _fire_progress(
                     phase="execute",
                     event_type="tool.called",
@@ -805,7 +763,7 @@ class UiRuntime:
                     human_line=human,
                     metrics={"tool": name},
                 )
-                # Emit step.started when step_executor first calls a tool (### S1 appears only at completion)
+                # Emit step.started + live step summary so frontend gets tool_log in real time
                 if author == "step_executor":
                     wf_state = await self._read_workflow_state(conversation_id)
                     sid = ""
@@ -822,13 +780,13 @@ class UiRuntime:
                                     break
                     if sid and sid not in step_started_ids:
                         step_started_ids.add(sid)
-                        hint = ""
+                        step_goal = ""
                         if wf_state:
                             for s in (wf_state.get("steps") or []):
                                 if str(s.get("id", "")) == sid:
-                                    hint = str(s.get("tool_hint", "")).strip()
+                                    step_goal = str(s.get("goal", "")).strip()
                                     break
-                        human_step = f"Querying {_step_source_label(hint)}…" if hint else f"Step {sid}…"
+                        human_step = f"{sid}: {step_goal}" if step_goal else f"Executing {sid}…"
                         _fire_progress(
                             phase="execute",
                             event_type="step.started",
@@ -836,6 +794,14 @@ class UiRuntime:
                             human_line=human_step,
                             metrics={"step_id": sid},
                         )
+                    # Emit a live summary snapshot so the frontend has step_details + tool_log
+                    if wf_state:
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                self._emit_step_summary(run_id, wf_state, step_counter), caller_loop
+                            ).result(timeout=5)
+                        except Exception:  # noqa: BLE001
+                            pass
             for part in parts:
                 fr = getattr(part, "function_response", None)
                 error_metrics = _extract_tool_error_metrics(fr)
@@ -888,14 +854,13 @@ class UiRuntime:
                     if sid not in step_started_ids:
                         step_started_ids.add(sid)
                         wf_state = await self._read_workflow_state(conversation_id)
-                        source = ""
+                        step_goal = ""
                         if wf_state:
                             for s in (wf_state.get("steps") or []):
                                 if str(s.get("id", "")) == sid:
-                                    hint = str(s.get("tool_hint", "")).strip()
-                                    source = _step_source_label(hint) if hint else ""
+                                    step_goal = str(s.get("goal", "")).strip()
                                     break
-                        human = f"Querying {source}…" if source else f"Step {sid}…"
+                        human = f"{sid}: {step_goal}" if step_goal else f"Executing {sid}…"
                         _fire_progress(
                             phase="execute",
                             event_type="step.started",
@@ -930,6 +895,13 @@ class UiRuntime:
                     metrics={**metrics, "step_number": step_counter},
                 )
 
+                # Emit intermediate step summary so frontend gets tool_log data mid-run
+                wf_snap = await self._read_workflow_state(conversation_id)
+                if wf_snap:
+                    asyncio.run_coroutine_threadsafe(
+                        self._emit_step_summary(run_id, wf_snap, step_counter), caller_loop
+                    ).result(timeout=10)
+
             elif author == "planner" and not bool(getattr(event, "partial", False)):
                 _fire_progress(
                     phase="plan",
@@ -948,26 +920,6 @@ class UiRuntime:
 
             if bool(getattr(event, "partial", False)):
                 partial_by_author[author] = f"{partial_by_author.get(author, '')}{text}"
-                session_state = await self._read_session_state(conversation_id)
-                retry_metrics = _extract_executor_retry_metrics(session_state)
-                if retry_metrics:
-                    signature = (
-                        str(retry_metrics.get("step_id", "") or "").strip(),
-                        int(retry_metrics.get("retry_count", 0) or 0),
-                        str(retry_metrics.get("error", "") or "").strip(),
-                    )
-                    if signature not in retry_signatures:
-                        retry_signatures.add(signature)
-                        _fire_progress(
-                            phase="execute",
-                            event_type="step.retry",
-                            status="progress",
-                            human_line=(
-                                f"Retrying {signature[0]} after {signature[2]} "
-                                f"(attempt {signature[1]}/{MAX_REACT_PARSE_RETRIES})."
-                            ),
-                            metrics=retry_metrics,
-                        )
                 continue
 
             is_final = getattr(event, "is_final_response", None)
@@ -975,26 +927,6 @@ class UiRuntime:
                 final_by_author[author] = (
                     f"{partial_by_author.pop(author, '')}{text}".strip() or text
                 )
-                session_state = await self._read_session_state(conversation_id)
-                retry_metrics = _extract_executor_retry_metrics(session_state)
-                if retry_metrics:
-                    signature = (
-                        str(retry_metrics.get("step_id", "") or "").strip(),
-                        int(retry_metrics.get("retry_count", 0) or 0),
-                        str(retry_metrics.get("error", "") or "").strip(),
-                    )
-                    if signature not in retry_signatures:
-                        retry_signatures.add(signature)
-                        _fire_progress(
-                            phase="execute",
-                            event_type="step.retry",
-                            status="progress",
-                            human_line=(
-                                f"Retrying {signature[0]} after {signature[2]} "
-                                f"(attempt {signature[1]}/{MAX_REACT_PARSE_RETRIES})."
-                            ),
-                            metrics=retry_metrics,
-                        )
                 continue
             partial_by_author[author] = f"{partial_by_author.get(author, '')}{text}"
 
@@ -1064,12 +996,14 @@ class UiRuntime:
                 "status": s.get("status", "pending"),
                 "tool_hint": tool_hint,
                 "source": source,
-                "step_progress_note": s.get("step_progress_note", ""),
                 "result_summary": s.get("result_summary", ""),
+                "executor_prose": s.get("executor_prose", ""),
+                "tool_reasoning": s.get("tool_reasoning", ""),
                 "evidence_ids": s.get("evidence_ids", []),
                 "tools_called": s.get("tools_called", []),
                 "open_gaps": s.get("open_gaps", []),
                 "reasoning_trace": s.get("reasoning_trace", ""),
+                "tool_log": s.get("tool_log", []),
             })
 
         summary = {
@@ -2015,8 +1949,14 @@ async def feedback_task(task_id: str, request: Request, payload: FeedbackRequest
     if not runtime.ready:
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
     _enforce_rate_limit(request)
-    _check_task_ownership(task_id.strip(), request)
-    run = await runtime.feedback_task(task_id.strip(), payload.message.strip())
+    task = _check_task_ownership(task_id.strip(), request)
+    msg = payload.message.strip()
+    # When user types "approve"/"continue" etc. while plan is pending, treat as approval (start_task)
+    # instead of revision feedback — otherwise "revise: approve" confuses the planner.
+    if task.get("awaiting_hitl") and _is_continue_execution_command(msg):
+        run = await runtime.start_task(task_id.strip())
+        return run.to_dict()
+    run = await runtime.feedback_task(task_id.strip(), msg)
     return run.to_dict()
 
 

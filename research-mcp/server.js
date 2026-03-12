@@ -690,6 +690,41 @@ Limitations:
 ${limitationLines}`;
 }
 
+function buildBigQuerySummary(rows, referencedDatasets, rowCount) {
+  if (!rowCount || !rows || rows.length === 0) {
+    return `Query returned 0 rows from ${referencedDatasets.join(", ")}.`;
+  }
+  const first = rows[0];
+  const keys = Object.keys(first || {});
+  // Extract the most informative fields from the first row
+  const highlights = [];
+  const nameFields = ["name", "approvedSymbol", "symbol", "label", "title", "approvedName"];
+  const scoreFields = ["overallAssociationScore", "score", "associationScore", "datatypeId"];
+  const idFields = ["id", "targetId", "diseaseId", "ensemblId"];
+  for (const f of nameFields) {
+    const val = first[f];
+    if (val && typeof val === "string") { highlights.push(val); break; }
+  }
+  for (const f of scoreFields) {
+    const val = first[f];
+    if (val !== undefined && val !== null) {
+      const num = typeof val === "number" ? val : parseFloat(val);
+      if (!isNaN(num)) { highlights.push(`score: ${num}`); break; }
+    }
+  }
+  for (const f of idFields) {
+    const val = first[f];
+    if (val && typeof val === "string" && !highlights.includes(val)) {
+      highlights.push(val); break;
+    }
+  }
+  const detail = highlights.length > 0 ? ` — ${highlights.join(", ")}` : "";
+  if (rowCount === 1) {
+    return `Found 1 result${detail}.`;
+  }
+  return `Found ${rowCount} results${detail}.`;
+}
+
 function normalizeDoiValue(rawDoi) {
   const value = normalizeWhitespace(rawDoi || "");
   if (!value) return "";
@@ -4065,15 +4100,18 @@ server.registerTool(
       const previewText =
         previewTextRaw.length > 7000 ? `${previewTextRaw.slice(0, 7000)}\n... (truncated)` : previewTextRaw;
 
+      const rowCount = rows?.length || 0;
+      const bqSummary = buildBigQuerySummary(rows, referencedDatasets, rowCount);
+
       return {
         content: [
           {
             type: "text",
             text: `${renderStructuredResponse({
-              summary: `BigQuery query completed with ${rows?.length || 0} row(s) returned.`,
+              summary: bqSummary,
               keyFields: [
                 `Datasets referenced: ${referencedDatasets.join(", ")}`,
-                `Rows returned: ${rows?.length || 0}`,
+                `Rows returned: ${rowCount}`,
                 `Row cap: ${boundedRows}`,
                 `Bytes processed: ${formatBigQueryBytes(totalBytesProcessed)} (${totalBytesProcessed})`,
                 `Bytes billed: ${formatBigQueryBytes(totalBytesBilled)} (${totalBytesBilled})`,
@@ -4288,7 +4326,8 @@ server.registerTool(
         if (!nextPageToken || pageStudies.length === 0) break;
       }
       hasMorePages = Boolean(nextPageToken);
-      if (!resultCount) resultCount = studies.length;
+      // Do NOT set resultCount = studies.length when API did not provide totalCount —
+      // that would imply "Showing 100 of 100 total" when there may be many more.
     } catch (error) {
       if (studies.length === 0) {
         return {
@@ -4333,11 +4372,14 @@ server.registerTool(
    Sponsor: ${sponsor}`;
     }).join("\n\n");
 
+    const countLine = resultCount
+      ? `Showing ${studies.length} of ${resultCount} total trials`
+      : `${studies.length} trials returned (total in registry not provided by API; more may exist — increase limit to fetch more)`;
     return {
       content: [
         {
           type: "text",
-          text: `Clinical trials for "${query}":\nShowing ${studies.length} of ${resultCount} total trials${hasMorePages ? " (more available — increase limit or maxPages)" : ""}${status ? `\nStatus filter: ${status}` : ""}\n\n${formatted}\n\nUse get_clinical_trial with the NCT ID for full details including results.`,
+          text: `Clinical trials for "${query}":\n${countLine}${hasMorePages ? " (additional pages available)" : ""}${status ? `\nStatus filter: ${status}` : ""}\n\n${formatted}\n\nUse get_clinical_trial with the NCT ID for full details including results.`,
         },
       ],
     };
@@ -8226,9 +8268,12 @@ server.registerTool(
       const analyzed = studies.length;
       const hasMore = Boolean(nextPageToken);
 
+      const countQualifier = Number.isFinite(totalCount)
+        ? ` (reported total in registry: ${totalCount})`
+        : " (registry total not provided; count reflects only studies fetched within pagination limits — more may exist)";
       const keyFields = [
         `Query: ${query}`,
-        `Studies analyzed: ${analyzed}${Number.isFinite(totalCount) ? ` (reported total: ${totalCount})` : ""}`,
+        `Studies analyzed: ${analyzed}${countQualifier}`,
         `Status breakdown: ${statusSummary.join(", ") || "N/A"}`,
         `Phase breakdown: ${phaseSummary.join(", ") || "N/A"}`,
         `Trials with posted results: ${withPostedResults}/${analyzed}`,
@@ -8277,6 +8322,9 @@ server.registerTool(
               sources,
               limitations: [
                 "Landscape is limited to scanned pages/studies and may not include the full registry.",
+                ...(!Number.isFinite(totalCount) && analyzed > 0
+                  ? ["Total matching studies in the registry was not provided by the API; the count reflects only fetched studies — more may exist."]
+                  : []),
                 "Termination reasons are free text and may need manual normalization.",
               ],
             }),
@@ -11420,6 +11468,22 @@ function abaProductId(organism) {
   return ABA_PRODUCT_IDS[key] ?? ABA_PRODUCT_IDS.mouse;
 }
 
+/** Resolve a gene symbol (e.g. LRRK2) to the canonical ABA acronym (e.g. Lrrk2) when exact match fails. */
+async function resolveAbaGeneAcronym(productId, geneAcronym) {
+  const url =
+    `${ABA_API}/data/Gene/query.json` +
+    `?criteria=products[id$eq${productId}],[acronym$il'*${encodeURIComponent(geneAcronym)}*']` +
+    `&num_rows=5`;
+  const res = await fetchJsonWithRetry(url, { timeoutMs: 10000 }).catch(() => ({ msg: [] }));
+  const genes = res.msg || [];
+  for (const g of genes) {
+    if (g?.acronym && String(g.acronym).toLowerCase() === String(geneAcronym).toLowerCase()) {
+      return g.acronym;
+    }
+  }
+  return genes[0]?.acronym || null;
+}
+
 server.registerTool(
   "search_aba_genes",
   {
@@ -11599,9 +11663,9 @@ server.registerTool(
   "get_aba_gene_expression",
   {
     description:
-      "Retrieves quantified gene expression data from the Allen Brain Atlas. Given a gene acronym, returns expression energy, density, and intensity across brain structures (StructureUnionize data). Optionally filter to a specific structure or sort by expression metric.",
+      "Retrieves quantified gene expression data from the Allen Brain Atlas. Given a gene acronym or symbol (e.g. LRRK2, Pdyn, Gad1), returns expression energy, density, and intensity across brain structures. Human symbols are auto-resolved to organism-specific acronyms (e.g. LRRK2 -> Lrrk2 for mouse). Optionally filter to a specific structure or sort by expression metric.",
     inputSchema: {
-      geneAcronym: z.string().describe("Gene acronym (e.g. 'Pdyn', 'Gad1', 'Slc17a7')."),
+      geneAcronym: z.string().describe("Gene acronym or symbol (e.g. 'LRRK2', 'Lrrk2', 'Pdyn', 'Gad1'). Human symbols like LRRK2 are auto-resolved to mouse Lrrk2 when organism is mouse."),
       organism: z
         .enum(["mouse", "human", "developing_mouse", "mouse_connectivity"])
         .optional()
@@ -11635,10 +11699,48 @@ server.registerTool(
       `&include=genes` +
       `&num_rows=1`;
 
-    const datasetRes = await fetchJsonWithRetry(datasetUrl, { timeoutMs: 15000 });
-    const datasets = datasetRes.msg || [];
+    let datasetRes = await fetchJsonWithRetry(datasetUrl, { timeoutMs: 15000 });
+    let datasets = datasetRes.msg || [];
+    let resolvedAcronym = geneAcronym;
 
     if (datasets.length === 0) {
+      const canonical = await resolveAbaGeneAcronym(productId, geneAcronym);
+      if (canonical && canonical !== geneAcronym) {
+        const retryUrl =
+          `${ABA_API}/data/SectionDataSet/query.json` +
+          `?criteria=products[id$eq${productId}],genes[acronym$eq'${encodeURIComponent(canonical)}']${planeFilter}` +
+          `&include=genes` +
+          `&num_rows=1`;
+        datasetRes = await fetchJsonWithRetry(retryUrl, { timeoutMs: 15000 });
+        datasets = datasetRes.msg || [];
+        if (datasets.length > 0) resolvedAcronym = canonical;
+      }
+    }
+
+    let usedHumanRequestedMouseFallback = false;
+    if (datasets.length === 0 && productId === ABA_PRODUCT_IDS.human) {
+      const mouseCanonical = await resolveAbaGeneAcronym(ABA_PRODUCT_IDS.mouse, geneAcronym);
+      const mouseAcronym = mouseCanonical || geneAcronym;
+      const mouseUrl =
+        `${ABA_API}/data/SectionDataSet/query.json` +
+        `?criteria=products[id$eq${ABA_PRODUCT_IDS.mouse}],genes[acronym$eq'${encodeURIComponent(mouseAcronym)}']${planeFilter}` +
+        `&include=genes` +
+        `&num_rows=1`;
+      const mouseRes = await fetchJsonWithRetry(mouseUrl, { timeoutMs: 15000 });
+      const mouseDatasets = mouseRes.msg || [];
+      if (mouseDatasets.length > 0) {
+        datasetRes = mouseRes;
+        datasets = mouseDatasets;
+        resolvedAcronym = mouseAcronym;
+        usedHumanRequestedMouseFallback = true;
+      }
+    }
+
+    if (datasets.length === 0) {
+      const humanHint =
+        organism === "human"
+          ? " The human Allen Brain Atlas has no ISH data for this gene. Try organism: 'mouse' for mouse ortholog expression (cross-species reference only)."
+          : "";
       return {
         content: [{
           type: "text",
@@ -11646,7 +11748,11 @@ server.registerTool(
             summary: `No ISH experiments found for gene "${geneAcronym}" in the Allen Brain Atlas (${organism || "mouse"}).`,
             keyFields: [`Gene: ${geneAcronym}`, `Product: ${organism || "mouse"}`],
             sources: [`${ABA_API}/data/SectionDataSet/query.json`],
-            limitations: ["Ensure the gene acronym is valid and exists in the selected atlas product."],
+            limitations: [
+              "Ensure the gene acronym is valid and exists in the selected atlas product.",
+              "For mouse atlas, use organism-specific acronym (e.g. Lrrk2 for LRRK2). Try search_aba_genes first to resolve the symbol.",
+              ...(humanHint ? [humanHint.trim()] : []),
+            ],
           }),
         }],
       };
@@ -11685,7 +11791,9 @@ server.registerTool(
     }
 
     const plane = planeOfSection || (dataset.plane_of_section_id === 1 ? "coronal" : "sagittal");
-    const geneName = dataset.genes?.[0]?.name || geneAcronym;
+    const geneName = dataset.genes?.[0]?.name || resolvedAcronym;
+    const resolvedNote =
+      resolvedAcronym !== geneAcronym ? ` (${geneAcronym} resolved to ${resolvedAcronym})` : "";
 
     const lines = records.map((r, i) => {
       const s = r.structure || {};
@@ -11698,9 +11806,9 @@ server.registerTool(
       content: [{
         type: "text",
         text: renderStructuredResponse({
-          summary: `Allen Brain Atlas expression for ${geneAcronym} (${geneName}): top ${records.length} structures by ${sortField} (${plane}, dataset ${datasetId}).`,
+          summary: `Allen Brain Atlas expression for ${resolvedAcronym} (${geneName})${resolvedNote}${usedHumanRequestedMouseFallback ? " [MOUSE — human atlas has no data]" : ""}: top ${records.length} structures by ${sortField} (${plane}, dataset ${datasetId}).`,
           keyFields: [
-            `Gene: ${geneAcronym} (${geneName})`,
+            `Gene: ${resolvedAcronym} (${geneName})${resolvedNote}${usedHumanRequestedMouseFallback ? " — MOUSE (human requested, human atlas has no data)" : ""}`,
             `Dataset ID: ${datasetId}`,
             `Plane: ${plane}`,
             `Sorted by: ${sortField}`,
@@ -11714,6 +11822,11 @@ server.registerTool(
             "https://mouse.brain-map.org/",
           ],
           limitations: [
+            ...(usedHumanRequestedMouseFallback
+              ? [
+                  "Human Allen Brain Atlas has no ISH data for this gene; data shown is from mouse ortholog. Mouse expression patterns may differ from human — use as cross-species reference only.",
+                ]
+              : []),
             "Expression values are derived from automated ISH image analysis — false positives/negatives can occur.",
             "Expression energy = intensity × density; compare within the same experiment for consistency.",
             "Only the delegate (highest quality) experiment is queried unless a specific plane is requested.",

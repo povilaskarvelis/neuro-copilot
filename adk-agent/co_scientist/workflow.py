@@ -37,6 +37,7 @@ from google.adk.tools import McpToolset
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.mcp_tool.mcp_toolset import StdioConnectionParams
 from google.adk.tools.tool_context import ToolContext
+from google import genai as _genai_module
 from google.genai import types
 from mcp.client.stdio import StdioServerParameters
 
@@ -47,10 +48,19 @@ logger = logging.getLogger(__name__)
 
 MCP_SERVER_DIR = Path(__file__).resolve().parents[2] / "research-mcp"
 DEFAULT_MODEL = os.getenv("ADK_NATIVE_MODEL", "gemini-2.5-flash")
-PLANNER_MODEL = os.getenv("ADK_PLANNER_MODEL", "gemini-3.1-flash-lite-preview")
-SYNTHESIZER_MODEL = os.getenv("ADK_SYNTHESIZER_MODEL", "gemini-2.5-flash")
-ROUTER_MODEL = os.getenv("ADK_ROUTER_MODEL", "gemini-3.1-flash-lite-preview")
-THINKING_CONFIG = types.ThinkingConfig(thinking_level="HIGH")
+PLANNER_MODEL = os.getenv("ADK_PLANNER_MODEL", "gemini-2.5-flash")
+SYNTHESIZER_MODEL = os.getenv("ADK_SYNTHESIZER_MODEL", "gemini-2.5-pro")
+ROUTER_MODEL = os.getenv("ADK_ROUTER_MODEL", "gemini-2.5-flash")
+THINKING_CONFIG_V3 = types.ThinkingConfig(thinking_level="HIGH")
+THINKING_CONFIG_V2 = types.ThinkingConfig(include_thoughts=True, thinking_budget=8192)
+
+
+def _thinking_config_for_model(model: str) -> types.ThinkingConfig | None:
+    if "3.1" in model or "3.0" in model:
+        return THINKING_CONFIG_V3
+    if "2.5" in model:
+        return THINKING_CONFIG_V2
+    return None
 HAS_BIGQUERY_RUNTIME_HINT = any(
     str(os.getenv(name, "")).strip()
     for name in ("BQ_PROJECT_ID", "BQ_DATASET_ALLOWLIST", "GOOGLE_CLOUD_PROJECT")
@@ -76,11 +86,9 @@ STATE_SYNTH_BUFFER = "temp:co_scientist_synth_stream_buffer"
 STATE_PLANNER_RENDERED = "temp:co_scientist_planner_rendered"
 STATE_EXECUTOR_RENDERED = "temp:co_scientist_executor_rendered"
 STATE_EXECUTOR_ACTIVE_STEP_ID = "temp:co_scientist_executor_active_step_id"
-STATE_REACT_PARSE_RETRIES = "temp:co_scientist_react_parse_retries"
-STATE_EXECUTOR_LAST_PROSE = "temp:co_scientist_executor_last_prose"
-STATE_EXECUTOR_LAST_ERROR = "temp:co_scientist_executor_last_error"
-MAX_REACT_PARSE_RETRIES = 2
 STATE_EXECUTOR_PREV_STEP_STATUS = "temp:co_scientist_executor_prev_step_status"
+STATE_EXECUTOR_REASONING_TRACE = "temp:co_scientist_executor_reasoning_trace"
+STATE_EXECUTOR_TOOL_LOG = "temp:co_scientist_executor_tool_log"
 STATE_PLAN_PENDING_APPROVAL = "co_scientist_plan_pending_approval"
 STATE_MODEL_ERROR_PASSTHROUGH = "temp:co_scientist_model_error_passthrough"
 
@@ -261,7 +269,7 @@ Follow a strict Reason-Act-Observe cycle:
 1. REASON: Read the current step goal and think about what information you need and which tool/query is best.
 2. ACT: Call the appropriate MCP tool.
 3. OBSERVE: Review the tool results. If insufficient or the completion condition is not met, reason again and try a different query or tool.
-4. CONCLUDE: When the step's completion condition is met (or the step is blocked), return your result.
+4. CONCLUDE: When the step's completion condition is met (or the step is blocked), write your findings summary.
 
 Available MCP tools:
 __TOOL_CATALOG__
@@ -274,70 +282,36 @@ Rules:
 - You MUST call at least one tool before returning a result.
 - If a tool call fails or returns insufficient data, try an alternative tool or query
   (e.g. search_pubmed <-> search_openalex_works, or fall back to run_bigquery_select_query).
-- If no tool can satisfy the step after trying alternatives, mark it as blocked with a clear reason.
+- If no tool can satisfy the step after trying alternatives, state clearly that the step is BLOCKED and why.
 - If the goal or completion_condition contains an example value (marked with "e.g." or similar),
   treat it as illustrative — accept any valid result that fulfills the intent, not the exact example value.
 - Prioritize high-signal evidence before broad expansion.
 - Surface contradictions and unresolved gaps explicitly.
-- Include source identifiers when available (PMID, DOI, NCT, OpenAlex IDs, UniProt accessions, PubChem CIDs, PDB IDs, dbSNP rsIDs, ChEMBL IDs, Reactome IDs, GWAS Catalog IDs).
 
-Evidence ID requirements:
-- evidence_ids MUST be populated with real, specific identifiers returned directly by tool
-  calls. Never fabricate identifiers. Use these canonical formats:
+Evidence identifiers:
+- Always include real identifiers returned by tool calls in your summary. Never fabricate identifiers.
+  Use canonical formats:
   Literature: PMID:XXXXXXXX, DOI:10.xxxx/..., NCT########, OpenAlex:WXXXXXXX, PMC########
   Databases:  UniProt:XXXXXX, PubChem:NNNN, PDB:XXXX, rsNNNNNN, CHEMBLNNNN,
               Reactome:R-HSA-NNNNNNN, GCSTNNNNNN
 - When a tool returns a database record identifier (UniProt accession, PubChem CID, PDB code,
-  rsID, ChEMBL ID, Reactome stable ID, GWAS Catalog study ID), always include it in evidence_ids.
+  rsID, ChEMBL ID, Reactome stable ID, GWAS Catalog study ID), always mention it in your summary.
 - If the primary tool for this step does not return individual document IDs (e.g. BigQuery
   aggregate queries), make a secondary call to search_pubmed or search_openalex_works using
   key terms from the findings to harvest supporting PMIDs or DOIs.
-- A completed step with an empty evidence_ids array is only acceptable when the step is a
-  pure calculation or data transformation with no literature or trial backing.
 __BQ_POLICY__
 
-Output requirements:
-- Return ONLY valid JSON (no markdown, no prose) matching this shape:
-  {
-    "schema": "step_execution_result.v1",
-    "step_id": "S1",
-    "reasoning_trace": "REASON: <why you chose this approach>\\nACT: <what tool you called and with what parameters>\\nOBSERVE: <what the results showed>\\nCONCLUDE: <your conclusion and whether the step goal is met>",
-    "tools_called": ["tool_name_1", "tool_name_2"],
-    "data_sources_queried": ["<human-readable database/source names or dataset identifiers, e.g. Open Targets Platform, open_targets_platform.associationByOverallDirect>"],
-    "status": "completed" | "blocked",
-    "step_progress_note": "<1-2 sentence progress update>",
-    "result_summary": "<concise findings summary>",
-    "evidence_ids": ["PMID:...", "NCT:...", "UniProt:...", "rs...", "CHEMBL..."],
-    "open_gaps": ["..."],
-    "suggested_next_searches": ["..."],
-    "structured_observations": [
-      {
-        "observation_type": "<atomic claim family such as drug_response, phenotype_association, interaction, or translational_model>",
-        "subject": { "type": "<entity type>", "label": "<entity label>", "id": "<optional canonical ID>" },
-        "predicate": "<atomic predicate such as sensitive_in, interacts_with, associated_with, has_phenotype, or has_ortholog>",
-        "object": { "type": "<entity type>", "label": "<entity label>", "id": "<optional canonical ID>" },
-        "object_literal": "<optional literal instead of object>",
-        "supporting_ids": ["PMID:...", "CHEMBL...", "HP:..."],
-        "source_tool": "<tool name>",
-        "confidence": "low" | "medium" | "high",
-        "qualifiers": { "dataset": "...", "metric": "...", "direction": "...", "species": "..." }
-      }
-    ]
-  }
-- The reasoning_trace MUST use labeled phases (REASON, ACT, OBSERVE, CONCLUDE). Keep it concise:
-  summarize intermediate tool calls briefly (one line each) and only expand on the final conclusion.
-  Do NOT repeat full query results in the trace — just note what was found. This avoids output truncation.
-- Never embed raw tool response envelopes or copied payload objects inside your JSON fields.
-  Do NOT copy fields like `*_response`, `content`, `structuredContent`, or `isError`;
-  summarize tool results in plain sentences instead.
-- The tools_called list MUST contain the names of every MCP tool you invoked during this step.
-- `data_sources_queried` SHOULD name the actual databases, datasets, or registries that materially supported the step.
-  Prefer concrete source names like `Open Targets Platform`, `ClinVar`, `ChEMBL`, or dataset identifiers like
-  `open_targets_platform.associationByOverallDirect` over generic transport labels like `BigQuery`.
-- `structured_observations` is optional, but include it whenever you used high-overlap tools whose outputs naturally support atomic claims
-  (especially drug response/screening, phenotype/rare-disease, interaction, or translational model-organism tools).
-- Each structured observation MUST be grounded directly in the tool output for this step. Do not invent or infer unsupported claims.
-- Prefer a small number of high-signal observations (usually 1-8) over exhaustive extraction.
+Output guidance:
+After completing your tool calls, write a clear findings summary. Your summary should:
+- State the key findings from this step in concrete terms (gene names, scores, trial phases, etc.)
+- Include all evidence identifiers inline (PMID, DOI, NCT, UniProt, etc.)
+- Explicitly describe key claims as atomic statements (e.g. "LRRK2 is associated with Parkinson disease
+  with an overall association score of 0.815 per Open Targets Platform")
+- Note any contradictions, gaps, or limitations discovered
+- State whether this step is COMPLETED or BLOCKED (and why if blocked)
+- Do NOT embed raw tool response envelopes or large payload objects; summarize tool results in
+  plain sentences instead
+- Keep the summary concise but thorough — capture the full richness of findings without padding
 """
 
 
@@ -347,34 +321,48 @@ You will receive structured state context (objective, plan steps, step results, 
 
 Your report MUST follow this exact section structure:
 
-## Summary
-A direct, evidence-grounded answer to the research question — not just a high-level statement but an informative synthesis that conveys the key takeaways a researcher needs. Include the most important specific findings, magnitudes, or conclusions so the reader learns something substantive without having to read the full report. When the answer naturally involves multiple items, categories, or dimensions, use bullet points to make the presentation clearer. If the plan is incomplete, note that the summary is partial.
+## TLDR
+A direct, synthesized answer to the research question written as a comprehensive passage (2-4 paragraphs) that a biomedical researcher can read and act on. This is NOT a summary of the process — it is THE ANSWER.
+- Lead with the most important conclusion. Be specific: include gene names, drug names, magnitudes, effect sizes, trial phases, or other concrete details.
+- Frame confidence based on evidence strength: use "strong evidence supports…" when multiple independent high-quality sources agree, "preliminary data indicate…" when evidence is thin, and "evidence is divided…" when sources conflict.
+- After the lead conclusion, expand with supporting context: mention key data points, notable caveats, and the overall weight of evidence across the dimensions investigated.
+- When the answer naturally involves multiple items, categories, or dimensions, use bullet points.
+- If the plan is incomplete, note that the answer is based on partial evidence.
 
-## Evidence and Methodology
-Start with ONE short overview paragraph that:
-- Lists the investigative steps taken and what type of evidence each provided at a high level.
-- Notes how many planned steps completed vs. total (e.g. "5 of 5 planned steps completed" or "3 of 5 planned steps completed; 2 steps could not be executed due to data unavailability").
-Then provide a subsection for EACH step with a status indicator in the heading (e.g. "### Step 1: <goal> — COMPLETED" or "### Step 2: <goal> — FAILED"), detailing:
-- The data source (use the human-readable source name, not tool names).
-- Key findings (with specific identifiers (PMID, DOI, NCT numbers) inline).
-- Significance: why these findings matter for the research question.
-- Limitations: any uncertainties or limitations specific to that step.
-Data source, Key findings, Significance, and Limitations should be seperate bullet points.
-Mark failed/blocked steps clearly with what went wrong.
+## Evidence Breakdown
+Within this section, organize findings by THEME (use ### subsections with descriptive headings, e.g. "### Human Genetics Support" not "### Step 1"). Write each subsection as information-dense prose with inline evidence citations:
+- State the finding clearly, then provide the supporting data with source names and identifiers (PMID, DOI, NCT, UniProt, etc.) inline.
+- Include specific numbers, scores, measurements, and identifiers rather than vague summaries.
+- Note the confidence level (high, moderate, low, or mixed) and number of independent sources.
+- If evidence on a finding is contradictory, briefly note the disagreement (details go in Conflicting Evidence).
+- Aim for substantive prose paragraphs — avoid sparse bullet-only lists or large tables when prose conveys the same information more clearly.
+
+### Conflicting & Uncertain Evidence
+For each area where sources disagree or evidence is equivocal:
+- State the disagreement clearly.
+- List which sources support each side, with identifiers.
+- Note the current lean (if any) and why, based on source quality/weight.
+- Suggest what would resolve it (e.g. an orthogonal assay, a larger cohort, etc.).
+Omit this section entirely if there are no mixed-evidence findings.
 
 ## Limitations
-Bullet list of overall limitations and caveats.
+Bullet list of:
+- Overall caveats (source coverage, data recency, methodology limitations).
+- Open gaps the investigation could not fill.
+- Planned analyses that could not be executed and why.
 
-## Potential Next Steps
-Numbered list of 3+ actionable follow-ups (confirmatory checks, risk reduction, monitoring, or decision-oriented follow-up).
+## Recommended Next Steps
+Numbered list of 3+ actionable follow-ups framed as a researcher would think about them: experimental validations, confirmatory literature searches, clinical data checks, risk reduction strategies, or monitoring recommendations. Each with a brief rationale.
 
 Rules:
 - Ground every claim in the provided evidence. Do not invent unsupported claims.
 - Use `claim_synthesis_summary` as the primary arbitration layer for substantive findings. It already consolidates overlapping claims, weights sources by evidence type, and flags mixed-evidence findings.
 - Do not treat all sources as equal. When claims disagree, prefer the interpretation backed by higher-weighted sources and stronger claim support, but still surface the disagreement explicitly.
-- If `mixed_evidence_claims` are present, call them out in the Summary or Limitations instead of silently choosing one side.
+- If `mixed_evidence_claims` are present, address them in Conflicting & Uncertain Evidence instead of silently choosing one side.
 - Be specific and thorough — avoid terse output.
+- NEVER organize findings by step execution order. Group by theme/topic.
 - Use ONLY human-readable database/source names (e.g. "PubMed", "ClinicalTrials.gov"). NEVER mention tool names (like run_bigquery_select_query, search_clinical_trials, etc.).
+- When citing database counts (e.g. clinical trials, PubMed results): use the total reported by the source when available (e.g. "X of Y total"). If the source says "total not provided" or "more may exist" or "X returned (registry total unknown)", do NOT state "a total of X" or "X total studies" — instead say "at least X" or "X studies (sample; full registry count not determined)".
 - Include specific identifiers inline when available (PMID, DOI, NCT numbers).
 - For database records, include identifiers with their canonical prefix so they can be linked: UniProt:P00533, PubChem:2244, PDB:1ABC, rs7903146, CHEMBL25, Reactome:R-HSA-1234567, GCST000001.
 - NEVER include raw URLs, API endpoints, or links to JSON output.
@@ -402,7 +390,7 @@ Available agents:
    any command (approve, continue, finalize, revise:, history, rollback, switch)
 
 4. **report_assistant** — Interacts with an existing research report: answers questions about findings,
-   restructures sections, and performs light follow-up lookups using tools.
+   restructures sections, and performs SINGLE-ITEM follow-up lookups using tools.
    ONLY available when report_exists is True.
    Examples: "What does this p-value mean?", "Expand the limitations section",
    "Get the abstract for PMID:38912345", "Restructure the evidence section"
@@ -411,11 +399,13 @@ Routing priority rules (check in order):
 1. If plan_pending_approval is True → transfer to research_workflow
 2. Workflow commands (approve, continue, finalize, revise:, history, rollback, switch) → research_workflow
 3. If has_pending_steps is True and user sends a continuation-like message → research_workflow
-4. If report_exists AND the user asks about the report, wants restructuring, or a light lookup → report_assistant
-5. If report_exists AND the user wants a NEW comprehensive investigation → research_workflow
-6. If the query is a clear research question requiring evidence from databases → research_workflow
-7. If the query is a straightforward biomedical knowledge question → general_qa
-8. If the query is ambiguous, incomplete, or doesn't make sense → clarifier
+4. If report_exists AND the user asks about the report, wants restructuring, or a single-item lookup → report_assistant
+5. If report_exists AND the user wants batch/comprehensive work (e.g. "find full text for all cited papers",
+   "retrieve full text for every reference", "fetch abstracts for all PMIDs in the report") → research_workflow
+6. If report_exists AND the user wants a NEW comprehensive investigation → research_workflow
+7. If the query is a clear research question requiring evidence from databases → research_workflow
+8. If the query is a straightforward biomedical knowledge question → general_qa
+9. If the query is ambiguous, incomplete, or doesn't make sense → clarifier
 
 You MUST always transfer. Never respond with text yourself.
 """
@@ -483,6 +473,10 @@ Guidelines:
   research investigation. You can ask me to investigate this formally, and I'll create a new plan
   that builds on the current findings."
 - Be conversational and helpful.
+- NEVER include meta-commentary in your response: do not mention tool access, API rate limits,
+  retrieval failures, or ask "would you like me to...". Deliver research content only; if retrieval
+  fails for some items, state that concisely and provide what you can without explaining system
+  internals.
 """
 
 
@@ -587,6 +581,21 @@ def _llm_response_text(llm_response: LlmResponse) -> str:
         str(getattr(part, "text", "") or "")
         for part in parts
         if isinstance(getattr(part, "text", None), str)
+        and not bool(getattr(part, "thought", False))
+    )
+
+
+def _llm_response_thought_text(llm_response: LlmResponse) -> str:
+    """Extract thinking/reasoning tokens from the model response."""
+    content = getattr(llm_response, "content", None)
+    parts = getattr(content, "parts", None) if content is not None else None
+    if not parts:
+        return ""
+    return "".join(
+        str(getattr(part, "text", "") or "")
+        for part in parts
+        if isinstance(getattr(part, "text", None), str)
+        and bool(getattr(part, "thought", False))
     )
 
 
@@ -596,6 +605,427 @@ def _llm_response_has_function_call(llm_response: LlmResponse) -> bool:
     if not parts:
         return False
     return any(getattr(part, "function_call", None) is not None for part in parts)
+
+
+def _extract_function_call_names(llm_response: LlmResponse) -> list[str]:
+    """Extract the names of all function calls from a model response."""
+    return [fc["name"] for fc in _extract_function_calls(llm_response)]
+
+
+def _extract_function_calls(llm_response: LlmResponse) -> list[dict[str, Any]]:
+    """Extract name + args for each function call in the response."""
+    content = getattr(llm_response, "content", None)
+    parts = getattr(content, "parts", None) if content is not None else None
+    if not parts:
+        return []
+    calls: list[dict[str, Any]] = []
+    for part in parts:
+        fc = getattr(part, "function_call", None)
+        if fc is not None:
+            name = str(getattr(fc, "name", "") or "").strip()
+            if name:
+                args = getattr(fc, "args", None) or {}
+                if not isinstance(args, dict):
+                    try:
+                        args = dict(args)
+                    except Exception:  # noqa: BLE001
+                        args = {}
+                calls.append({"name": name, "args": args})
+    return calls
+
+
+def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
+    """Generate a human-readable 1-line description from a tool call and its args.
+
+    The description explains *what information is being sought*, not just
+    the tool name.  Uses the tool's semantic purpose + available args.
+    """
+    source = tool_registry.TOOL_SOURCE_NAMES.get(name, name)
+    query = str(args.get("query", "") or "").strip()
+    gene = str(args.get("gene", "") or args.get("gene_symbol", "") or args.get("gene_id", "") or "").strip()
+    disease = str(args.get("disease", "") or args.get("disease_id", "") or "").strip()
+    compound = str(args.get("compound", "") or args.get("drug", "") or args.get("drug_name", "") or "").strip()
+
+    # --- BigQuery ---
+    if name == "run_bigquery_select_query" and query:
+        tables = re.findall(r"FROM\s+`?[\w.]+\.(\w+)`?", query, re.IGNORECASE)
+        table_hint = f" from {', '.join(tables)}" if tables else ""
+        # Try to extract what's being queried for
+        where_clauses = re.findall(r"WHERE\s+.*?['\"](.+?)['\"]", query, re.IGNORECASE)
+        subject = where_clauses[0][:50] if where_clauses else ""
+        if subject and table_hint:
+            return f"Retrieving {subject} data{table_hint}"
+        if table_hint:
+            return f"Querying{table_hint}"
+        return f"Running BigQuery query"
+    if name == "list_bigquery_tables":
+        dataset = str(args.get("dataset_id", "") or "").strip()
+        table = str(args.get("table_name", "") or "").strip()
+        if table:
+            return f"Inspecting schema of {table} table"
+        if dataset:
+            return f"Discovering available tables in {dataset}"
+        return f"Listing available BigQuery tables"
+
+    # --- Gene / variant resolution ---
+    if name == "resolve_gene_identifiers":
+        return f"Resolving gene identifiers for {query}" if query else "Resolving gene identifiers"
+    if name == "get_variant_annotations":
+        return f"Retrieving variant annotations for {query}" if query else "Retrieving variant annotations"
+    if name == "annotate_variants_vep":
+        return f"Annotating variants with Ensembl VEP for {query}" if query else "Annotating variants via VEP"
+
+    # --- Ontology / disease identifiers ---
+    if name == "map_ontology_terms_oxo":
+        return f"Mapping ontology identifiers for {query}" if query else "Cross-mapping ontology terms"
+    if name == "search_hpo_terms":
+        return f"Looking up phenotype terms for {query}" if query else "Searching phenotype ontology"
+    if name == "get_orphanet_disease_profile":
+        return f"Retrieving rare disease profile for {query}" if query else "Fetching Orphanet disease profile"
+
+    # --- Clinical trials ---
+    if name == "search_clinical_trials":
+        return f"Searching clinical trials for {query}" if query else "Searching ClinicalTrials.gov"
+    if name == "get_clinical_trial":
+        nct = str(args.get("nct_id", "") or args.get("id", "") or query or "").strip()
+        return f"Retrieving trial details for {nct}" if nct else "Retrieving clinical trial details"
+    if name == "summarize_clinical_trials_landscape":
+        return f"Summarizing trial landscape for {query}" if query else "Summarizing clinical trial landscape"
+
+    # --- Literature ---
+    if name in ("search_pubmed", "search_pubmed_advanced"):
+        return f"Searching literature for {query[:220]}" if query else "Searching PubMed"
+    if name == "get_pubmed_abstract":
+        pmid = str(args.get("pmid", "") or query or "").strip()
+        return f"Fetching abstract for PMID {pmid}" if pmid else "Fetching PubMed abstract"
+    if name == "get_paper_fulltext":
+        return f"Retrieving full text for {query[:60]}" if query else "Retrieving paper full text"
+    if name in ("search_openalex_works", "search_europe_pmc_literature"):
+        return f"Searching literature for {query[:140]}" if query else f"Searching {source}"
+
+    # --- Expression / tissue data ---
+    if name == "get_gene_tissue_expression":
+        return f"Retrieving tissue expression data for {gene or query}" if (gene or query) else "Querying GTEx expression"
+    if name == "get_human_protein_atlas_gene":
+        return f"Retrieving protein expression atlas for {gene or query}" if (gene or query) else "Querying Human Protein Atlas"
+    if name in ("search_aba_genes", "get_aba_gene_expression"):
+        return f"Searching brain expression data for {gene or query}" if (gene or query) else "Querying Allen Brain Atlas expression"
+    if name == "search_aba_structures":
+        return f"Looking up brain structures: {query}" if query else "Browsing Allen Brain Atlas structures"
+    if name == "search_aba_differential_expression":
+        return f"Checking differential brain expression for {gene or query}" if (gene or query) else "Querying differential expression"
+
+    # --- Drug / compound data ---
+    if name == "get_chembl_bioactivities":
+        return f"Retrieving bioactivity data for {compound or query}" if (compound or query) else "Querying ChEMBL bioactivities"
+    if name == "get_pubchem_compound":
+        return f"Looking up compound info for {compound or query}" if (compound or query) else "Querying PubChem"
+    if name == "get_guidetopharmacology_target":
+        return f"Checking pharmacology data for {gene or query}" if (gene or query) else "Querying Guide to Pharmacology"
+    if name == "get_dailymed_drug_label":
+        return f"Retrieving drug label for {compound or query}" if (compound or query) else "Fetching DailyMed label"
+
+    # --- Safety / adverse events ---
+    if name == "search_fda_adverse_events":
+        return f"Checking FDA adverse events for {query}" if query else "Searching FDA FAERS"
+
+    # --- Protein structure / interactions ---
+    if name == "get_alphafold_structure":
+        return f"Fetching predicted structure for {gene or query}" if (gene or query) else "Querying AlphaFold"
+    if name == "search_protein_structures":
+        return f"Searching protein structures for {gene or query}" if (gene or query) else "Searching RCSB PDB"
+    if name == "search_drug_gene_interactions":
+        return f"Checking drug-gene interactions for {gene or query}" if (gene or query) else "Querying DGIdb"
+    if name == "search_reactome_pathways":
+        return f"Searching pathway data for {gene or query}" if (gene or query) else "Querying Reactome pathways"
+
+    # --- GWAS ---
+    if name == "search_gwas_associations":
+        return f"Searching GWAS associations for {gene or query}" if (gene or query) else "Querying GWAS Catalog"
+
+    # --- ClinGen / gene curation ---
+    if name == "get_clingen_gene_curation":
+        return f"Checking gene-disease validity for {gene or query}" if (gene or query) else "Querying ClinGen"
+
+    # --- Genetic associations ---
+    if name == "query_monarch_associations":
+        return f"Querying gene-phenotype associations for {query}" if query else "Searching Monarch Initiative"
+    if name == "search_civic_variants":
+        return f"Searching clinical variant evidence for {query}" if query else "Querying CIViC variants"
+    if name == "search_civic_genes":
+        return f"Searching clinical gene evidence for {gene or query}" if (gene or query) else "Querying CIViC genes"
+    if name == "get_cancer_mutation_profile":
+        return f"Retrieving mutation profile for {gene or query}" if (gene or query) else "Querying cBioPortal"
+
+    # --- Generic fallback: use source + whatever query-like arg is available ---
+    any_query = query or gene or compound or disease
+    if any_query:
+        return f"Querying {source} for {any_query[:80]}"
+    return f"Querying {source}"
+
+
+def _describe_tool_result(name: str, response: Any) -> str:
+    """Generate a human-readable 1-line description from a tool result."""
+    source = tool_registry.TOOL_SOURCE_NAMES.get(name, name)
+    if not isinstance(response, dict):
+        try:
+            response = dict(response) if response else {}
+        except Exception:  # noqa: BLE001
+            response = {}
+    err = response.get("error") or response.get("error_message")
+    if err:
+        return f"{source}: error — {str(err)[:100]}"
+
+    # MCP tools put text in content[0].text; the format is typically:
+    #   "Summary:\n{actual summary}\n\nKey Fields:\n..."
+    # Extract the real summary from the second line, or the first non-label line.
+    mcp_text = _extract_mcp_text(response)
+    if mcp_text:
+        summary_line = _extract_mcp_summary_line(mcp_text)
+        if summary_line:
+            # Long-output tools: literature (incl. query in result), clinical trials, abstracts
+            long_output_tools = (
+                "get_aba_gene_expression",
+                "get_gene_tissue_expression",
+                "search_pubmed",
+                "search_pubmed_advanced",
+                "search_clinical_trials",
+                "summarize_clinical_trials_landscape",
+                "get_clinical_trial",
+                "get_pubmed_abstract",
+            )
+            max_chars = 380 if name in long_output_tools else 220
+            return _truncate_summary(summary_line, max_chars=max_chars)
+
+    # Try structured dict keys (for non-MCP tools / direct function tools)
+    summary = _extract_result_summary(name, response)
+    if summary:
+        return summary
+    return f"{source} returned results"
+
+
+_MCP_SECTION_LABELS = {"summary:", "key fields:", "sources:", "limitations:", "notes:"}
+
+
+def _extract_mcp_text(response: dict[str, Any]) -> str:
+    """Extract the combined text from an MCP tool response."""
+    content_parts = response.get("content")
+    if isinstance(content_parts, list):
+        for part in content_parts:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = str(part.get("text", "") or "").strip()
+                if text:
+                    return text
+    # Fallback: structuredContent.text
+    sc = response.get("structuredContent")
+    if isinstance(sc, dict):
+        text = str(sc.get("text", "") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _extract_mcp_summary_line(text: str) -> str:
+    """Extract the real summary from MCP structured text.
+
+    MCP tools format responses as:
+        Summary:
+        {actual summary text}
+
+        Key Fields:
+        - field1
+        ...
+    We skip section labels ('Summary:', 'Key Fields:', etc.) and grab
+    the first block of actual content lines.
+    """
+    lines = text.split("\n")
+    in_summary_section = False
+    content_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if content_lines:
+                break
+            continue
+        if stripped.lower() in _MCP_SECTION_LABELS:
+            if content_lines:
+                break
+            in_summary_section = stripped.lower() == "summary:"
+            continue
+        # Skip bullet-point lines from non-summary sections
+        if not in_summary_section and not content_lines and stripped.startswith("- "):
+            continue
+        content_lines.append(stripped)
+    return " ".join(content_lines).strip() if content_lines else ""
+
+
+def _truncate_summary(text: str, *, max_chars: int = 120) -> str:
+    """Truncate a summary line to max_chars, stripping markdown heading markers."""
+    text = re.sub(r"^#+\s*", "", text).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars - 1].rstrip() + "…"
+
+
+def _extract_result_summary(name: str, response: dict[str, Any]) -> str:
+    """Extract a meaningful 1-line summary from tool response data."""
+    source = tool_registry.TOOL_SOURCE_NAMES.get(name, name)
+
+    # Gene resolver: extract symbol, Ensembl ID
+    if name == "resolve_gene_identifiers":
+        symbol = response.get("symbol") or response.get("query") or ""
+        ensembl = response.get("ensembl", {})
+        eid = ensembl.get("gene") if isinstance(ensembl, dict) else ""
+        if symbol and eid:
+            return f"found {symbol} (Ensembl: {eid})"
+        if symbol:
+            return f"found gene: {symbol}"
+
+    # BigQuery: count rows if result is a list/table
+    if name in ("run_bigquery_select_query", "list_bigquery_tables"):
+        # list_bigquery_tables returns table names
+        if name == "list_bigquery_tables":
+            tables = response.get("tables") or response.get("table_names")
+            if isinstance(tables, list):
+                return f"found {len(tables)} tables"
+            schema = response.get("schema") or response.get("fields")
+            if isinstance(schema, (list, dict)):
+                count = len(schema) if isinstance(schema, list) else len(schema)
+                return f"retrieved schema ({count} fields)"
+        # select query: look for rows/results
+        rows = response.get("rows") or response.get("results") or response.get("data")
+        if isinstance(rows, list):
+            return f"found {len(rows)} rows"
+        total = response.get("total_rows") or response.get("totalRows") or response.get("count")
+        if total is not None:
+            return f"found {total} results"
+
+    # Clinical trials
+    if name in ("search_clinical_trials", "summarize_clinical_trials_landscape"):
+        studies = response.get("studies") or response.get("results") or response.get("trials")
+        if isinstance(studies, list):
+            return f"found {len(studies)} clinical trials"
+        count = response.get("totalCount") or response.get("count") or response.get("total")
+        if count is not None:
+            return f"found {count} clinical trials"
+
+    # PubMed / literature search
+    if name in ("search_pubmed", "search_pubmed_advanced", "search_openalex_works",
+                "search_europe_pmc_literature"):
+        articles = response.get("results") or response.get("articles") or response.get("papers")
+        if isinstance(articles, list):
+            return f"found {len(articles)} articles"
+        count = response.get("count") or response.get("total") or response.get("totalResults")
+        if count is not None:
+            return f"found {count} articles"
+
+    # GWAS
+    if name == "search_gwas_associations":
+        assocs = response.get("associations") or response.get("results")
+        if isinstance(assocs, list):
+            return f"found {len(assocs)} associations"
+
+    # HPO / ontology
+    if name == "search_hpo_terms":
+        terms = response.get("terms") or response.get("results")
+        if isinstance(terms, list):
+            return f"found {len(terms)} phenotype terms"
+
+    # Drug interactions
+    if name == "search_drug_gene_interactions":
+        interactions = response.get("matchedTerms") or response.get("interactions") or response.get("results")
+        if isinstance(interactions, list):
+            return f"found {len(interactions)} drug-gene interactions"
+
+    # FDA adverse events
+    if name == "search_fda_adverse_events":
+        events = response.get("results") or response.get("events")
+        if isinstance(events, list):
+            return f"found {len(events)} adverse event reports"
+
+    # Generic: look for common list/count patterns in any response
+    for key in ("results", "data", "items", "hits", "records", "entries"):
+        val = response.get(key)
+        if isinstance(val, list) and len(val) > 0:
+            return f"found {len(val)} {key}"
+    for key in ("count", "total", "totalCount", "numFound", "total_rows"):
+        val = response.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            return f"found {int(val)} results"
+
+    # If response has a meaningful top-level field (symbol, name, id)
+    for key in ("symbol", "name", "label", "title"):
+        val = response.get(key)
+        if isinstance(val, str) and val.strip():
+            return f"found: {val.strip()[:80]}"
+
+    return ""
+
+
+def _summarize_latest_tool_results(llm_request: LlmRequest) -> str:
+    """Extract brief observation lines from function_response parts in the most recent content."""
+    contents = getattr(llm_request, "contents", None) or []
+    observations: list[str] = []
+    for content in reversed(contents):
+        parts = getattr(content, "parts", None)
+        if not parts:
+            continue
+        found_any = False
+        for part in parts:
+            fr = getattr(part, "function_response", None)
+            if fr is None:
+                continue
+            found_any = True
+            tool_name = str(getattr(fr, "name", "") or "").strip()
+            source = tool_registry.TOOL_SOURCE_NAMES.get(tool_name, tool_name)
+            response = getattr(fr, "response", None) or {}
+            if not isinstance(response, dict):
+                try:
+                    response = dict(response) if response else {}
+                except Exception:  # noqa: BLE001
+                    response = {}
+            err = response.get("error") or response.get("error_message")
+            if err:
+                msg = str(err)[:120]
+                observations.append(f"OBSERVE: {source} → error: {msg}")
+            else:
+                resp_str = str(response)
+                size = len(resp_str)
+                if size > 300:
+                    observations.append(f"OBSERVE: {source} → returned data ({size} chars)")
+                elif size > 0:
+                    preview = resp_str[:200].replace("\n", " ")
+                    observations.append(f"OBSERVE: {source} → {preview}")
+                else:
+                    observations.append(f"OBSERVE: {source} → returned a response")
+        if found_any:
+            break
+    return "\n".join(observations)
+
+
+def _get_tool_log(callback_context: CallbackContext) -> list[dict[str, str]]:
+    """Read the structured tool log from state."""
+    raw = callback_context.state.get(STATE_EXECUTOR_TOOL_LOG, "[]") or "[]"
+    if isinstance(raw, list):
+        return raw
+    try:
+        parsed = json.loads(str(raw))
+        return parsed if isinstance(parsed, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _set_tool_log(callback_context: CallbackContext, log: list[dict[str, str]]) -> None:
+    callback_context.state[STATE_EXECUTOR_TOOL_LOG] = json.dumps(log, ensure_ascii=False)
+    # Sync tool_log to the active step so it's visible via workflow state reads mid-execution
+    task_state = callback_context.state.get(STATE_WORKFLOW_TASK)
+    if task_state:
+        active_id = str(callback_context.state.get(STATE_EXECUTOR_ACTIVE_STEP_ID, "") or "").strip()
+        if active_id:
+            for s in task_state.get("steps", []):
+                if str(s.get("id", "")) == active_id:
+                    s["tool_log"] = log
+                    break
 
 
 def _set_temp_state(callback_context: CallbackContext, key: str, value: Any) -> None:
@@ -616,11 +1046,11 @@ def _clear_turn_temp_state(callback_context: CallbackContext) -> None:
     callback_context.state[STATE_EXECUTOR_BUFFER] = ""
     callback_context.state[STATE_SYNTH_BUFFER] = ""
     callback_context.state[STATE_PLANNER_RENDERED] = ""
-    callback_context.state[STATE_EXECUTOR_LAST_PROSE] = ""
     callback_context.state[STATE_EXECUTOR_RENDERED] = ""
     callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = ""
     callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = ""
-    callback_context.state[STATE_REACT_PARSE_RETRIES] = 0
+    callback_context.state[STATE_EXECUTOR_REASONING_TRACE] = ""
+    callback_context.state[STATE_EXECUTOR_TOOL_LOG] = "[]"
     callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = False
 
 
@@ -808,6 +1238,140 @@ def _consume_buffered_json_object(
     return None, last_error
 
 
+# ---------------------------------------------------------------------------
+# Post-hoc structure extraction from prose (primary extraction path)
+# ---------------------------------------------------------------------------
+
+_EXTRACTION_CLIENT: _genai_module.Client | None = None
+EXTRACTION_MODEL = os.getenv("ADK_EXTRACTION_MODEL", "gemini-2.0-flash")
+EXTRACTION_FALLBACK_MODEL = os.getenv("ADK_EXTRACTION_FALLBACK_MODEL", "gemini-2.5-flash-lite")
+
+_EXTRACTION_PROMPT_TEMPLATE = """\
+Extract structured data from the following research step output.
+Focus on identifying substantive scientific claims as structured_observations with proper
+subject/predicate/object triples, and collecting all evidence identifiers.
+
+Step {step_id} output:
+---
+{prose}
+---
+
+Return a JSON object with these fields:
+{{
+  "status": "completed" or "blocked",
+  "result_summary": "<concise but thorough findings summary preserving key details, scores, and identifiers>",
+  "evidence_ids": ["PMID:...", "NCT:...", "DOI:...", "UniProt:...", "rs...", "CHEMBL..."],
+  "tools_called": ["tool_name_1"],
+  "data_sources_queried": ["Open Targets Platform", "ClinicalTrials.gov", ...],
+  "open_gaps": ["..."],
+  "suggested_next_searches": ["..."],
+  "structured_observations": [
+    {{
+      "observation_type": "<claim family: e.g. phenotype_association, drug_response, interaction, pathway_involvement>",
+      "subject": {{ "type": "<entity type>", "label": "<name>", "id": "<optional canonical ID>" }},
+      "predicate": "<atomic predicate: e.g. associated_with, sensitive_in, inhibits, involved_in>",
+      "object": {{ "type": "<entity type>", "label": "<name>", "id": "<optional canonical ID>" }},
+      "supporting_ids": ["PMID:...", "CHEMBL..."],
+      "source_tool": "<tool name that produced this finding>",
+      "confidence": "low" | "medium" | "high"
+    }}
+  ]
+}}
+
+Rules:
+- Extract ALL substantive scientific claims as structured_observations (usually 1-12 per step).
+- Each observation must be grounded in the text — do not invent unsupported claims.
+- Include every evidence identifier mentioned in the text in evidence_ids.
+- The result_summary should capture the full richness of findings without padding.
+- If the text indicates the step failed or was blocked, set status to "blocked"."""
+
+
+def _get_extraction_client() -> _genai_module.Client | None:
+    global _EXTRACTION_CLIENT
+    if _EXTRACTION_CLIENT is not None:
+        return _EXTRACTION_CLIENT
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        _EXTRACTION_CLIENT = _genai_module.Client(api_key=api_key)
+    except Exception:  # noqa: BLE001
+        logger.warning("[extract] failed to create genai client")
+        return None
+    return _EXTRACTION_CLIENT
+
+
+def _call_extraction_model(client: _genai_module.Client, model: str, prompt: str, step_id: str) -> dict[str, Any] | None:
+    """Call a single extraction model and return parsed dict or None."""
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
+    )
+    text = str(getattr(response, "text", "") or "").strip()
+    if not text:
+        return None
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        return None
+    parsed["step_id"] = step_id
+    parsed["schema"] = STEP_RESULT_SCHEMA
+    if not parsed.get("step_progress_note"):
+        summary = str(parsed.get("result_summary", "") or "")
+        parsed["step_progress_note"] = summary[:200] if summary else "Step completed."
+    return parsed
+
+
+def _extract_structure_from_prose(prose: str, step_id: str) -> dict[str, Any] | None:
+    """Extract structured step data from prose. Tries primary model, falls back on failure."""
+    client = _get_extraction_client()
+    if client is None:
+        return None
+    prompt = _EXTRACTION_PROMPT_TEMPLATE.format(step_id=step_id, prose=prose[:6000])
+    models_to_try = [EXTRACTION_MODEL]
+    if EXTRACTION_FALLBACK_MODEL and EXTRACTION_FALLBACK_MODEL != EXTRACTION_MODEL:
+        models_to_try.append(EXTRACTION_FALLBACK_MODEL)
+    for model in models_to_try:
+        try:
+            parsed = _call_extraction_model(client, model, prompt, step_id)
+            if parsed is not None:
+                logger.info(
+                    "[extract] %s extracted for %s: %d observations, %d evidence_ids",
+                    model, step_id,
+                    len(parsed.get("structured_observations") or []),
+                    len(parsed.get("evidence_ids") or []),
+                )
+                return parsed
+            logger.warning("[extract] %s returned empty for %s", model, step_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[extract] %s failed for %s: %s", model, step_id, exc)
+    return None
+
+
+_EVIDENCE_ID_PATTERNS = re.compile(
+    r"(?:PMID:\d+|DOI:10\.\S+|NCT\d{8,}|PMC\d+|OpenAlex:W\d+"
+    r"|UniProt:[A-Z0-9]{4,}|PubChem:\d+|PDB:[A-Z0-9]{4}"
+    r"|rs\d{4,}|CHEMBL\d+|Reactome:R-HSA-\d+|GCST\d+)"
+)
+
+
+def _extract_evidence_ids_from_text(text: str) -> list[str]:
+    """Regex-extract canonical evidence identifiers from prose text."""
+    if not text:
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for match in _EVIDENCE_ID_PATTERNS.finditer(text):
+        eid = match.group(0)
+        if eid not in seen:
+            seen.add(eid)
+            result.append(eid)
+    return result[:30]
+
+
 def _as_nonempty_str(value: Any, field_name: str) -> str:
     text = re.sub(r"\s+", " ", str(value or "").strip())
     if not text:
@@ -977,6 +1541,26 @@ def _merge_attr_payload(existing: dict[str, Any] | None, new_attrs: dict[str, An
     return merged
 
 
+_ID_LIKE_PATTERN = re.compile(r"^[A-Z0-9_]+:[A-Z0-9_.:-]+$", flags=re.IGNORECASE)
+
+
+def _is_more_informative_label(candidate: str, existing: str) -> bool:
+    """Return True if *candidate* is a better human-readable label than *existing*.
+
+    Prefers labels that look like natural language over bare identifiers
+    (e.g. "Parkinson disease" over "MONDO:0005180").
+    """
+    if not candidate or candidate == existing:
+        return False
+    existing_is_id = bool(_ID_LIKE_PATTERN.match(existing))
+    candidate_is_id = bool(_ID_LIKE_PATTERN.match(candidate))
+    if existing_is_id and not candidate_is_id:
+        return True
+    if not existing_is_id and candidate_is_id:
+        return False
+    return len(candidate) > len(existing)
+
+
 def _upsert_entity(
     store: dict[str, Any],
     entity_type: str,
@@ -1000,6 +1584,8 @@ def _upsert_entity(
             "attrs": {},
         }
         store["entities"][entity_id] = existing
+    elif _is_more_informative_label(cleaned_label, existing.get("label", "")):
+        existing["label"] = cleaned_label
     existing["aliases"] = _merge_str_values(existing.get("aliases"), aliases or [])
     existing["attrs"] = _merge_attr_payload(existing.get("attrs"), attrs)
     return existing
@@ -1615,6 +2201,32 @@ SYNTHESIS_META_PREDICATES = {
     "supported_by",
 }
 
+TRIVIAL_IDENTIFIER_PREDICATES = {
+    "has_ensembl_id",
+    "has_mondo_id",
+    "has_efo_id",
+    "has_entrez_id",
+    "has_uniprot_id",
+    "has_chembl_id",
+    "has_id",
+    "has_identifier",
+    "identified_as",
+    "maps_to",
+    "cross_referenced_in",
+    "resolved_to",
+    "has_accession",
+    "has_ontology_id",
+    "has_domain_count",
+    "has_modified_residue_count",
+    "has_isoform_count",
+    "has_subcellular_location",
+    "classified_as",
+    "has_no_genetic_associations",
+    "has_no_phenotype_associations",
+    "has_no_clingen_curation_for_disease",
+    "localized_to",
+}
+
 
 CLAIM_SOURCE_TOOL_WEIGHTS: dict[str, float] = {
     "get_clingen_gene_curation": 1.0,
@@ -2209,10 +2821,11 @@ def _build_claim_synthesis_summary(store: dict[str, Any], objective_text: str = 
             continue
         evidence_by_claim.setdefault(claim_id, []).append(record)
 
+    excluded_predicates = SYNTHESIS_META_PREDICATES | TRIVIAL_IDENTIFIER_PREDICATES
     substantive_claims = [
         claim
         for claim in claims
-        if str(claim.get("predicate", "")).strip() not in SYNTHESIS_META_PREDICATES
+        if str(claim.get("predicate", "")).strip() not in excluded_predicates
     ]
     adjudicated_claims = [
         _score_adjudicated_claim(claim, evidence_by_claim.get(str(claim.get("id", "")).strip(), []), label_by_entity)
@@ -2258,6 +2871,8 @@ def _build_claim_synthesis_summary(store: dict[str, Any], objective_text: str = 
     def _public_claim_summary(claim: dict[str, Any]) -> dict[str, Any]:
         return {
             "statement": claim.get("statement", ""),
+            "subject": claim.get("subject", ""),
+            "object": claim.get("object", ""),
             "predicate": claim.get("predicate", ""),
             "support_score": claim.get("support_score", 0.0),
             "support_strength": claim.get("support_strength", ""),
@@ -2912,8 +3527,22 @@ def _render_react_trace_block(
     return lines
 
 
-def _render_react_step_progress(task_state: dict[str, Any], result: dict[str, Any], reasoning_trace: str) -> str:
-    """Render progress for a single ReAct step iteration."""
+def _render_react_step_progress(
+    task_state: dict[str, Any],
+    result: dict[str, Any],
+    reasoning_trace: str,
+    tool_reasoning: str = "",
+    executor_prose: str = "",
+) -> str:
+    """Render a compact progressive log for a completed ReAct step.
+
+    Format:
+      ### S1 · `completed` — Goal text
+      1. **MyGene.info** — resolved LRRK2 to ENSG00000188906
+      2. **BigQuery** — listed 60 tables in open_targets_platform
+      -> Claims: LRRK2 has Ensembl ID ENSG00000188906 [high]
+      ---
+    """
     step_id = str(result.get("step_id", "")).strip()
     try:
         _, step = _find_step(task_state, step_id)
@@ -2921,44 +3550,81 @@ def _render_react_step_progress(task_state: dict[str, Any], result: dict[str, An
         step = {}
     status = str(result.get("status", step.get("status", ""))).strip()
     goal = str(step.get("goal", "")).strip()
-    tools_called = list(step.get("tools_called", []) or [])
+    tool_log: list[dict[str, str]] = step.get("tool_log") or []
 
-    lines = [f"### {step_id} · `{status}`", ""]
+    header = f"### {step_id} · `{status}`"
     if goal:
-        lines.extend([f"**Goal:** {goal}", ""])
+        header += f" — {goal}"
+    lines: list[str] = [header]
 
-    react_block = _render_react_trace_block(reasoning_trace, tools_called)
-    if react_block:
-        lines.extend(react_block)
-
-    progress_note = str(result.get("step_progress_note", "")).strip()
-    if progress_note:
-        lines.extend([progress_note, ""])
-    result_summary = str(result.get("result_summary", "")).strip()
-    if result_summary:
-        lines.extend(["**Key Findings**", "", result_summary, ""])
-    evidence_ids = [str(x).strip() for x in result.get("evidence_ids", []) if str(x).strip()]
-    if evidence_ids:
-        lines.extend(["**Evidence IDs**", ""])
-        lines.extend(f"- `{eid}`" for eid in evidence_ids[:12])
-        lines.append("")
-    open_gaps = [str(x).strip() for x in result.get("open_gaps", []) if str(x).strip()]
-    if open_gaps:
-        lines.extend(["**Open Gaps**", ""])
-        lines.extend(f"- {gap}" for gap in open_gaps[:6])
-        lines.append("")
-
-    completed = _completed_step_count(task_state)
-    total = _total_step_count(task_state)
-    plan_status = str(task_state.get("plan_status", ""))
-    if plan_status == "completed":
-        lines.append(f"_Progress: {completed}/{total} steps complete — generating final summary._")
+    # --- Tool log: compact dash list ---
+    if tool_log:
+        for entry in tool_log:
+            tool = entry.get("tool", "?")
+            summary = entry.get("summary", "").strip()
+            entry_result = entry.get("result", "").strip()
+            entry_status = entry.get("status", "")
+            if summary and entry_result:
+                lines.append(f"- {summary} → {entry_result}")
+            elif summary:
+                if entry_status == "called":
+                    lines.append(f"- {summary}…")
+                else:
+                    lines.append(f"- {summary}")
+            else:
+                lines.append(f"- **{tool}** — querying…")
     else:
-        next_id = str(task_state.get("current_step_id") or "")
-        lines.append(f"_Progress: {completed}/{total} steps complete. Next: {next_id}_")
-    lines.append("")
+        tools_called = list(step.get("tools_called", []) or [])
+        if tools_called:
+            source_labels = []
+            for tool_name in tools_called:
+                source = tool_registry.TOOL_SOURCE_NAMES.get(tool_name, "")
+                if source and source not in source_labels:
+                    source_labels.append(source)
+            if source_labels:
+                lines.append(f"Sources: {', '.join(source_labels)}")
+
+    # --- Key claims (compact, 1-2 lines) ---
+    observations = list(result.get("structured_observations", []) or [])
+    if observations:
+        claim_parts = []
+        for obs in observations[:5]:
+            subj = obs.get("subject", {}).get("label", "?") if isinstance(obs.get("subject"), dict) else "?"
+            pred = obs.get("predicate", "?")
+            obj = obs.get("object", {}).get("label", "?") if isinstance(obs.get("object"), dict) else "?"
+            conf = obs.get("confidence", "")
+            conf_tag = f" [{conf}]" if conf else ""
+            claim_parts.append(f"{subj} → {pred} → {obj}{conf_tag}")
+        claims_text = "; ".join(claim_parts)
+        if len(observations) > 5:
+            claims_text += f" _(+{len(observations) - 5} more)_"
+        lines.append(f"   → **Claims:** {claims_text}")
+
     lines.append("---")
     return "\n".join(lines).strip()
+
+
+_STEP_PROSE_NOISE_PATTERNS = [
+    re.compile(r"^#+\s*S\d+\s*[·\-].*$", re.MULTILINE),
+    re.compile(r"^\*\*Goal:\*\*.*$", re.MULTILINE),
+    re.compile(r"^\*\*(?:Key |Detailed )?Findings\*\*\s*$", re.MULTILINE),
+    re.compile(r"^\*\*(?:Evidence|Evidence IDs|Structured Claims|Claims|Open Gaps|Tool Activity|Sources queried|ReAct Trace|Tool Trace)\*\*.*$", re.MULTILINE),
+    re.compile(r"^_Progress:.*_\s*$", re.MULTILINE),
+    re.compile(r"^\s*(?:COMPLETED|BLOCKED)\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^-{3,}\s*$", re.MULTILINE),
+    re.compile(r"^This step is (?:COMPLETED|BLOCKED)\.?\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^ACT:\s+Called\s+.+$", re.MULTILINE),
+    re.compile(r"^OBSERVE:\s+.+$", re.MULTILINE),
+]
+
+
+def _clean_step_prose(text: str) -> str:
+    """Remove redundant headings, status lines, and progress lines from model prose."""
+    cleaned = text
+    for pattern in _STEP_PROSE_NOISE_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -3410,7 +4076,7 @@ def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> s
     Skips the ## References section (already formatted) and avoids double-linking.
     """
     # Split off the References section — leave it untouched.
-    refs_split = re.split(r"(?m)^## References\b", text, maxsplit=1)
+    refs_split = re.split(r"(?m)^#{2,3} References\b", text, maxsplit=1)
     body = refs_split[0]
     refs_tail = ("\n## References" + refs_split[1]) if len(refs_split) > 1 else ""
 
@@ -3485,7 +4151,7 @@ def _expand_reference_only_body_lines(text: str, lit_ids: list[str]) -> str:
     if not text or not lit_ids:
         return text
 
-    refs_split = re.split(r"(?m)^## References\b", text, maxsplit=1)
+    refs_split = re.split(r"(?m)^#{2,3} References\b", text, maxsplit=1)
     body = refs_split[0]
     refs_tail = ("\n## References" + refs_split[1]) if len(refs_split) > 1 else ""
     citation_cache: dict[int, str] = {}
@@ -3643,14 +4309,28 @@ def _render_step_subsection(step: dict[str, Any]) -> list[str]:
 def _normalize_top_level_heading_key(heading: str) -> str:
     normalized = re.sub(r"\s+", " ", str(heading or "").strip()).lower()
     mapping = {
-        "summary": "summary",
-        "evidence and methodology": "evidence_and_methodology",
-        "evidence & methodology": "evidence_and_methodology",
+        "tldr": "answer",
+        "answer": "answer",
+        "summary": "answer",
+        "evidence breakdown": "detailed_findings",
+        "detailed findings": "detailed_findings",
+        "key findings": "detailed_findings",
+        "findings": "detailed_findings",
+        "conflicting & uncertain evidence": "conflicting_evidence",
+        "conflicting and uncertain evidence": "conflicting_evidence",
+        "conflicting evidence": "conflicting_evidence",
+        "limitations & gaps": "limitations",
+        "limitations and gaps": "limitations",
         "limitations": "limitations",
+        "recommended next steps": "next_steps",
         "potential next steps": "next_steps",
         "next steps": "next_steps",
         "next actions": "next_steps",
+        "sources consulted": "sources_consulted",
         "references": "references",
+        # Legacy mappings for backward compatibility with older LLM output
+        "evidence and methodology": "detailed_findings",
+        "evidence & methodology": "detailed_findings",
     }
     return mapping.get(normalized, normalized.replace(" ", "_"))
 
@@ -3860,121 +4540,102 @@ def _human_join(items: list[str]) -> str:
     return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
 
 
-def _build_structured_summary_markdown(
+def _all_substantive_paragraphs(text: str) -> str:
+    """Return all non-heading, non-empty paragraphs from text as joined prose."""
+    paragraphs: list[str] = []
+    for block in re.split(r"\n\s*\n", str(text or "").strip()):
+        cleaned = block.strip()
+        if not cleaned:
+            continue
+        if cleaned.startswith("#"):
+            continue
+        paragraphs.append(re.sub(r"\s+", " ", cleaned).strip())
+    return "\n\n".join(paragraphs)
+
+
+def _build_structured_answer_markdown(
     task_state: dict[str, Any],
     claim_summary: dict[str, Any],
     *,
-    model_summary: str = "",
+    model_answer: str = "",
 ) -> str:
+    """Build the Answer section: a direct, standalone answer with confidence framing."""
     lines: list[str] = []
+    objective = str(task_state.get("objective", "")).strip()
     top_claims = list(claim_summary.get("top_supported_claims", []) or [])
-    step_highlights = _build_step_result_highlights(task_state)
-    model_summary_paragraph = _first_substantive_paragraph(model_summary)
+    mixed_claims = list(claim_summary.get("mixed_evidence_claims", []) or [])
+    model_answer_text = _all_substantive_paragraphs(model_answer)
+    model_answer_first = _first_substantive_paragraph(model_answer)
+
+    all_sources: list[str] = []
+    for step in task_state.get("steps", []):
+        if str(step.get("status", "")).strip() == "completed":
+            all_sources.extend(_derive_step_data_sources(step))
+    unique_sources = _dedupe_str_list(all_sources, limit=6)
+    source_context = ""
+    if unique_sources:
+        source_context = f" Based on evidence from {_human_join(unique_sources)}."
+
     if not top_claims:
-        objective = str(task_state.get("objective", "")).strip()
-        if _is_informative_model_summary(objective, model_summary):
-            lines.append(model_summary_paragraph)
-            if step_highlights:
-                lines.append("")
-                lines.append("Key evidence strands:")
-                lines.append("")
-                for highlight in step_highlights:
-                    source_text = f" (source: {highlight['source']})" if highlight.get("source") else ""
-                    lines.append(f"- {highlight['summary']}{source_text}")
-        elif step_highlights:
-            source_text = _human_join([item.get("source", "") for item in step_highlights if item.get("source")])
-            if objective:
-                if source_text:
-                    lines.append(
-                        f"For the question of {objective}, the completed searches across {source_text} identified these directly relevant findings:"
-                    )
-                else:
-                    lines.append(
-                        f"For the question of {objective}, the completed searches identified these directly relevant findings:"
-                    )
-            else:
-                lines.append("The completed searches identified these directly relevant findings:")
-            lines.append("")
-            for highlight in step_highlights:
-                source_suffix = f" (source: {highlight['source']})" if highlight.get("source") else ""
-                lines.append(f"- {highlight['summary']}{source_suffix}")
+        if _is_informative_model_summary(objective, model_answer):
+            lines.append(model_answer_text or model_answer_first)
+            if source_context:
+                lines.append(source_context.strip())
         else:
-            fallback = str(model_summary_paragraph or model_summary or "").strip()
-            if fallback:
-                lines.append(fallback)
+            step_highlights = _build_step_result_highlights(task_state)
+            if step_highlights:
+                highlight_text = "; ".join(h["summary"] for h in step_highlights[:3])
+                lines.append(f"Preliminary findings indicate: {highlight_text}.{source_context}")
             elif objective:
                 lines.append(
-                    f"The collected evidence is not yet sufficient to make a strong, claim-level conclusion for {objective}."
+                    f"The collected evidence is not yet sufficient to reach a definitive conclusion"
+                    f" regarding {objective}.{source_context}"
                 )
             else:
-                lines.append("The collected evidence is not yet sufficient to make a strong, claim-level conclusion.")
-        return "\n".join(lines).strip()
+                lines.append(f"The collected evidence is not yet sufficient to reach a definitive conclusion.{source_context}")
+        return "\n\n".join(lines).strip()
 
-    lead_claim = top_claims[0]
-    mixed_claims = list(claim_summary.get("mixed_evidence_claims", []) or [])
-    if _is_informative_model_summary(str(task_state.get("objective", "")).strip(), model_summary):
-        lines.append(model_summary_paragraph)
+    confidence_framing = _answer_confidence_framing(top_claims, mixed_claims)
+
+    if _is_informative_model_summary(objective, model_answer):
+        lines.append(model_answer_text or model_answer_first)
     else:
+        lead_claim = top_claims[0]
         lead_sources = _human_join(list(lead_claim.get("primary_sources", []) or [])[:3]) or "the available sources"
-        objective = str(task_state.get("objective", "")).strip()
-        if objective:
-            lines.append(
-                f"For the question of {objective}, the strongest directly grounded finding is "
-                f"{lead_claim.get('statement', '')}. "
-                f"This interpretation is driven primarily by {lead_sources}."
-            )
-        else:
-            lines.append(
-                "In practical terms, the current evidence points to "
-                f"{lead_claim.get('statement', '')}. "
-                f"This interpretation is driven primarily by {lead_sources}."
-            )
+        lines.append(
+            f"{confidence_framing} {lead_claim.get('statement', '')},"
+            f" driven primarily by {lead_sources}.{source_context}"
+        )
 
     if mixed_claims:
         conflict = mixed_claims[0]
-        conflict_claims = list(conflict.get("claims", []) or [])
-        conflict_descriptions: list[str] = []
-        for claim in conflict_claims[:2]:
-            claim_sources = _human_join(list(claim.get("primary_sources", []) or [])[:2]) or "another source"
-            conflict_descriptions.append(
-                f"{claim_sources} supports {claim.get('statement', '')}"
-            )
         focus = " and ".join(
-            part
-            for part in [
+            part for part in [
                 str(conflict.get("subject", "")).strip(),
                 str(conflict.get("object", "")).strip(),
-            ]
-            if part
-        ) or "the main claim"
-        preferred = str(conflict.get("preferred_interpretation", "")).strip()
-        if len(conflict_descriptions) >= 2:
-            lines.append(
-                f"The main caveat is that evidence is mixed for {focus}: "
-                f"{conflict_descriptions[0]}, whereas {conflict_descriptions[1]}. "
-                + (
-                    f"The report therefore treats {preferred} as the leading interpretation rather than a definitive conclusion."
-                    if preferred
-                    else "The report therefore treats this finding as unresolved."
-                )
-            )
-        elif preferred:
-            lines.append(
-                f"Evidence is mixed for {focus}, so the report treats {preferred} as the leading interpretation rather than a definitive conclusion."
-            )
-        else:
-            lines.append(
-                f"Evidence is mixed for {focus}, and the report therefore treats this finding as unresolved."
-            )
-    if step_highlights:
-        lines.append("")
-        lines.append("Key evidence strands:")
-        lines.append("")
-        for highlight in step_highlights:
-            source_suffix = f" (source: {highlight['source']})" if highlight.get("source") else ""
-            lines.append(f"- {highlight['summary']}{source_suffix}")
+            ] if part
+        ) or "a key finding"
+        lines.append(
+            f" However, evidence is mixed regarding {focus}"
+            f" (see Conflicting & Uncertain Evidence below)."
+        )
 
-    return "\n".join(lines).strip()
+    return "\n\n".join(lines).strip()
+
+
+def _answer_confidence_framing(
+    top_claims: list[dict[str, Any]],
+    mixed_claims: list[dict[str, Any]],
+) -> str:
+    if mixed_claims:
+        return "Evidence is divided, but the current balance suggests"
+    strengths = [str(c.get("support_strength", "low")).strip().lower() for c in top_claims[:3]]
+    high_count = sum(1 for s in strengths if s == "high")
+    if high_count >= 2:
+        return "Strong evidence from multiple independent sources supports that"
+    if high_count == 1:
+        return "Evidence supports that"
+    return "Preliminary data indicate that"
 
 
 def _format_markdown_table_cell(value: Any) -> str:
@@ -4039,6 +4700,402 @@ def _build_mixed_evidence_claims_table(claim_summary: dict[str, Any]) -> str:
         ["Claim focus", "Assessment", "Current lean", "Leading sources"],
         rows,
     )
+
+
+# ---------------------------------------------------------------------------
+# Thematic claim clustering + adaptive finding rendering
+# ---------------------------------------------------------------------------
+
+NARRATIVE_PREDICATES = {
+    "has_function", "participates_in", "causal_gene_for", "depends_on",
+    "activates", "inhibits",
+}
+TABULAR_PREDICATES = {
+    "associated_with", "interacts_with", "has_phenotype", "cross_referenced_in",
+    "has_ortholog", "has_model", "screen_hit_in",
+}
+
+_ENTITY_TYPE_LABELS: dict[str, str] = {
+    "gene": "Gene",
+    "compound": "Compound",
+    "disease": "Disease",
+    "cell_line": "Cell line",
+    "phenotype": "Phenotype",
+    "pathway": "Pathway",
+    "variant": "Variant",
+    "protein": "Protein",
+    "source": "Source",
+    "record": "Record",
+}
+
+
+def _cluster_claims_by_theme(
+    claim_summary: dict[str, Any],
+    task_state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Group ALL substantive claims from the evidence store into thematic clusters.
+
+    Reads the full evidence store (entities, claims, evidence records) rather
+    than only the top-N summary, so nuance is preserved for complex questions.
+    """
+    store = task_state.get("evidence_store", {}) or {}
+    objective_text = str(task_state.get("objective", "")).strip()
+    all_claims = list((store or {}).get("claims", {}).values())
+    evidence_records = list((store or {}).get("evidence", []))
+    entities = dict((store or {}).get("entities", {}))
+    label_by_entity = {eid: str(e.get("label", eid)).strip() for eid, e in entities.items()}
+    type_by_entity = {eid: str(e.get("type", "record")).strip() for eid, e in entities.items()}
+
+    excluded_predicates = SYNTHESIS_META_PREDICATES | TRIVIAL_IDENTIFIER_PREDICATES
+    substantive_claims = [
+        c for c in all_claims
+        if str(c.get("predicate", "")).strip() not in excluded_predicates
+    ]
+    if not substantive_claims:
+        return _fallback_findings_from_steps(task_state)
+
+    evidence_by_claim: dict[str, list[dict[str, Any]]] = {}
+    for record in evidence_records:
+        cid = str(record.get("claim_id", "")).strip()
+        if cid:
+            evidence_by_claim.setdefault(cid, []).append(record)
+
+    mixed_claim_ids: set[str] = set()
+    mixed_claims_list = list(claim_summary.get("mixed_evidence_claims", []) or [])
+    for conflict in mixed_claims_list:
+        for cc in list(conflict.get("claims", []) or []):
+            cid = str(cc.get("claim_id", "")).strip()
+            if cid:
+                mixed_claim_ids.add(cid)
+
+    adjudicated: list[dict[str, Any]] = []
+    for claim in substantive_claims:
+        cid = str(claim.get("id", "")).strip()
+        scored = _score_adjudicated_claim(claim, evidence_by_claim.get(cid, []), label_by_entity)
+        scored["mixed_evidence"] = cid in mixed_claim_ids
+        scored["display_priority_score"] = _claim_display_priority_score(scored, objective_text)
+        scored["subject_entity_id"] = str(claim.get("subject_entity_id", "")).strip()
+        scored["object_entity_id"] = str(claim.get("object_entity_id", "")).strip()
+        scored["subject_type"] = type_by_entity.get(scored["subject_entity_id"], "record")
+        scored["object_type"] = type_by_entity.get(scored["object_entity_id"], "record")
+        scored["step_ids"] = list(claim.get("step_ids", []) or [])
+        scored["observation_types"] = list(claim.get("observation_types", []) or [])
+
+        qualifiers_combined: dict[str, Any] = {}
+        for rec in evidence_by_claim.get(cid, []):
+            for k, v in (rec.get("qualifiers") or {}).items():
+                if v and k not in qualifiers_combined:
+                    qualifiers_combined[k] = v
+        scored["qualifiers"] = qualifiers_combined
+
+        adjudicated.append(scored)
+
+    adjudicated.sort(key=lambda c: (
+        float(c.get("display_priority_score", 0.0) or 0.0),
+        1 if not c.get("mixed_evidence") else 0,
+        int(c.get("source_count", 0) or 0),
+    ), reverse=True)
+
+    entity_to_cluster: dict[str, int] = {}
+    clusters: list[dict[str, Any]] = []
+
+    for claim in adjudicated:
+        subject = str(claim.get("subject", "")).strip()
+        obj = str(claim.get("object", "")).strip()
+        merged_idx: int | None = None
+        for key in [subject, obj]:
+            if key and key in entity_to_cluster:
+                merged_idx = entity_to_cluster[key]
+                break
+
+        if merged_idx is not None:
+            clusters[merged_idx]["claims"].append(claim)
+            for key in [subject, obj]:
+                if key:
+                    entity_to_cluster[key] = merged_idx
+        else:
+            new_idx = len(clusters)
+            clusters.append({"claims": [claim], "title": "", "variant": "verdict"})
+            for key in [subject, obj]:
+                if key:
+                    entity_to_cluster[key] = new_idx
+
+    for cluster in clusters:
+        cluster["title"] = _derive_cluster_title(cluster["claims"])
+        cluster["variant"] = _select_finding_variant(cluster["claims"])
+        cluster["confidence"] = _aggregate_cluster_confidence(cluster["claims"])
+
+    clusters.sort(key=lambda c: (
+        max((float(cl.get("display_priority_score", 0)) for cl in c["claims"]), default=0),
+        len(c["claims"]),
+    ), reverse=True)
+    return clusters[:12]
+
+
+def _fallback_findings_from_steps(task_state: dict[str, Any]) -> list[dict[str, Any]]:
+    """When no structured claims exist, build findings from step result summaries."""
+    findings: list[dict[str, Any]] = []
+    for step in task_state.get("steps", []):
+        if str(step.get("status", "")).strip() != "completed":
+            continue
+        summary = str(step.get("result_summary", "")).strip()
+        if not summary:
+            continue
+        source = _format_step_source_display(step)
+        findings.append({
+            "claims": [],
+            "title": str(step.get("goal", "")).strip() or "Finding",
+            "variant": "verdict",
+            "confidence": "moderate",
+            "step_summary": summary,
+            "step_source": source,
+        })
+    return findings[:12]
+
+
+def _derive_cluster_title(claims: list[dict[str, Any]]) -> str:
+    from collections import Counter
+    subjects = [str(c.get("subject", "")).strip() for c in claims if c.get("subject")]
+    objects = [str(c.get("object", "")).strip() for c in claims if c.get("object")]
+    entity_counts = Counter(subjects + objects)
+    if entity_counts:
+        top_entity = entity_counts.most_common(1)[0][0]
+        subject_types = {str(c.get("subject_type", "")).strip() for c in claims if str(c.get("subject", "")).strip() == top_entity}
+        object_types = {str(c.get("object_type", "")).strip() for c in claims if str(c.get("object", "")).strip() == top_entity}
+        entity_type = (subject_types | object_types) - {"", "record", "objective", "step", "source"}
+        type_label = _ENTITY_TYPE_LABELS.get(next(iter(entity_type), ""), "")
+        predicates = {str(c.get("predicate", "")).strip() for c in claims}
+        if len(predicates) == 1:
+            pred = predicates.pop().replace("_", " ")
+            if type_label:
+                return f"{top_entity} ({type_label}) — {pred}"
+            return f"{top_entity} — {pred}"
+        if type_label:
+            return f"{top_entity} ({type_label})"
+        return top_entity
+    first = claims[0] if claims else {}
+    return str(first.get("statement", "Finding")).split(" is ")[0].strip() or "Finding"
+
+
+def _select_finding_variant(claims: list[dict[str, Any]]) -> str:
+    """Choose tabular / verdict / narrative based on claim predicates and entity counts."""
+    predicates = [str(c.get("predicate", "")).strip() for c in claims]
+    subjects = {str(c.get("subject", "")).strip() for c in claims if c.get("subject")}
+    objects = {str(c.get("object", "")).strip() for c in claims if c.get("object")}
+    unique_entities = subjects | objects
+
+    narrative_count = sum(1 for p in predicates if p in NARRATIVE_PREDICATES)
+    tabular_count = sum(1 for p in predicates if p in TABULAR_PREDICATES)
+
+    if len(claims) >= 3 and len(unique_entities) >= 3 and tabular_count >= narrative_count:
+        return "tabular"
+    if narrative_count > tabular_count and narrative_count >= 2:
+        return "narrative"
+    return "verdict"
+
+
+def _aggregate_cluster_confidence(claims: list[dict[str, Any]]) -> str:
+    if any(c.get("mixed_evidence") for c in claims):
+        return "mixed"
+    total_sources = len({s for c in claims for s in (c.get("primary_sources") or [])})
+    total_evidence = sum(int(c.get("evidence_count", 0) or 0) for c in claims)
+    strengths = [str(c.get("support_strength", "low")).strip().lower() for c in claims]
+    if all(s == "high" for s in strengths) or (total_sources >= 3 and total_evidence >= 4):
+        return "high"
+    if any(s == "high" for s in strengths) or total_sources >= 2:
+        return "moderate"
+    if total_sources >= 1 and total_evidence >= 1:
+        return "moderate"
+    return "low"
+
+
+def _format_qualifier_context(qualifiers: dict[str, Any]) -> str:
+    """Render non-empty qualifiers as a compact context string."""
+    parts: list[str] = []
+    for key in ["tissue", "disease", "species", "assay", "phase", "evidence"]:
+        val = str(qualifiers.get(key, "") or "").strip()
+        if val:
+            parts.append(f"{key}: {val}")
+    return "; ".join(parts)
+
+
+def _render_finding_cluster(cluster: dict[str, Any]) -> list[str]:
+    """Render a single thematic finding cluster with adaptive presentation."""
+    variant = cluster.get("variant", "verdict")
+    title = cluster.get("title", "Finding")
+    confidence = cluster.get("confidence", "moderate")
+    claims = cluster.get("claims", [])
+    lines: list[str] = [f"### {title}", ""]
+
+    if not claims:
+        step_summary = cluster.get("step_summary", "")
+        source = cluster.get("step_source", "")
+        if step_summary:
+            source_suffix = f" (source: {source})" if source else ""
+            lines.append(f"{step_summary}{source_suffix}")
+            lines.append("")
+        return lines
+
+    source_count = len({s for c in claims for s in (c.get("primary_sources") or [])})
+    evidence_count = sum(int(c.get("evidence_count", 0) or 0) for c in claims)
+    evidence_meta: list[str] = []
+    if source_count > 0:
+        evidence_meta.append(f"{source_count} source{'s' if source_count != 1 else ''}")
+    if evidence_count > 0:
+        evidence_meta.append(f"{evidence_count} evidence record{'s' if evidence_count != 1 else ''}")
+    confidence_labels = {"high": "Strong", "moderate": "Moderate", "low": "Limited", "mixed": "Mixed"}
+    conf_label = confidence_labels.get(confidence, confidence.title())
+    meta_suffix = f" ({', '.join(evidence_meta)})" if evidence_meta else ""
+    lines.append(f"**Evidence strength:** {conf_label}{meta_suffix}")
+    lines.append("")
+
+    if variant == "tabular":
+        lines.extend(_render_finding_tabular(claims))
+    elif variant == "narrative":
+        lines.extend(_render_finding_narrative(claims))
+    else:
+        lines.extend(_render_finding_verdict(claims))
+
+    lines.append("")
+    return lines
+
+
+def _render_finding_verdict(claims: list[dict[str, Any]]) -> list[str]:
+    supporting = [c for c in claims if not c.get("mixed_evidence")]
+    conflicting = [c for c in claims if c.get("mixed_evidence")]
+    lines: list[str] = []
+    if supporting:
+        lines.append("**Supporting evidence:**")
+        for claim in supporting:
+            lines.append(_format_claim_evidence_line(claim))
+    if conflicting:
+        lines.append("")
+        lines.append("**Conflicting evidence:**")
+        for claim in conflicting:
+            source_text = ", ".join(list(claim.get("primary_sources", []) or [])[:3]) or "not specified"
+            lines.append(f"- {claim.get('statement', '')} — {source_text} (mixed evidence)")
+    return lines
+
+
+def _format_claim_evidence_line(claim: dict[str, Any]) -> str:
+    """Format a single claim as a rich evidence bullet with provenance."""
+    source_text = ", ".join(list(claim.get("primary_sources", []) or [])[:3]) or "not specified"
+    ids_text = ", ".join(list(claim.get("supporting_ids", []) or [])[:4])
+    id_suffix = f" ({ids_text})" if ids_text else ""
+    strength = str(claim.get("support_strength", "")).strip()
+    strength_suffix = f" | strength: {strength}" if strength else ""
+    qualifier_ctx = _format_qualifier_context(claim.get("qualifiers") or {})
+    qualifier_suffix = f" [{qualifier_ctx}]" if qualifier_ctx else ""
+    return f"- {claim.get('statement', '')} — {source_text}{id_suffix}{strength_suffix}{qualifier_suffix}"
+
+
+def _render_finding_tabular(claims: list[dict[str, Any]]) -> list[str]:
+    rows: list[list[Any]] = []
+    for claim in claims:
+        source_text = ", ".join(list(claim.get("primary_sources", []) or [])[:2]) or "-"
+        ids_text = ", ".join(list(claim.get("supporting_ids", []) or [])[:3]) or "-"
+        strength = str(claim.get("support_strength", "")).strip() or "-"
+        mixed = " (mixed)" if claim.get("mixed_evidence") else ""
+        qualifier_ctx = _format_qualifier_context(claim.get("qualifiers") or {})
+        subject_type = _ENTITY_TYPE_LABELS.get(str(claim.get("subject_type", "")).strip(), "")
+        subject_label = claim.get("subject", "-")
+        if subject_type and subject_type not in subject_label:
+            subject_label = f"{subject_label} ({subject_type})"
+        rows.append([
+            subject_label,
+            claim.get("predicate", "").replace("_", " "),
+            claim.get("object", "-"),
+            source_text,
+            ids_text,
+            f"{strength}{mixed}",
+            qualifier_ctx or "-",
+        ])
+    table = _render_markdown_table(
+        ["Subject", "Relationship", "Object", "Source", "Identifiers", "Strength", "Context"],
+        rows,
+    )
+    return [table] if table else []
+
+
+def _render_finding_narrative(claims: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for claim in claims:
+        source_text = ", ".join(list(claim.get("primary_sources", []) or [])[:3]) or "not specified"
+        ids_text = ", ".join(list(claim.get("supporting_ids", []) or [])[:4])
+        id_suffix = f" ({ids_text})" if ids_text else ""
+        qualifier_ctx = _format_qualifier_context(claim.get("qualifiers") or {})
+        qualifier_suffix = f" [{qualifier_ctx}]" if qualifier_ctx else ""
+        lines.append(f"{claim.get('statement', '')} ({source_text}{id_suffix}){qualifier_suffix}.")
+    return [" ".join(lines)]
+
+
+def _render_conflicting_evidence_section(claim_summary: dict[str, Any]) -> list[str]:
+    """Render the Conflicting & Uncertain Evidence section."""
+    conflicts = list(claim_summary.get("mixed_evidence_claims", []) or [])
+    if not conflicts:
+        return []
+    lines = ["### Conflicting & Uncertain Evidence", ""]
+    for conflict in conflicts[:5]:
+        focus = " and ".join(
+            part for part in [
+                str(conflict.get("subject", "")).strip(),
+                str(conflict.get("object", "")).strip(),
+            ] if part
+        ) or "a key claim"
+
+        lines.append(f"### {focus}")
+        lines.append("")
+
+        conflict_claims = list(conflict.get("claims", []) or [])
+        for claim in conflict_claims[:4]:
+            predicate = str(claim.get("predicate", "")).replace("_", " ")
+            sources = ", ".join(list(claim.get("primary_sources", []) or [])[:2]) or "unknown source"
+            lines.append(f"- **{sources}** supports: {claim.get('statement', '')} ({predicate})")
+
+        assessment = str(conflict.get("assessment", "")).replace("_", " ").strip()
+        preferred = str(conflict.get("preferred_interpretation", "")).strip()
+        if preferred:
+            lines.append(f"- **Current lean:** {preferred} ({assessment})")
+        else:
+            lines.append(f"- **Current lean:** No clear preferred interpretation ({assessment})")
+        lines.append(f"- **To resolve:** Validate with an orthogonal source or confirmatory experiment for {focus}.")
+        lines.append("")
+    return lines
+
+
+def _render_sources_consulted(task_state: dict[str, Any]) -> list[str]:
+    """Build Sources Consulted section from step metadata."""
+    seen: dict[str, dict[str, Any]] = {}
+    for step in task_state.get("steps", []):
+        sources = _derive_step_data_sources(step)
+        status = str(step.get("status", "")).strip()
+        goal = str(step.get("goal", "")).strip()
+        for source_name in sources:
+            if source_name in seen:
+                seen[source_name]["steps"].append(goal)
+                if status == "completed":
+                    seen[source_name]["completed"] = True
+            else:
+                seen[source_name] = {
+                    "source": source_name,
+                    "steps": [goal],
+                    "completed": status == "completed",
+                }
+    if not seen:
+        return []
+    rows: list[list[Any]] = []
+    for entry in seen.values():
+        status_text = "Queried" if entry["completed"] else "Attempted"
+        contribution = "; ".join(entry["steps"][:2])
+        if len(entry["steps"]) > 2:
+            contribution += f" (+{len(entry['steps']) - 2} more)"
+        rows.append([entry["source"], status_text, contribution])
+    lines = ["## Sources Consulted", ""]
+    table = _render_markdown_table(["Source", "Status", "Contribution"], rows)
+    if table:
+        lines.append(table)
+        lines.append("")
+    return lines
 
 
 def _build_structured_limitations(
@@ -4119,15 +5176,18 @@ def _build_structured_final_synthesis(task_state: dict[str, Any], raw_markdown: 
         str(task_state.get("objective", "")).strip(),
     )
 
+    model_answer_text = sections.get("answer", "") or sections.get("summary", "")
+    model_findings_text = sections.get("detailed_findings", "") or sections.get("key_findings", "")
+
     return {
         "coverage_status": _compute_coverage_status(task_state),
         "claim_synthesis_summary": claim_summary,
-        "direct_answer": _build_structured_summary_markdown(
+        "answer": _build_structured_answer_markdown(
             task_state,
             claim_summary,
-            model_summary=sections.get("summary", ""),
+            model_answer=model_answer_text,
         ),
-        "evidence_section_markdown": _normalize_evidence_section_markdown(sections.get("evidence_and_methodology", "")),
+        "model_findings_text": model_findings_text.strip(),
         "limitations": _build_structured_limitations(
             task_state,
             claim_summary,
@@ -4184,49 +5244,54 @@ def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -
 
 
 def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict[str, Any]) -> str:
-    """Fallback renderer: builds the report from structured synthesis fields."""
+    """Render the final report from structured synthesis fields."""
     objective = str(task_state.get("objective", "")).strip()
-    completed = _completed_step_count(task_state)
-    total = _total_step_count(task_state)
-    failed = _failed_step_count(task_state)
+    claim_summary = dict(synthesis.get("claim_synthesis_summary", {}) or {})
 
     lines = ["# AI Co-Scientist Report", ""]
 
     if objective:
         lines += [f"> **Research Question:** {objective}", "", "---", ""]
 
-    # Summary
-    lines += ["## Summary", ""]
-    direct_answer = str(synthesis.get("direct_answer", "")).strip()
-    if direct_answer:
-        lines.append(direct_answer)
+    # TLDR
+    lines += ["## TLDR", ""]
+    answer = str(synthesis.get("answer", "")).strip()
+    if answer:
+        lines.append(answer)
         lines.append("")
-    claim_summary = dict(synthesis.get("claim_synthesis_summary", {}) or {})
-    mixed_claims_table = _build_mixed_evidence_claims_table(claim_summary)
-    if mixed_claims_table:
-        lines += ["### Mixed-Evidence Claims", "", mixed_claims_table, ""]
 
-    # Evidence and Methodology
-    lines += ["## Evidence and Methodology", ""]
-    evidence_section_markdown = str(synthesis.get("evidence_section_markdown", "")).strip()
-    if evidence_section_markdown:
-        lines.append(evidence_section_markdown)
-        lines.append("")
-    else:
-        lines.append(_build_methodology_overview(task_state, completed, total, failed))
-        lines.append("")
-        for step in task_state.get("steps", []):
-            lines += _render_step_subsection(step)
+    # Evidence Breakdown (Detailed Findings, Conflicting Evidence, References, Next Steps)
+    lines += ["## Evidence Breakdown", ""]
 
-    # Limitations
+    # Detailed Findings (model-authored thematic prose)
+    model_findings = str(synthesis.get("model_findings_text", "")).strip()
+    if model_findings:
+        lines.append(model_findings)
+        lines.append("")
+
+    # Conflicting & Uncertain Evidence
+    conflict_lines = _render_conflicting_evidence_section(claim_summary)
+    if conflict_lines:
+        lines.extend(conflict_lines)
+
+    # Recommended Next Steps (within Evidence Breakdown)
+    next_actions = [str(x).strip() for x in synthesis.get("next_actions", []) if str(x).strip()]
+    if not next_actions:
+        next_actions = _fallback_next_actions_from_task_state(task_state)
+    if next_actions:
+        lines += ["### Recommended Next Steps", ""]
+        for i, item in enumerate(next_actions[:20], start=1):
+            lines.append(f"{i}. {item}")
+        lines.append("")
+
+    # Limitations (top-level, own section)
     limitations = [str(x).strip() for x in synthesis.get("limitations", []) if str(x).strip()]
     if limitations:
         lines += ["## Limitations", ""]
         lines.extend(f"- {item}" for item in limitations[:20])
         lines.append("")
 
-    # References — only literature IDs go into the numbered References section;
-    # database IDs get clickable inline links via _hyperlink_inline_ids.
+    # References (last section)
     current_text = "\n".join(lines)
     inline_ids = _extract_inline_ids_from_text(current_text)
     lit_ids = [eid for eid in inline_ids if _is_literature_id(eid)]
@@ -4240,16 +5305,6 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
     body_so_far = _hyperlink_inline_ids(body_so_far, ref_map)
     body_so_far = _expand_reference_only_body_lines(body_so_far, lit_ids)
     lines = body_so_far.split("\n")
-
-    # Next Steps (after References so _strip_next_steps_section in ui_server preserves References)
-    next_actions = [str(x).strip() for x in synthesis.get("next_actions", []) if str(x).strip()]
-    if not next_actions:
-        next_actions = _fallback_next_actions_from_task_state(task_state)
-    if next_actions:
-        lines += ["## Potential Next Steps", ""]
-        for i, item in enumerate(next_actions[:20], start=1):
-            lines.append(f"{i}. {item}")
-        lines.append("")
 
     return "\n".join(lines).strip()
 
@@ -4299,8 +5354,6 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
 
     focused_catalog = _format_tool_catalog(focused_tools)
     routing_guidance = _format_step_routing_guidance(tool_hint, focused_tools)
-    structured_observation_guidance = _format_structured_observation_guidance(tool_hint, focused_tools)
-
     payload = {
         "schema": "react_step_context.v1",
         "objective": task_state.get("objective", ""),
@@ -4329,15 +5382,17 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
         )
     if routing_guidance:
         instructions.append(routing_guidance)
-    if structured_observation_guidance:
-        instructions.append(structured_observation_guidance)
 
     instructions.append(
         f"Execute ONLY step {active_step.get('id')}. "
         f"There are {remaining_count - 1} more step(s) after this one. "
-        "Call at least one tool, then return ONLY valid JSON matching "
-        "`step_execution_result.v1`. Include your reasoning_trace. "
-        "Do not include markdown fences or extra commentary."
+        "Call at least one tool, then write a clear findings summary. "
+        "Include all evidence identifiers (PMID, DOI, NCT, etc.) inline "
+        "and state key findings as explicit claims."
+    )
+    instructions.append(
+        "If tool calls return errors (e.g. schema changes, no matching signature, field not found), "
+        "conclude the step now with a brief note about the limitations. Do not retry failing queries more than once."
     )
     return instructions
 
@@ -4552,7 +5607,8 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
 
     instructions.append(
         "Return user-facing Markdown (not JSON). Follow the section structure from your instructions exactly: "
-        "Summary, Evidence and Methodology (with per-step subsections), Limitations, Potential Next Steps."
+        "Answer (comprehensive, 2-4 paragraphs), Detailed Findings (organized by theme with ### subsections, not by step), "
+        "Conflicting & Uncertain Evidence (if any), Recommended Next Steps, Limitations."
     )
     return instructions
 
@@ -4737,9 +5793,9 @@ def _make_planner_before_model_callback(*, require_approval: bool, model_name: s
                 callback_context.state[STATE_WORKFLOW_TASK] = None
                 callback_context.state[STATE_PLAN_PENDING_APPROVAL] = False
                 llm_request.config = llm_request.config or types.GenerateContentConfig()
-                # 2.5 Flash doesn't support thinking_config
-                if "3.1" in str(model_name):
-                    llm_request.config.thinking_config = THINKING_CONFIG
+                tc = _thinking_config_for_model(str(model_name))
+                if tc:
+                    llm_request.config.thinking_config = tc
                 llm_request.config.response_mime_type = "application/json"
                 llm_request.append_instructions([
                     f"Revise the previous plan for this objective: {original_objective}",
@@ -4772,8 +5828,9 @@ def _make_planner_before_model_callback(*, require_approval: bool, model_name: s
             callback_context.state[STATE_WORKFLOW_TASK] = None
 
         llm_request.config = llm_request.config or types.GenerateContentConfig()
-        if "3.1" in str(model_name):
-            llm_request.config.thinking_config = THINKING_CONFIG
+        tc = _thinking_config_for_model(str(model_name))
+        if tc:
+            llm_request.config.thinking_config = tc
         llm_request.config.response_mime_type = "application/json"
         llm_request.append_instructions([_planner_json_instruction_suffix()])
         return None
@@ -4918,6 +5975,12 @@ def _hitl_skip_agent(*, callback_context: CallbackContext) -> types.Content | No
 def _react_skip_if_done(*, callback_context: CallbackContext) -> types.Content | None:
     """before_agent_callback for step_executor: skip entirely when no work remains."""
     if bool(callback_context.state.get(STATE_FINALIZE_REQUESTED, False)):
+        task_state = _get_task_state(callback_context)
+        if task_state:
+            task_state["plan_status"] = "completed"
+            task_state["current_step_id"] = None
+            callback_context.state[STATE_WORKFLOW_TASK] = task_state
+            callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
         return types.Content(role="model", parts=[])
     if str(callback_context.state.get(STATE_TURN_ABORT_REASON, "")).strip():
         return types.Content(role="model", parts=[])
@@ -4976,56 +6039,96 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
         _append_executor_rendered(callback_context, rendered)
         return _make_text_response(rendered)
 
-    retries = int(callback_context.state.get(STATE_REACT_PARSE_RETRIES, 0) or 0)
+    prev_active = str(callback_context.state.get(STATE_EXECUTOR_ACTIVE_STEP_ID, "") or "").strip()
     callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = current_step_id
     callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = str(active_step.get("status", "pending"))
-    if retries == 0:
-        callback_context.state[STATE_EXECUTOR_LAST_ERROR] = ""
+    if prev_active != current_step_id:
+        callback_context.state[STATE_EXECUTOR_REASONING_TRACE] = ""
+        _set_tool_log(callback_context, [])
+    else:
+        # Within the same step's tool loop -- update last tool_log entry with result
+        tool_log = _get_tool_log(callback_context)
+        contents = getattr(llm_request, "contents", None) or []
+        for content in reversed(contents):
+            parts = getattr(content, "parts", None)
+            if not parts:
+                continue
+            for part in parts:
+                fr = getattr(part, "function_response", None)
+                if fr is None:
+                    continue
+                tool_name = str(getattr(fr, "name", "") or "").strip()
+                result_desc = _describe_tool_result(tool_name, getattr(fr, "response", None))
+                for entry in tool_log:
+                    if entry.get("status") == "called" and entry.get("raw_tool") == tool_name:
+                        entry["status"] = "done"
+                        entry["result"] = result_desc
+                        break
+                else:
+                    source = tool_registry.TOOL_SOURCE_NAMES.get(tool_name, tool_name)
+                    tool_log.append({"tool": source, "raw_tool": tool_name, "status": "done",
+                                     "summary": result_desc})
+            break
+        _set_tool_log(callback_context, tool_log)
+        obs = _summarize_latest_tool_results(llm_request)
+        if obs:
+            prev_trace = str(callback_context.state.get(STATE_EXECUTOR_REASONING_TRACE, "") or "")
+            callback_context.state[STATE_EXECUTOR_REASONING_TRACE] = (prev_trace + "\n" + obs).strip()
     active_step["status"] = "in_progress"
     callback_context.state[STATE_WORKFLOW_TASK] = task_state
 
-    logger.info("[react:before] executing step %s (retry=%d): %s", current_step_id, retries, active_step.get("goal", ""))
+    logger.info("[react:before] executing step %s: %s", current_step_id, active_step.get("goal", ""))
 
     llm_request.config = llm_request.config or types.GenerateContentConfig()
-    if "3.1" in str(DEFAULT_MODEL):
-        llm_request.config.thinking_config = THINKING_CONFIG
+    tc = _thinking_config_for_model(str(DEFAULT_MODEL))
+    if tc:
+        llm_request.config.thinking_config = tc
     llm_request.config.response_mime_type = None
     instructions = _react_step_context_instructions(task_state, active_step)
-    if retries > 0:
-        last_prose = str(callback_context.state.get(STATE_EXECUTOR_LAST_PROSE, "") or "").strip()
-        if last_prose:
-            instructions.append(
-                "CRITICAL — JSON FORMAT REQUIRED: Your previous response was plain prose, not JSON. "
-                "Your previous output was:\n"
-                f"---\n{last_prose}\n---\n"
-                "Do NOT make any more tool calls. Do NOT repeat the prose. "
-                "Using ONLY the findings above, output a single raw JSON object matching "
-                "`step_execution_result.v1`. The very first character of your response MUST be `{`."
-            )
-        else:
-            instructions.append(
-                "CRITICAL — JSON FORMAT REQUIRED: Your previous response could not be parsed as JSON. "
-                "You MUST return ONLY a raw JSON object matching `step_execution_result.v1`. "
-                "Do NOT make additional tool calls. Do NOT write prose or markdown. "
-                "The very first character of your response MUST be `{`."
-            )
     llm_request.append_instructions(instructions)
     return None
 
 
 def _react_after_model_callback(*, callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
-    """ReAct step executor: parse single-step result, store trace, advance."""
+    """ReAct step executor: accept prose or JSON, extract structure post-hoc, advance."""
     if bool(callback_context.state.get(STATE_MODEL_ERROR_PASSTHROUGH, False)):
         callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = False
         callback_context.state[STATE_EXECUTOR_BUFFER] = ""
-        logger.info("[react:after] model error passthrough — skipping JSON parse")
+        logger.info("[react:after] model error passthrough — skipping parse")
         return None
 
     if _llm_response_has_function_call(llm_response):
-        logger.debug("[react:after] response has function_call — continuing tool loop")
         callback_context.state[STATE_EXECUTOR_BUFFER] = ""
-        text_alongside = _llm_response_text(llm_response)
-        if text_alongside.strip():
+        fc_list = _extract_function_calls(llm_response)
+        tool_names = [fc["name"] for fc in fc_list]
+        thought_text = _llm_response_thought_text(llm_response).strip()
+        text_alongside = _llm_response_text(llm_response).strip()
+
+        # Build structured tool_log entries from actual function call data
+        tool_log = _get_tool_log(callback_context)
+        for fc in fc_list:
+            source = tool_registry.TOOL_SOURCE_NAMES.get(fc["name"], fc["name"])
+            description = _describe_tool_call(fc["name"], fc["args"])
+            tool_log.append({"tool": source, "raw_tool": fc["name"], "status": "called",
+                             "summary": description})
+        _set_tool_log(callback_context, tool_log)
+
+        # Keep the raw reasoning trace for backward compat
+        trace_parts: list[str] = []
+        if tool_names:
+            source_labels = [tool_registry.TOOL_SOURCE_NAMES.get(t, t) for t in tool_names]
+            trace_parts.append(f"ACT: Called {', '.join(source_labels)}")
+        if thought_text:
+            trace_parts.append(thought_text)
+        if text_alongside:
+            trace_parts.append(text_alongside)
+        if trace_parts:
+            chunk = "\n".join(trace_parts)
+            prev_trace = str(callback_context.state.get(STATE_EXECUTOR_REASONING_TRACE, "") or "")
+            callback_context.state[STATE_EXECUTOR_REASONING_TRACE] = (prev_trace + "\n" + chunk).strip()
+        logger.info("[react:after] function_call: %s, tool_log_len=%d",
+                    ", ".join(tool_names), len(tool_log))
+        if text_alongside:
             return _replace_llm_response_text(llm_response, "")
         return None
 
@@ -5038,159 +6141,107 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
         logger.debug("[react:after] empty text (no-op iteration)")
         return None
 
-    logger.info("[react:after] received text (%d chars), parsing step result", len(text))
+    buffered = str(callback_context.state.get(STATE_EXECUTOR_BUFFER, "") or "")
+    callback_context.state[STATE_EXECUTOR_BUFFER] = ""
+    tool_reasoning = str(callback_context.state.get(STATE_EXECUTOR_REASONING_TRACE, "") or "").strip()
+    callback_context.state[STATE_EXECUTOR_REASONING_TRACE] = ""
+    final_text = (buffered + text).strip()
+    full_text = (tool_reasoning + "\n\n" + final_text).strip() if (tool_reasoning and final_text) else (tool_reasoning or final_text)
 
-    parsed, parse_error = _consume_buffered_json_object(
-        callback_context,
-        buffer_key=STATE_EXECUTOR_BUFFER,
-        llm_response=llm_response,
-    )
+    logger.info("[react:after] received text (%d chars, %d tool-reasoning), processing step result",
+                len(full_text), len(tool_reasoning))
 
     task_state = _get_task_state(callback_context)
     active_step_id = str(callback_context.state.get(STATE_EXECUTOR_ACTIVE_STEP_ID, "") or "")
-    prev_status = str(callback_context.state.get(STATE_EXECUTOR_PREV_STEP_STATUS, "") or "pending")
 
-    def _restore_step_status_on_failure() -> None:
-        if not task_state or not active_step_id:
-            return
-        try:
-            _, step = _find_step(task_state, active_step_id)
-        except Exception:  # noqa: BLE001
-            return
-        step["status"] = prev_status or "pending"
-        callback_context.state[STATE_WORKFLOW_TASK] = task_state
+    if not task_state or not active_step_id:
+        logger.warning("[react:after] no task state or active step — ignoring text")
+        return _replace_llm_response_text(llm_response, "")
 
-    retries = int(callback_context.state.get(STATE_REACT_PARSE_RETRIES, 0) or 0)
+    # --- Build step result: try JSON first, then post-hoc extraction, then minimal ---
+    parsed, _ = _parse_json_object_from_text(full_text)
+    reasoning_trace = ""
 
-    def _handle_step_error(error_label: str, error_msg: str) -> LlmResponse:
-        """Retry the step or mark it blocked after max retries."""
-        _restore_step_status_on_failure()
-        callback_context.state[STATE_EXECUTOR_LAST_ERROR] = f"{error_label}: {error_msg}".strip()
-        if retries < MAX_REACT_PARSE_RETRIES:
-            callback_context.state[STATE_REACT_PARSE_RETRIES] = retries + 1
-            logger.warning(
-                "[react:after] %s for step %s (retry %d/%d) — will retry",
-                error_label, active_step_id, retries + 1, MAX_REACT_PARSE_RETRIES,
-            )
-            return _replace_llm_response_text(llm_response, "")
+    if parsed is not None and parsed.get("schema") == STEP_RESULT_SCHEMA:
+        logger.info("[react:after] model produced valid JSON for %s", active_step_id)
+        reasoning_trace = str(parsed.pop("reasoning_trace", "") or "").strip()
+    else:
+        parsed = None
+        logger.info("[react:after] prose output for %s — running post-hoc extraction", active_step_id)
+        extracted = _extract_structure_from_prose(full_text, active_step_id)
 
-        callback_context.state[STATE_REACT_PARSE_RETRIES] = 0
-        last_prose = str(callback_context.state.get(STATE_EXECUTOR_LAST_PROSE, "") or "").strip()
-        callback_context.state[STATE_EXECUTOR_LAST_PROSE] = ""
+        regex_ids = _extract_evidence_ids_from_text(full_text)
 
-        # If the model returned actual prose (it gathered data but couldn't format JSON),
-        # salvage it as a completed step rather than blocking entirely.
-        if last_prose and task_state and active_step_id:
-            logger.warning(
-                "[react:after] %s for step %s — max retries exhausted but prose output found; "
-                "salvaging as completed step",
-                error_label, active_step_id,
-            )
-            try:
-                _, step = _find_step(task_state, active_step_id)
-                step["status"] = "completed"
-                step["result_summary"] = last_prose[:1500]
-                step["step_progress_note"] = "Recovered step result from prose after repeated JSON formatting failures."
-                step["reasoning_trace"] = (
-                    f"Partial result (JSON formatting failed after {MAX_REACT_PARSE_RETRIES + 1} "
-                    f"attempts). {error_label}: {error_msg}"
-                )
-                step["execution_metrics"] = _build_step_execution_metrics(
-                    step,
-                    {
-                        "step_id": active_step_id,
-                        "status": "completed",
-                        "tools_called": list(step.get("tools_called", []) or []),
-                        "evidence_ids": list(step.get("evidence_ids", []) or []),
-                        "open_gaps": list(step.get("open_gaps", []) or []),
-                    },
-                    parse_retry_count=MAX_REACT_PARSE_RETRIES + 1,
-                )
-                next_id = _next_pending_step_id(task_state)
-                task_state["current_step_id"] = next_id
-                new_plan_status = "completed" if next_id is None else "ready"
-                task_state["plan_status"] = new_plan_status
-                _refresh_task_state_derived_state(task_state)
-                callback_context.state[STATE_WORKFLOW_TASK] = task_state
-                if new_plan_status == "completed":
-                    callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
-                callback_context.state[STATE_EXECUTOR_LAST_ERROR] = ""
-                rendered = (
-                    f"### {active_step_id} · `partial` _(output recovered from prose)_\n\n"
-                    f"{last_prose[:800]}{'…' if len(last_prose) > 800 else ''}\n\n---"
-                )
-                _append_executor_rendered(callback_context, rendered)
-                return _replace_llm_response_text(llm_response, rendered)
-            except Exception:  # noqa: BLE001
-                pass
-
-        logger.error(
-            "[react:after] %s for step %s — max retries exhausted, marking blocked",
-            error_label, active_step_id,
-        )
-        if task_state and active_step_id:
-            try:
-                _, step = _find_step(task_state, active_step_id)
-                step["status"] = "blocked"
-                step["step_progress_note"] = f"Execution failed after repeated JSON formatting errors: {error_label}"
-                step["result_summary"] = f"Step failed after {MAX_REACT_PARSE_RETRIES + 1} attempts: {error_msg}"
-                step["reasoning_trace"] = f"Execution failed: {error_label}. {error_msg}"
-                step["execution_metrics"] = _build_step_execution_metrics(
-                    step,
-                    {
-                        "step_id": active_step_id,
-                        "status": "blocked",
-                        "tools_called": list(step.get("tools_called", []) or []),
-                        "evidence_ids": [],
-                        "open_gaps": list(step.get("open_gaps", []) or []),
-                    },
-                    parse_retry_count=MAX_REACT_PARSE_RETRIES + 1,
-                )
-                next_id = _next_pending_step_id(task_state)
-                task_state["current_step_id"] = next_id
-                new_plan_status = "completed" if next_id is None else "blocked"
-                task_state["plan_status"] = new_plan_status
-                _refresh_task_state_derived_state(task_state)
-                callback_context.state[STATE_WORKFLOW_TASK] = task_state
-                if new_plan_status == "completed":
-                    callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
-            except Exception:  # noqa: BLE001
-                pass
-        rendered = (
-            f"### {active_step_id} · `blocked`\n\n"
-            f"**Reason:** {error_label} — {error_msg}\n\n"
-            f"_Attempted {MAX_REACT_PARSE_RETRIES + 1} times. Moving to next step._\n\n---"
-        )
-        _append_executor_rendered(callback_context, rendered)
-        return _replace_llm_response_text(llm_response, rendered)
-
-    if parsed is None or task_state is None:
-        logger.warning("[react:after] parse failed (parse_error=%s)", parse_error)
-        raw_combined = (str(callback_context.state.get(STATE_EXECUTOR_BUFFER, "") or "") + text).strip()
-        if raw_combined:
-            callback_context.state[STATE_EXECUTOR_LAST_PROSE] = raw_combined[:3000]
-        return _handle_step_error("JSON parse error", parse_error or "Failed to parse step result JSON")
-
-    reasoning_trace = str(parsed.pop("reasoning_trace", "") or "").strip()
+        if extracted is not None:
+            existing_ids = set(extracted.get("evidence_ids") or [])
+            for eid in regex_ids:
+                if eid not in existing_ids:
+                    extracted.setdefault("evidence_ids", []).append(eid)
+                    existing_ids.add(eid)
+            parsed = extracted
+            reasoning_trace = str(parsed.pop("reasoning_trace", "") or "").strip()
+        else:
+            logger.warning("[react:after] extraction failed for %s — using minimal result", active_step_id)
+            parsed = {
+                "schema": STEP_RESULT_SCHEMA,
+                "step_id": active_step_id,
+                "status": "completed",
+                "step_progress_note": "Step completed (structure extraction unavailable).",
+                "result_summary": full_text[:2000],
+                "evidence_ids": regex_ids,
+                "open_gaps": [],
+                "suggested_next_searches": [],
+                "tools_called": [],
+                "data_sources_queried": [],
+                "structured_observations": [],
+            }
 
     if "schema" not in parsed:
         parsed["schema"] = STEP_RESULT_SCHEMA
+    if not parsed.get("step_id"):
+        parsed["step_id"] = active_step_id
+    if not parsed.get("step_progress_note"):
+        summary = str(parsed.get("result_summary", "") or "")
+        parsed["step_progress_note"] = summary[:200] if summary else "Step completed."
 
     try:
         validated = _apply_step_execution_result_to_task_state(
             task_state,
             parsed,
-            parse_retry_count=retries,
+            parse_retry_count=0,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.error("[react:after] validation error: %s", exc)
-        return _handle_step_error("Validation error", str(exc))
+        logger.error("[react:after] validation error for %s: %s — falling back to minimal", active_step_id, exc)
+        try:
+            _, step = _find_step(task_state, active_step_id)
+            step["status"] = "completed"
+            step["result_summary"] = full_text[:2000]
+            step["step_progress_note"] = "Step completed (validation fallback)."
+            step["evidence_ids"] = _extract_evidence_ids_from_text(full_text)
+            step["execution_metrics"] = _build_step_execution_metrics(
+                step,
+                {"step_id": active_step_id, "status": "completed", "tools_called": [], "evidence_ids": step["evidence_ids"], "open_gaps": []},
+                parse_retry_count=0,
+            )
+            next_id = _next_pending_step_id(task_state)
+            task_state["current_step_id"] = next_id
+            task_state["plan_status"] = "completed" if next_id is None else "ready"
+            _refresh_task_state_derived_state(task_state)
+            validated = {"step_id": active_step_id, "status": "completed"}
+        except Exception:  # noqa: BLE001
+            logger.error("[react:after] fallback also failed for %s", active_step_id)
+            return _replace_llm_response_text(llm_response, "")
 
-    callback_context.state[STATE_REACT_PARSE_RETRIES] = 0
-
-    if reasoning_trace:
+    tool_log = _get_tool_log(callback_context)
+    try:
         _, step = _find_step(task_state, validated["step_id"])
-        step["reasoning_trace"] = reasoning_trace
+        if reasoning_trace:
+            step["reasoning_trace"] = reasoning_trace
+        step["tool_reasoning"] = tool_reasoning
+        step["executor_prose"] = final_text
+        step["tool_log"] = tool_log
+    except Exception:  # noqa: BLE001
+        pass
 
     completed = _completed_step_count(task_state)
     total = _total_step_count(task_state)
@@ -5203,12 +6254,14 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
     callback_context.state[STATE_WORKFLOW_TASK] = task_state
     callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = ""
     callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = ""
-    callback_context.state[STATE_EXECUTOR_LAST_ERROR] = ""
 
     if new_plan_status == "completed":
         callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
 
-    rendered = _render_react_step_progress(task_state, validated, reasoning_trace)
+    rendered = _render_react_step_progress(
+        task_state, validated, reasoning_trace,
+        tool_reasoning=tool_reasoning, executor_prose=final_text,
+    )
     _append_executor_rendered(callback_context, rendered)
     return _replace_llm_response_text(llm_response, rendered)
 
@@ -5294,7 +6347,8 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
       name, therapeuticAreas, synonyms, ontology. Always query by name first, accept whatever ID is returned.
     - **evidence**: targetId (Ensembl ID), diseaseId (MONDO or EFO ID), datasourceId, datatypeId,
       score, literature, drugId. Filter by targetId + diseaseId, NOT gene symbols.
-    - **known_drug**, **drug_molecule**, **drug_mechanism_of_action**, **drug_warning**: drug data
+    - **known_drug**, **drug_molecule**, **drug_mechanism_of_action**, **drug_warning**: drug data.
+      IMPORTANT: Always run `list_bigquery_tables(dataset='open_targets_platform', table='known_drug')` (and same for drug_mechanism_of_action) to get exact column names before querying — schema can change. Use targetId (Ensembl ID) to join known_drug to targets; there is no drugId field in the target table. For IN UNNEST, use correct types: `col IN UNNEST(ARRAY<STRING>['a','b'])` not `col IN UNNEST(nested_struct)`.
     - **evidence_*** (evidence_gwas_credible_sets, evidence_chembl, evidence_clingen, etc.): typed evidence
     - **openfda_significant_adverse_drug_reactions**: post-marketing safety signals
     - **go**, **mouse_phenotype**, **literature**: gene ontology, phenotypes, literature mining

@@ -74,18 +74,54 @@ function inlineMarkdown(text) {
 function markdownToHtml(markdown) {
   const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
   const html = [];
-  let inUl = false;
-  let inOl = false;
   let inCode = false;
   let codeBuffer = [];
   let inBlockquote = false;
+  const listStack = [];
 
+  const closeCurrentList = () => {
+    const current = listStack.pop();
+    if (!current) return;
+    if (current.liOpen) html.push("</li>");
+    html.push(`</${current.type}>`);
+  };
+  const closeListsToIndent = (targetIndent = -1) => {
+    while (listStack.length && listStack[listStack.length - 1].indent > targetIndent) {
+      closeCurrentList();
+    }
+  };
   const closeLists = () => {
-    if (inUl) { html.push("</ul>"); inUl = false; }
-    if (inOl) { html.push("</ol>"); inOl = false; }
+    closeListsToIndent(-1);
   };
   const closeBlockquote = () => {
     if (inBlockquote) { html.push("</blockquote>"); inBlockquote = false; }
+  };
+  const openList = (type, indent, start = 1) => {
+    if (type === "ol") {
+      html.push(Number.isFinite(start) && start > 1 ? `<ol start="${start}">` : "<ol>");
+    } else {
+      html.push("<ul>");
+    }
+    listStack.push({ type, indent, liOpen: false });
+  };
+  const renderListItem = ({ type, indent, content, anchorHtml: itemAnchorHtml, start = 1 }) => {
+    closeBlockquote();
+    closeListsToIndent(indent);
+
+    let current = listStack[listStack.length - 1];
+    if (!current || indent > current.indent) {
+      openList(type, indent, start);
+      current = listStack[listStack.length - 1];
+    } else if (current.type !== type || current.indent !== indent) {
+      closeCurrentList();
+      openList(type, indent, start);
+      current = listStack[listStack.length - 1];
+    }
+
+    if (current.liOpen) html.push("</li>");
+    html.push("<li>");
+    current.liOpen = true;
+    html.push(`${itemAnchorHtml}${inlineMarkdown(content)}`);
   };
   const looksLikeTableRow = (value) => {
     const text = String(value || "").trim();
@@ -248,23 +284,14 @@ function markdownToHtml(markdown) {
       continue;
     }
 
-    const ul = trimmed.match(/^[-*]\s+(.+)$/);
-    if (ul) {
-      if (inOl) { html.push("</ol>"); inOl = false; }
-      if (!inUl) { html.push("<ul>"); inUl = true; }
-      html.push(`<li>${anchorHtml}${inlineMarkdown(ul[1])}</li>`);
-      continue;
-    }
-
-    const ol = trimmed.match(/^(\d+)\.\s+(.+)$/);
-    if (ol) {
-      if (inUl) { html.push("</ul>"); inUl = false; }
-      if (!inOl) {
-        const start = Number(ol[1] || "1");
-        html.push(Number.isFinite(start) && start > 1 ? `<ol start="${start}">` : "<ol>");
-        inOl = true;
-      }
-      html.push(`<li>${anchorHtml}${inlineMarkdown(ol[2])}</li>`);
+    const listMatch = line.match(/^(\s*)([-*]|\d+\.)\s+(.+)$/);
+    if (listMatch) {
+      const indent = (listMatch[1] || "").replace(/\t/g, "  ").length;
+      const marker = listMatch[2] || "";
+      const content = listMatch[3] || "";
+      const type = /^\d+\.$/.test(marker) ? "ol" : "ul";
+      const start = type === "ol" ? Number.parseInt(marker, 10) || 1 : 1;
+      renderListItem({ type, indent, content, anchorHtml, start });
       continue;
     }
 
@@ -488,7 +515,7 @@ function reactTraceLines({ trace = "", phases = null } = {}) {
   const hasPhases = phaseMap && order.some((key) => String(phaseMap[key] || "").trim());
   if (!normalizedTrace && !hasPhases) return lines;
 
-  lines.push("**ReAct Trace**");
+  lines.push("**Tool Trace**");
   lines.push("");
 
   if (hasPhases) {
@@ -553,16 +580,7 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
     needs_clarification: "Clarification required to proceed.",
   };
 
-  let title = "";
-  if (normalizedStatus === "completed") {
-    title = "Completed";
-  } else if (stepsTotal > 0) {
-    title = `Step ${stepsCompleted}/${stepsTotal}`;
-  } else if (normalizedStatus === "queued") {
-    title = "Starting";
-  } else {
-    title = "Research log";
-  }
+  const title = "Research log";
 
   let summary = "";
   if (normalizedStatus === "completed" && (stepsTotal > 0 || latestSummary?.summary)) {
@@ -602,10 +620,6 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
   }
   if (stepPips.length) {
     preview = stepPips.join("  ·  ");
-    if (stepsTotal > stepPips.length) {
-      const remaining = stepsTotal - stepPips.length;
-      preview += `  ·  ${remaining} remaining`;
-    }
   } else if (latestLine) {
     preview = latestLine;
   } else if (normalizedStatus === "completed") {
@@ -621,64 +635,49 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
       const sid = String(step.id || "").trim();
       const st = String(step.status || "pending").trim();
       const goal = String(step.goal || "").trim();
-      const icon = st === "completed" ? "✓" : st === "blocked" ? "✗" : st === "pending" ? "○" : "…";
-      details.push(`### ${icon} ${sid} — ${goal}`);
-      if (st === "completed" || st === "blocked") {
-        const progressNote = String(step.step_progress_note || "").trim();
-        if (progressNote) details.push(progressNote);
-        const reasoningTrace = String(step.reasoning_trace || "").trim();
-        if (reasoningTrace) {
-          details.push(...reactTraceLines({ trace: reasoningTrace }));
-        }
-        const resultSummary = String(step.result_summary || "").trim();
-        if (resultSummary) {
-          details.push(resultSummary);
-        }
-        const tools = Array.isArray(step.tools_called) ? step.tools_called : [];
-        if (tools.length) {
-          details.push(`**Sources:** ${tools.map((t) => `\`${t}\``).join(", ")}`);
-        }
-        const evidence = Array.isArray(step.evidence_ids) ? step.evidence_ids : [];
-        if (evidence.length) {
-          details.push(`**Evidence:** ${evidence.slice(0, 6).map((e) => `\`${e}\``).join(", ")}`);
-        }
-        const gaps = Array.isArray(step.open_gaps) ? step.open_gaps : [];
-        if (gaps.length) {
-          details.push(`**Gaps:** ${gaps.slice(0, 3).join("; ")}`);
-        }
-      }
-      details.push("");
-    }
-  } else if (stepEvents.length > 0) {
-    for (const event of stepEvents) {
-      const m = event?.metrics || {};
-      const sid = String(m.step_id || "").trim();
-      const st = String(m.step_status || "completed").trim();
-      const goal = String(m.goal || "").trim();
+
+      // Only show completed, blocked, or in_progress steps — hide future pending steps
+      if (st === "pending") continue;
+
       const icon = st === "completed" ? "✓" : st === "blocked" ? "✗" : "…";
       details.push(`### ${icon} ${sid} — ${goal}`);
-      const findings = String(m.findings || "").trim();
-      if (findings) details.push(findings);
-      const reactTrace = String(m.react_trace || "").trim();
-      const reactPhases = m.react_phases && typeof m.react_phases === "object" ? m.react_phases : null;
-      if (reactTrace || reactPhases) {
-        details.push(...reactTraceLines({ trace: reactTrace, phases: reactPhases }));
+
+      const toolLog = Array.isArray(step.tool_log) ? step.tool_log : [];
+      if (toolLog.length > 0) {
+        for (const entry of toolLog) {
+          const summary = String(entry.summary || "").trim();
+          const result = String(entry.result || "").trim();
+          const entryStatus = String(entry.status || "done").trim();
+          const tool = String(entry.tool || "?");
+          let line;
+          if (summary && result) {
+            line = `- ${summary} → ${result}`;
+          } else if (summary) {
+            line = (entryStatus === "called") ? `- ${summary}…` : `- ${summary}`;
+          } else {
+            line = `- **${tool}** — querying…`;
+          }
+          details.push(line);
+        }
+      } else if (st === "in_progress") {
+        const source = String(step.source || step.tool_hint || "").trim();
+        if (source) {
+          details.push(`- **${source}** — querying…`);
+        }
       }
-      const tools = Array.isArray(m.tools) ? m.tools : [];
-      if (tools.length) details.push(`**Sources:** ${tools.map((t) => `\`${t}\``).join(", ")}`);
-      const evidence = Array.isArray(m.evidence) ? m.evidence : [];
-      if (evidence.length) details.push(`**Evidence:** ${evidence.slice(0, 6).map((e) => `\`${e}\``).join(", ")}`);
+
+      if ((st === "completed" || st === "blocked") && Array.isArray(step.structured_observations) && step.structured_observations.length > 0) {
+        const claims = step.structured_observations.slice(0, 3).map((obs) => {
+          const subj = obs?.subject?.label || "?";
+          const pred = obs?.predicate || "?";
+          const obj = obs?.object?.label || "?";
+          const conf = obs?.confidence ? ` [${obs.confidence}]` : "";
+          return `${subj} → ${pred} → ${obj}${conf}`;
+        });
+        details.push(`   → **Claims:** ${claims.join("; ")}`);
+      }
       details.push("");
     }
-  } else if (safeEvents.length > 0) {
-    details.push("### Activity");
-    for (const event of safeEvents.slice(-12)) {
-      const line = String(event?.human_line || event?.type || "").trim();
-      if (!line) continue;
-      details.push(`- ${line}`);
-    }
-  } else {
-    details.push("- Waiting for workflow events.");
   }
 
   return {

@@ -197,13 +197,18 @@ def test_coverage_status_complete_vs_partial():
     assert workflow._compute_coverage_status(task_state) == "complete_plan"
 
 
-def test_react_step_rendering_includes_trace():
+def test_react_step_rendering_compact_tool_log():
     task_state = {
         "objective": "test",
         "plan_status": "ready",
         "current_step_id": "S2",
         "steps": [
-            {"id": "S1", "status": "completed", "goal": "Find papers"},
+            {"id": "S1", "status": "completed", "goal": "Find papers",
+             "tool_log": [
+                 {"tool": "PubMed", "raw_tool": "search_pubmed", "status": "done",
+                  "summary": "Searching PubMed for LRRK2",
+                  "result": "found 5 articles"},
+             ]},
             {"id": "S2", "status": "pending", "goal": "Check trials"},
         ],
     }
@@ -215,13 +220,13 @@ def test_react_step_rendering_includes_trace():
         "evidence_ids": ["PMID:111"],
         "open_gaps": [],
     }
-    rendered = workflow._render_react_step_progress(
-        task_state, result, "Searched PubMed for LRRK2, found 5 relevant RCTs."
-    )
-    assert "ReAct Trace" in rendered
-    assert "LRRK2" in rendered
-    assert "PMID:111" in rendered
-    assert "1/2 steps complete" in rendered
+    rendered = workflow._render_react_step_progress(task_state, result, "")
+    assert "S1" in rendered
+    assert "Find papers" in rendered
+    assert "PubMed" in rendered
+    assert "Searching PubMed for LRRK2" in rendered
+    assert "found 5 articles" in rendered
+    assert "---" in rendered
 
 
 def test_parse_react_phases_structured():
@@ -271,7 +276,7 @@ def test_render_react_trace_block_with_tools():
     )
     lines = workflow._render_react_trace_block(trace, ["run_bigquery_select_query", "list_bigquery_tables"])
     text = "\n".join(lines)
-    assert "ReAct Trace" in text
+    assert "Tool Trace" in text or "ReAct Trace" in text
     assert "Reason:" in text
     assert "Act:" in text
     assert "Observe:" in text
@@ -280,7 +285,7 @@ def test_render_react_trace_block_with_tools():
     assert "BigQuery" in text
 
 
-def test_render_react_step_progress_with_structured_trace():
+def test_render_react_step_progress_with_tool_log_and_claims():
     task_state = {
         "objective": "test",
         "plan_status": "ready",
@@ -289,6 +294,11 @@ def test_render_react_step_progress_with_structured_trace():
             {
                 "id": "S1", "status": "completed", "goal": "Find papers",
                 "tools_called": ["run_bigquery_select_query"],
+                "tool_log": [
+                    {"tool": "BigQuery", "raw_tool": "run_bigquery_select_query",
+                     "status": "done", "summary": "Querying BigQuery (disease)",
+                     "result": "found 5 rows"},
+                ],
             },
             {"id": "S2", "status": "pending", "goal": "Check trials"},
         ],
@@ -300,15 +310,167 @@ def test_render_react_step_progress_with_structured_trace():
         "result_summary": "Found 5 papers.",
         "evidence_ids": ["PMID:111"],
         "open_gaps": [],
+        "structured_observations": [
+            {"subject": {"label": "LRRK2"}, "predicate": "associated_with",
+             "object": {"label": "PD"}, "confidence": "high"},
+        ],
     }
-    trace = "REASON: Need IPF data.\nACT: Queried BigQuery.\nOBSERVE: Found results.\nCONCLUDE: Step complete."
-    rendered = workflow._render_react_step_progress(task_state, result, trace)
-    assert "ReAct Trace" in rendered
-    assert "> **Reason:**" in rendered
-    assert "> **Act:**" in rendered
-    assert "> **Observe:**" in rendered
-    assert "> **Conclude:**" in rendered
-    assert "`run_bigquery_select_query`" in rendered
+    rendered = workflow._render_react_step_progress(task_state, result, "")
+    assert "BigQuery" in rendered
+    assert "Querying BigQuery" in rendered
+    assert "found 5 rows" in rendered
+    assert "Claims" in rendered
+    assert "LRRK2" in rendered
+
+
+def test_describe_tool_call_bigquery():
+    desc = workflow._describe_tool_call(
+        "run_bigquery_select_query",
+        {"query": "SELECT * FROM `open_targets_platform.disease` WHERE name = 'Parkinson'"},
+    )
+    assert "disease" in desc
+    assert "Parkinson" in desc
+
+
+def test_describe_tool_call_bigquery_schema():
+    desc = workflow._describe_tool_call(
+        "list_bigquery_tables",
+        {"dataset_id": "open_targets_platform", "table_name": "target"},
+    )
+    assert "target" in desc
+    assert "schema" in desc.lower() or "inspect" in desc.lower()
+
+
+def test_describe_tool_call_gene_resolver():
+    desc = workflow._describe_tool_call("resolve_gene_identifiers", {"query": "LRRK2"})
+    assert "LRRK2" in desc
+    assert "gene" in desc.lower()
+
+
+def test_describe_tool_call_brain_expression():
+    desc = workflow._describe_tool_call("search_aba_genes", {"query": "LRRK2"})
+    assert "LRRK2" in desc
+    assert "brain" in desc.lower()
+
+
+def test_describe_tool_call_adverse_events():
+    desc = workflow._describe_tool_call("search_fda_adverse_events", {"query": "BIIB122"})
+    assert "BIIB122" in desc
+    assert "adverse" in desc.lower()
+
+
+def test_describe_tool_call_tissue_expression():
+    desc = workflow._describe_tool_call("get_gene_tissue_expression", {"gene": "LRRK2"})
+    assert "LRRK2" in desc
+    assert "expression" in desc.lower()
+
+
+def test_describe_tool_call_chembl():
+    desc = workflow._describe_tool_call("get_chembl_bioactivities", {"query": "CHEMBL123"})
+    assert "CHEMBL123" in desc
+    assert "bioactivity" in desc.lower()
+
+
+def test_describe_tool_call_gwas():
+    desc = workflow._describe_tool_call("search_gwas_associations", {"gene": "LRRK2"})
+    assert "LRRK2" in desc
+    assert "GWAS" in desc
+
+
+def test_describe_tool_call_clingen():
+    desc = workflow._describe_tool_call("get_clingen_gene_curation", {"gene": "LRRK2"})
+    assert "LRRK2" in desc
+    assert "validity" in desc.lower() or "ClinGen" in desc
+
+
+def test_describe_tool_result_error():
+    desc = workflow._describe_tool_result("run_bigquery_select_query", {"error": "syntax error near FROM"})
+    assert "error" in desc.lower()
+    assert "syntax" in desc
+
+
+def test_describe_tool_result_gene():
+    desc = workflow._describe_tool_result(
+        "resolve_gene_identifiers",
+        {"symbol": "LRRK2", "ensembl": {"gene": "ENSG00000188906"}},
+    )
+    assert "LRRK2" in desc
+    assert "ENSG00000188906" in desc
+
+
+def test_describe_tool_result_trials():
+    desc = workflow._describe_tool_result(
+        "search_clinical_trials",
+        {"studies": [{"id": "NCT001"}, {"id": "NCT002"}, {"id": "NCT003"}]},
+    )
+    assert "3" in desc
+    assert "trial" in desc.lower()
+
+
+def test_describe_tool_result_pubmed():
+    desc = workflow._describe_tool_result(
+        "search_pubmed",
+        {"results": [{"pmid": "1"}, {"pmid": "2"}]},
+    )
+    assert "2" in desc
+    assert "article" in desc.lower()
+
+
+def test_describe_tool_result_bigquery_rows():
+    desc = workflow._describe_tool_result(
+        "run_bigquery_select_query",
+        {"rows": [{"a": 1}, {"a": 2}, {"a": 3}, {"a": 4}]},
+    )
+    assert "4" in desc
+    assert "row" in desc.lower()
+
+
+def test_describe_tool_result_bigquery_tables():
+    desc = workflow._describe_tool_result(
+        "list_bigquery_tables",
+        {"tables": ["target", "disease", "drug", "evidence"]},
+    )
+    assert "4" in desc
+    assert "table" in desc.lower()
+
+
+def test_describe_tool_result_mcp_structured():
+    """MCP tools return text starting with 'Summary:\\n{actual summary}'."""
+    desc = workflow._describe_tool_result("list_bigquery_tables", {
+        "content": [{"type": "text", "text":
+            "Summary:\nFound 60 tables in open_targets_platform dataset.\n\nKey Fields:\n- target\n- disease"}],
+        "structuredContent": {
+            "summary": "Summary:",
+            "status": "ok",
+        },
+    })
+    assert "60 tables" in desc
+    assert "open_targets_platform" in desc
+
+
+def test_describe_tool_result_mcp_gene():
+    """MCP gene resolver response."""
+    desc = workflow._describe_tool_result("resolve_gene_identifiers", {
+        "content": [{"type": "text", "text":
+            "Summary:\nLRRK2 (leucine rich repeat kinase 2), Ensembl: ENSG00000188906, Entrez: 120892\n\nKey Fields:\n- symbol: LRRK2"}],
+    })
+    assert "LRRK2" in desc
+    assert "ENSG00000188906" in desc
+
+
+def test_describe_tool_result_mcp_bigquery_query():
+    """MCP BigQuery query response."""
+    desc = workflow._describe_tool_result("run_bigquery_select_query", {
+        "content": [{"type": "text", "text":
+            "Summary:\nReturned 3 rows for LRRK2-Parkinson association query.\n\nKey Fields:\n- score: 0.815"}],
+    })
+    assert "3 rows" in desc
+    assert "LRRK2" in desc
+
+
+def test_describe_tool_result_generic_fallback():
+    desc = workflow._describe_tool_result("some_unknown_tool", {"name": "BRCA1"})
+    assert "BRCA1" in desc
 
 
 def test_resolve_source_label():
@@ -459,9 +621,6 @@ def test_react_step_context_instructions_include_phenotype_routing_guidance():
     instructions = workflow._react_step_context_instructions(task_state, active_step)
     text = "\n".join(instructions)
     assert "Routing guidance for this step's tool_hint `query_monarch_associations`" in text
-    assert "Family: phenotype and rare-disease evidence." in text
-    assert "\"predicate\": \"causal_gene_for\"" in text
-    assert "\"source_tool\": \"get_orphanet_disease_profile\"" in text
     assert "`search_hpo_terms` (Human Phenotype Ontology)" in text
     assert "`get_orphanet_disease_profile` (Orphanet / ORDO)" in text
     assert "Start with `query_monarch_associations`" in text
@@ -554,10 +713,6 @@ def test_react_step_context_instructions_include_pharmacodb_routing_guidance():
     instructions = workflow._react_step_context_instructions(task_state, active_step)
     text = "\n".join(instructions)
     assert "Routing guidance for this step's tool_hint `get_pharmacodb_compound_response`" in text
-    assert "Structured observation guidance for this step" in text
-    assert "Family: drug-response and screening evidence." in text
-    assert "\"predicate\": \"sensitive_in\"" in text
-    assert "\"source_tool\": \"get_pharmacodb_compound_response\"" in text
     assert "`get_gdsc_drug_sensitivity` (GDSC / CancerRxGene)" in text
     assert "`get_prism_repurposing_response` (PRISM Repurposing)" in text
     assert "Start with `get_pharmacodb_compound_response`" in text
@@ -906,22 +1061,18 @@ The model kept useful step-level prose here.
     final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
 
     assert "# AI Co-Scientist Report" in final_markdown
-    assert "## Summary" in final_markdown
-    assert "Overall confidence" not in final_markdown
-    assert "### Evidence Snapshot" not in final_markdown
-    assert "For the question of Assess paclitaxel response in lung cancer, the strongest directly grounded finding is Paclitaxel is sensitive in A549." in final_markdown
-    assert "PRISM Repurposing supports Paclitaxel is resistant in A549" in final_markdown
-    assert "whereas GDSC / CancerRxGene supports Paclitaxel is sensitive in A549." in final_markdown
-    assert "### Top Supported Claims" not in final_markdown
-    assert "Key evidence strands:" in final_markdown
-    assert "- Paclitaxel showed sensitivity in A549. (source: GDSC / CancerRxGene)" in final_markdown
-    assert "- PRISM reported weak or resistant response in A549. (source: PRISM Repurposing)" in final_markdown
-    assert "### Mixed-Evidence Claims" in final_markdown
-    assert "| Claim focus | Assessment | Current lean | Leading sources |" in final_markdown
-    assert "## Evidence and Methodology" in final_markdown
-    assert "Custom evidence narrative from the model." in final_markdown
+    assert "## TLDR" in final_markdown
+    assert "## Key Findings" not in final_markdown
+    assert "Custom evidence narrative from the model" in final_markdown
+    assert "## Conflicting & Uncertain Evidence" in final_markdown
+    assert "Paclitaxel and A549" in final_markdown
+    assert "Paclitaxel is sensitive in A549" in final_markdown
+    assert "GDSC / CancerRxGene" in final_markdown
+    assert "PRISM Repurposing" in final_markdown
     assert "Generic model limitation." in final_markdown
     assert "Resolve the mixed evidence for Paclitaxel and A549" in final_markdown
+    assert "## Recommended Next Steps" in final_markdown
+    assert "## Evidence and Methodology" not in final_markdown
 
 
 def test_informative_model_summary_is_preserved_in_report_summary():
@@ -1017,9 +1168,7 @@ Model-authored evidence narrative.
     final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
 
     assert "LRRK2 appears to remain a high-conviction Parkinson disease target overall" in final_markdown
-    assert "For the question of Determine whether LRRK2 is a high-conviction Parkinson disease target" not in final_markdown
-    assert "### Top Supported Claims" not in final_markdown
-    assert "Key evidence strands:" in final_markdown
+    assert "## TLDR" in final_markdown
 
 
 def test_postprocess_uses_actual_bigquery_backing_source_instead_of_transport_label():
@@ -1164,14 +1313,13 @@ Generic evidence narrative.
 
     final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
 
+    assert "## TLDR" in final_markdown
     assert "the following key findings were identified" not in final_markdown
-    assert "For the question of Find publicly available EEG/MEG and MRI datasets suitable for cross-cohort replication in schizophrenia, the completed searches" in final_markdown
-    assert "Key evidence strands:" not in final_markdown
     assert "OpenNeuro and SchizConnect expose reusable schizophrenia MRI cohorts" in final_markdown
     assert "NEMAR and OpenNeuro provide smaller schizophrenia EEG datasets" in final_markdown
 
 
-def test_postprocess_normalizes_flat_evidence_step_blocks_into_key_findings_list():
+def test_postprocess_renders_model_key_findings_when_no_structured_claims():
     plan = {
         "schema": workflow.PLAN_SCHEMA,
         "objective": "Assess BRAF V600E actionability",
@@ -1192,21 +1340,16 @@ def test_postprocess_normalizes_flat_evidence_step_blocks_into_key_findings_list
     )
     raw_markdown = """# AI Co-Scientist Report
 
-## Summary
+## Answer
 
-This is a vague model summary.
+Dabrafenib is approved for melanoma with BRAF V600E/K mutations.
 
-## Evidence and Methodology
+## Key Findings
 
-One overview paragraph.
+### BRAF-Directed Therapies
 
-Step 4: Retrieve DailyMed labels for BRAF-directed therapies — COMPLETED
-Data Source: DailyMed
-Key Findings: DailyMed labels confirmed several BRAF-directed standard-of-care uses.
+DailyMed labels confirmed several BRAF-directed standard-of-care uses.
 Dabrafenib is approved for unresectable or metastatic melanoma with BRAF V600E/K mutations.
-Tovorafenib has accelerated approval for relapsed or refractory pediatric low-grade glioma with BRAF alteration.
-Significance: This clarifies which uses are on-label versus investigational.
-Limitations: Manufacturer-specific labels may differ in wording.
 
 ## Limitations
 
@@ -1215,17 +1358,14 @@ Limitations: Manufacturer-specific labels may differ in wording.
 
     final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
 
-    assert "### Step 4: Retrieve DailyMed labels for BRAF-directed therapies — COMPLETED" in final_markdown
-    assert "**Data Source:** DailyMed" in final_markdown
-    assert "**Key Findings:**" in final_markdown
-    assert "- DailyMed labels confirmed several BRAF-directed standard-of-care uses." in final_markdown
-    assert "- Dabrafenib is approved for unresectable or metastatic melanoma with BRAF V600E/K mutations." in final_markdown
-    assert "- Tovorafenib has accelerated approval for relapsed or refractory pediatric low-grade glioma with BRAF alteration." in final_markdown
-    assert "**Significance:** This clarifies which uses are on-label versus investigational." in final_markdown
-    assert "**Limitations:** Manufacturer-specific labels may differ in wording." in final_markdown
+    assert "## TLDR" in final_markdown
+    assert "## Key Findings" not in final_markdown
+    assert "BRAF-Directed Therapies" in final_markdown
+    assert "Dabrafenib is approved" in final_markdown
+    assert "## Evidence and Methodology" not in final_markdown
 
 
-def test_postprocess_normalizes_inline_step_fields_from_single_paragraph():
+def test_postprocess_renders_answer_section_for_no_claim_task():
     plan = {
         "schema": workflow.PLAN_SCHEMA,
         "objective": "Evaluate LRRK2 target conviction",
@@ -1246,29 +1386,26 @@ def test_postprocess_normalizes_inline_step_fields_from_single_paragraph():
     )
     raw_markdown = """# AI Co-Scientist Report
 
-## Summary
+## Answer
 
-This is a vague model summary.
+The human LRRK2 gene was resolved to Entrez ID 120892 and Ensembl ID ENSG00000188906.
 
-## Evidence and Methodology
+## Key Findings
 
-Overview paragraph.
+### Gene Resolution
 
-Step 1: Resolve LRRK2 gene identifiers — COMPLETED
-Data source: MyGene.info Key findings: The human LRRK2 gene was resolved to Entrez ID 120892 and Ensembl ID ENSG00000188906. Significance: This ensured consistent identifier grounding across sources. * Limitations: None.
+MyGene.info confirmed LRRK2 maps to Entrez ID 120892.
 """
 
     final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
 
-    assert "### Step 1: Resolve LRRK2 gene identifiers — COMPLETED" in final_markdown
-    assert "**Data Source:** MyGene.info" in final_markdown
-    assert "**Key Findings:**" in final_markdown
-    assert "- The human LRRK2 gene was resolved to Entrez ID 120892 and Ensembl ID ENSG00000188906." in final_markdown
-    assert "**Significance:** This ensured consistent identifier grounding across sources." in final_markdown
-    assert "**Limitations:** None." in final_markdown
+    assert "## TLDR" in final_markdown
+    assert "## Key Findings" not in final_markdown
+    assert "Gene Resolution" in final_markdown
+    assert "## Evidence and Methodology" not in final_markdown
 
 
-def test_postprocess_ignores_orphan_asterisks_and_bold_field_wrappers_in_step_blocks():
+def test_postprocess_sources_consulted_shows_step_sources():
     plan = {
         "schema": workflow.PLAN_SCHEMA,
         "objective": "Evaluate LRRK2 target conviction",
@@ -1287,33 +1424,34 @@ def test_postprocess_ignores_orphan_asterisks_and_bold_field_wrappers_in_step_bl
         plan,
         objective_text="Evaluate LRRK2 target conviction",
     )
-    raw_markdown = """# AI Co-Scientist Report
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Resolved LRRK2.",
+            "result_summary": "The human LRRK2 gene was resolved.",
+            "evidence_ids": [],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["resolve_gene_identifiers"],
+            "structured_observations": [],
+        },
+    )
 
-## Summary
-
-This is a vague model summary.
-
-## Evidence and Methodology
-
-Overview paragraph.
-
-Step 1: Resolve LRRK2 gene identifiers — COMPLETED
-**Data Source:** MyGene.info
-**Key Findings:** The human LRRK2 gene was resolved.
-*
-**Significance:** This ensured consistent identifier grounding. *
-**Limitations:** None.
+    raw_markdown = """## Answer
+LRRK2 was resolved.
+## Key Findings
+### Gene Resolution
+MyGene.info confirmed LRRK2 maps to Entrez ID 120892.
 """
 
     final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
 
-    assert "**Data Source:** MyGene.info" in final_markdown
-    assert "- The human LRRK2 gene was resolved." in final_markdown
-    assert "**Significance:** This ensured consistent identifier grounding." in final_markdown
-    assert "**Limitations:** None." in final_markdown
-    assert "\n- *\n" not in final_markdown
-    assert "* *" not in final_markdown
-    assert "**Data Source:** **" not in final_markdown
+    assert "Recommended Next Steps" in final_markdown
+    assert "## Evidence Breakdown" in final_markdown
+    assert "## Evidence and Methodology" not in final_markdown
 
 
 def test_postprocess_expands_reference_only_key_finding_bullets(monkeypatch):
@@ -1398,3 +1536,39 @@ def test_step_result_highlights_strip_step_metadata_prefixes():
     assert highlights
     assert highlights[0]["summary"].startswith("A clinical study of the LRRK2 inhibitor BIIB122")
     assert "S6 · completed Goal" not in highlights[0]["summary"]
+
+
+def test_extract_evidence_ids_from_text():
+    text = (
+        "LRRK2 (PMID:12345678) is associated with Parkinson disease. "
+        "See also DOI:10.1038/s41586-021-03819-2 and trial NCT03710707. "
+        "UniProt:Q5S007 encodes LRRK2. Variant rs34637584 is pathogenic. "
+        "CHEMBL2189121 targets LRRK2. PDB:4ZLO shows the structure. "
+        "OpenAlex:W2741809807 is a key reference. "
+        "Reactome:R-HSA-392499 and GCST004902 are also relevant. "
+        "PMC9876543 has full text."
+    )
+    ids = workflow._extract_evidence_ids_from_text(text)
+    assert "PMID:12345678" in ids
+    assert "DOI:10.1038/s41586-021-03819-2" in ids
+    assert "NCT03710707" in ids
+    assert "UniProt:Q5S007" in ids
+    assert "rs34637584" in ids
+    assert "CHEMBL2189121" in ids
+    assert "PDB:4ZLO" in ids
+    assert "OpenAlex:W2741809807" in ids
+    assert "Reactome:R-HSA-392499" in ids
+    assert "GCST004902" in ids
+    assert "PMC9876543" in ids
+    assert len(ids) == 11
+
+
+def test_extract_evidence_ids_from_text_empty():
+    assert workflow._extract_evidence_ids_from_text("") == []
+    assert workflow._extract_evidence_ids_from_text("no identifiers here") == []
+
+
+def test_extract_evidence_ids_from_text_deduplication():
+    text = "Found PMID:11111111 and PMID:11111111 again, plus PMID:22222222"
+    ids = workflow._extract_evidence_ids_from_text(text)
+    assert ids == ["PMID:11111111", "PMID:22222222"]
