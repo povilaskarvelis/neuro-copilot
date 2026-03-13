@@ -507,6 +507,141 @@ function setActivityExpanded(taskId, expanded) {
   state.activityExpandedByTask[activityExpansionKey(taskId)] = !!expanded;
 }
 
+function normalizeActivityText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function activityStepStatusLabel(status) {
+  const normalized = String(status || "").trim();
+  if (normalized === "completed") return "Completed";
+  if (normalized === "blocked") return "Blocked";
+  if (normalized === "in_progress") return "In progress";
+  return "Pending";
+}
+
+function activityStepStatusClass(status) {
+  const normalized = String(status || "").trim();
+  if (normalized === "completed") return "is-complete";
+  if (normalized === "blocked") return "is-blocked";
+  if (normalized === "in_progress") return "is-running";
+  return "";
+}
+
+function summarizeActivityToolEntry(entry) {
+  const summary = normalizeActivityText(entry?.summary || "");
+  const result = normalizeActivityText(entry?.result || "");
+  const status = String(entry?.status || "done").trim();
+  const tool = normalizeActivityText(entry?.tool || entry?.raw_tool || "Tool");
+  if (summary && result) return `${summary} -> ${result}`;
+  if (summary) return status === "called" ? `${summary}...` : summary;
+  return `${tool} querying...`;
+}
+
+function collectActivitySources(step) {
+  const sources = [];
+  const addSource = (value) => {
+    const normalized = normalizeActivityText(value);
+    if (!normalized || sources.includes(normalized)) return;
+    sources.push(normalized);
+  };
+
+  const dataSources = Array.isArray(step?.data_sources) ? step.data_sources : [];
+  for (const source of dataSources) {
+    addSource(source);
+  }
+
+  if (sources.length) return sources;
+
+  addSource(step?.source || step?.tool_hint || "");
+
+  const toolLog = Array.isArray(step?.tool_log) ? step.tool_log : [];
+  for (const entry of toolLog) {
+    addSource(entry?.tool || "");
+  }
+
+  return sources;
+}
+
+function renderActivitySectionHtml(label, items = [], extraClass = "") {
+  const lines = (Array.isArray(items) ? items : []).filter(Boolean);
+  if (!lines.length) return "";
+  const classNames = ["activity-log-step-section", extraClass].filter(Boolean).join(" ");
+  return `
+    <div class="${classNames}">
+      <div class="activity-log-step-label">${escapeHtml(label)}</div>
+      <div class="activity-log-step-list">
+        ${lines.map((line) => `<div class="activity-log-step-item">${inlineMarkdown(line)}</div>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function buildActivityDetailsHtml(stepDetails = []) {
+  const visibleSteps = (Array.isArray(stepDetails) ? stepDetails : [])
+    .filter((step) => String(step?.status || "pending").trim() !== "pending");
+
+  if (!visibleSteps.length) {
+    return '<div class="activity-log-empty">Activity details will appear here as steps begin.</div>';
+  }
+
+  return `
+    <div class="activity-log">
+      ${visibleSteps.map((step) => {
+        const sid = String(step?.id || "").trim() || "Step";
+        const status = String(step?.status || "pending").trim();
+        const statusLabel = activityStepStatusLabel(status);
+        const statusClass = activityStepStatusClass(status);
+        const goal = normalizeActivityText(step?.goal || "") || sid;
+        const sources = collectActivitySources(step);
+        const toolLog = Array.isArray(step?.tool_log) ? step.tool_log : [];
+        const toolLines = toolLog.map((entry) => summarizeActivityToolEntry(entry)).filter(Boolean);
+        const resultSummary = normalizeActivityText(step?.result_summary || "");
+        const openGaps = (Array.isArray(step?.open_gaps) ? step.open_gaps : [])
+          .map((item) => normalizeActivityText(item))
+          .filter(Boolean);
+        const evidenceIds = (Array.isArray(step?.evidence_ids) ? step.evidence_ids : [])
+          .map((item) => normalizeActivityText(item))
+          .filter(Boolean);
+        const summaryLines = [];
+        if (resultSummary) summaryLines.push(resultSummary);
+        if (!summaryLines.length) {
+          if (status === "in_progress") {
+            summaryLines.push(sources.length ? `Working with ${sources.join(", ")}.` : "Working on this step.");
+          } else if (status === "blocked") {
+            summaryLines.push("This step needs follow-up before it can continue.");
+          } else {
+            summaryLines.push("Step completed.");
+          }
+        }
+
+        const metaParts = [statusLabel];
+        if (sources.length) metaParts.push(`Sources: ${sources.join(", ")}`);
+
+        return `
+          <div class="activity-log-step ${statusClass}">
+            <div class="activity-log-step-head">
+              <span class="activity-log-step-dot" aria-hidden="true"></span>
+              <div class="activity-log-step-copy">
+                <div class="activity-log-step-title">
+                  <span class="activity-log-step-id">${escapeHtml(sid)}</span>
+                  <span class="activity-log-step-goal">${escapeHtml(goal)}</span>
+                </div>
+                <div class="activity-log-step-meta">${escapeHtml(metaParts.join(" · "))}</div>
+              </div>
+            </div>
+            <div class="activity-log-step-body">
+              ${renderActivitySectionHtml("Summary", summaryLines, "is-summary")}
+              ${renderActivitySectionHtml("Activity", toolLines)}
+              ${renderActivitySectionHtml("Evidence", evidenceIds)}
+              ${renderActivitySectionHtml("Open questions", openGaps)}
+            </div>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
 function reactTraceLines({ trace = "", phases = null } = {}) {
   const lines = [];
   const normalizedTrace = String(trace || "").trim();
@@ -628,65 +763,13 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
     preview = "Click for activity details";
   }
 
-  const details = [];
-
-  if (stepDetails.length > 0) {
-    for (const step of stepDetails) {
-      const sid = String(step.id || "").trim();
-      const st = String(step.status || "pending").trim();
-      const goal = String(step.goal || "").trim();
-
-      // Only show completed, blocked, or in_progress steps — hide future pending steps
-      if (st === "pending") continue;
-
-      const icon = st === "completed" ? "✓" : st === "blocked" ? "✗" : "…";
-      details.push(`### ${icon} ${sid} — ${goal}`);
-
-      const toolLog = Array.isArray(step.tool_log) ? step.tool_log : [];
-      if (toolLog.length > 0) {
-        for (const entry of toolLog) {
-          const summary = String(entry.summary || "").trim();
-          const result = String(entry.result || "").trim();
-          const entryStatus = String(entry.status || "done").trim();
-          const tool = String(entry.tool || "?");
-          let line;
-          if (summary && result) {
-            line = `- ${summary} → ${result}`;
-          } else if (summary) {
-            line = (entryStatus === "called") ? `- ${summary}…` : `- ${summary}`;
-          } else {
-            line = `- **${tool}** — querying…`;
-          }
-          details.push(line);
-        }
-      } else if (st === "in_progress") {
-        const source = String(step.source || step.tool_hint || "").trim();
-        if (source) {
-          details.push(`- **${source}** — querying…`);
-        }
-      }
-
-      if ((st === "completed" || st === "blocked") && Array.isArray(step.structured_observations) && step.structured_observations.length > 0) {
-        const claims = step.structured_observations.slice(0, 3).map((obs) => {
-          const subj = obs?.subject?.label || "?";
-          const pred = obs?.predicate || "?";
-          const obj = obs?.object?.label || "?";
-          const conf = obs?.confidence ? ` [${obs.confidence}]` : "";
-          return `${subj} → ${pred} → ${obj}${conf}`;
-        });
-        details.push(`   → **Claims:** ${claims.join("; ")}`);
-      }
-      details.push("");
-    }
-  }
-
   return {
     taskId: String(taskId || "").trim() || "pending",
     status: normalizedStatus,
     title,
     summary,
     preview,
-    detailsHtml: markdownToHtml(details.join("\n")),
+    detailsHtml: buildActivityDetailsHtml(stepDetails),
     planApproved: !!planApproved,
   };
 }
@@ -732,7 +815,7 @@ function activityCardHtml(snapshot) {
         </div>
       </div>
       <div class="activity-preview">${escapeHtml(snapshot.preview)}</div>
-      <div class="activity-details markdown-body ${expanded ? "" : "hidden"}">${snapshot.detailsHtml}</div>
+      <div class="activity-details ${expanded ? "" : "hidden"}">${snapshot.detailsHtml}</div>
     </section>
   `;
 }

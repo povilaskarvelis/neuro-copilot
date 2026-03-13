@@ -38,6 +38,7 @@ from co_scientist.workflow import (
     STATE_EXECUTOR_ACTIVE_STEP_ID,
     STATE_PRIOR_RESEARCH,
     STATE_WORKFLOW_TASK,
+    _derive_step_data_sources,
     _describe_tool_call,
     STATE_PLAN_PENDING_APPROVAL,
     _is_continue_execution_command,
@@ -377,13 +378,12 @@ def _steps_from_workflow_state(wf_state: dict | None) -> list[dict]:
             "source": _source_label(step.get("tool_hint", "")),
             "completion_condition": str(step.get("completion_condition", "")).strip(),
             "result_summary": step.get("result_summary", ""),
-            "executor_prose": step.get("executor_prose", ""),
             "tool_reasoning": step.get("tool_reasoning", ""),
             "evidence_refs": step.get("evidence_ids", []),
             "tool_trace": [
                 {"tool": t} for t in step.get("tools_called", [])
             ],
-            "output": step.get("executor_prose", "") or step.get("result_summary", ""),
+            "output": step.get("result_summary", ""),
         }
         for step in wf_state.get("steps", [])
     ]
@@ -996,14 +996,15 @@ class UiRuntime:
                 "status": s.get("status", "pending"),
                 "tool_hint": tool_hint,
                 "source": source,
+                "data_sources": _derive_step_data_sources(s),
                 "result_summary": s.get("result_summary", ""),
-                "executor_prose": s.get("executor_prose", ""),
                 "tool_reasoning": s.get("tool_reasoning", ""),
                 "evidence_ids": s.get("evidence_ids", []),
                 "tools_called": s.get("tools_called", []),
                 "open_gaps": s.get("open_gaps", []),
                 "reasoning_trace": s.get("reasoning_trace", ""),
                 "tool_log": s.get("tool_log", []),
+                "structured_observations": s.get("structured_observations", []),
             })
 
         summary = {

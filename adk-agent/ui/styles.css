@@ -640,27 +640,157 @@ body.expanded .messages {
 }
 
 .activity-details {
-  margin: 8px 0 0;
-  padding: 8px;
-  border-radius: 8px;
-  border: 1px solid #22364a;
-  background: rgba(9, 12, 22, 0.82);
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(37, 56, 76, 0.92);
+  background: rgba(10, 14, 22, 0.9);
   color: #dbe6f3;
-  font: 500 0.76rem/1.45 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font: 500 0.76rem/1.52 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   white-space: normal;
-  max-height: 420px;
+  max-height: 380px;
   overflow: auto;
 }
 
 .activity-card.expanded .activity-preview {
   max-height: none;
   overflow: visible;
+  color: #a9bad0;
 }
 
 .activity-card.expanded .activity-details {
   cursor: text;
   -webkit-user-select: text;
   user-select: text;
+}
+
+.activity-details a {
+  color: #dcecff;
+  text-decoration: underline;
+}
+
+.activity-details code {
+  background: #121a25;
+  border: 1px solid #27374a;
+  border-radius: 5px;
+  padding: 0.08em 0.28em;
+  font-size: 0.86em;
+}
+
+.activity-log {
+  display: grid;
+  gap: 0;
+}
+
+.activity-log-empty {
+  color: #9eb1c6;
+  line-height: 1.5;
+}
+
+.activity-log-step {
+  padding: 10px 0;
+}
+
+.activity-log-step + .activity-log-step {
+  border-top: 1px solid rgba(45, 62, 81, 0.9);
+}
+
+.activity-log-step-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.activity-log-step-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: #6f879f;
+  flex: 0 0 auto;
+}
+
+.activity-log-step.is-complete .activity-log-step-dot {
+  background: #7bd7a4;
+}
+
+.activity-log-step.is-running .activity-log-step-dot {
+  background: #78ddff;
+}
+
+.activity-log-step.is-blocked .activity-log-step-dot {
+  background: #ff96ad;
+}
+
+.activity-log-step-copy {
+  min-width: 0;
+}
+
+.activity-log-step-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.activity-log-step-id {
+  font-size: 0.74rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #87a0bb;
+  font-weight: 600;
+}
+
+.activity-log-step-goal {
+  color: #ecf3fb;
+  font-size: 0.84rem;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.activity-log-step-meta {
+  margin-top: 2px;
+  color: #91a4ba;
+  font-size: 0.71rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.activity-log-step-body {
+  margin-left: 18px;
+  margin-top: 7px;
+  display: grid;
+  gap: 8px;
+}
+
+.activity-log-step-section {
+  display: grid;
+  gap: 4px;
+}
+
+.activity-log-step-label {
+  color: #7f96af;
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.activity-log-step-list {
+  display: grid;
+  gap: 3px;
+}
+
+.activity-log-step-item {
+  color: #d9e4f0;
+  font-size: 0.77rem;
+  line-height: 1.52;
+  overflow-wrap: anywhere;
+}
+
+.activity-log-step-section:not(.is-summary) .activity-log-step-item {
+  color: #adc1d6;
 }
 
 .message {
