@@ -361,6 +361,13 @@ function setLoading(isLoading) {
   updateSendVisibility();
 }
 
+function setInnerHtmlIfChanged(element, html) {
+  if (!element) return false;
+  if (element.innerHTML === html) return false;
+  element.innerHTML = html;
+  return true;
+}
+
 function conversationTitle(conversation) {
   const text = String(conversation?.title || "").trim();
   return text || "Untitled Research";
@@ -973,11 +980,13 @@ function updateInlineActivityCard(run) {
 }
 
 function renderSidebar() {
+  let html = "";
   if (!state.conversations.length) {
-    el.tasksList.innerHTML = '<p class="muted">No chats yet.</p>';
+    html = '<p class="muted">No chats yet.</p>';
+    setInnerHtmlIfChanged(el.tasksList, html);
     return;
   }
-  el.tasksList.innerHTML = state.conversations
+  html = state.conversations
     .map((conversation) => {
       const conversationId = String(conversation.conversation_id || "");
       const active = conversationId === state.selectedConversationId ? "active" : "";
@@ -996,18 +1005,20 @@ function renderSidebar() {
       `;
     })
     .join("");
+  setInnerHtmlIfChanged(el.tasksList, html);
 }
 
 function renderTaskHeader() {
   const conversation = state.selectedConversationDetail?.conversation;
   if (!conversation) {
-    el.taskTitle.textContent = "New chat";
+    if (el.taskTitle.textContent !== "New chat") el.taskTitle.textContent = "New chat";
     return;
   }
   const title = conversationTitle(conversation);
   const status = String(conversation.latest_status || "");
   const count = Number(conversation.iteration_count || 0);
-  el.taskTitle.textContent = `${title} · ${status} · ${count} iteration${count === 1 ? "" : "s"}`;
+  const nextTitle = `${title} · ${status} · ${count} iteration${count === 1 ? "" : "s"}`;
+  if (el.taskTitle.textContent !== nextTitle) el.taskTitle.textContent = nextTitle;
 }
 
 function renderMessages() {
@@ -1026,8 +1037,9 @@ function renderMessages() {
       }
     }
     parts.push(`<article class="message assistant"><div class="message-body markdown-body">${markdownToHtml(state.clarificationMessage)}</div></article>`);
-    el.messages.innerHTML = parts.join("");
-    el.messages.scrollTop = el.messages.scrollHeight;
+    if (setInnerHtmlIfChanged(el.messages, parts.join(""))) {
+      el.messages.scrollTop = el.messages.scrollHeight;
+    }
     return;
   }
 
@@ -1043,11 +1055,12 @@ function renderMessages() {
       } else {
         parts.push(minimalLoadingSpinnerHtml(pendingRunLabel()));
       }
-      el.messages.innerHTML = parts.join("");
-      el.messages.scrollTop = el.messages.scrollHeight;
+      if (setInnerHtmlIfChanged(el.messages, parts.join(""))) {
+        el.messages.scrollTop = el.messages.scrollHeight;
+      }
       return;
     }
-    el.messages.innerHTML = "";
+    setInnerHtmlIfChanged(el.messages, "");
     return;
   }
 
@@ -1103,8 +1116,9 @@ function renderMessages() {
     }
   }
 
-  el.messages.innerHTML = parts.join("");
-  el.messages.scrollTop = el.messages.scrollHeight;
+  if (setInnerHtmlIfChanged(el.messages, parts.join(""))) {
+    el.messages.scrollTop = el.messages.scrollHeight;
+  }
 }
 
 function setReportStatus(taskId, message = "", isError = false) {
@@ -1382,7 +1396,7 @@ async function refreshHealth() {
   updateSendVisibility();
 }
 
-async function refreshConversations({ keepSelection = true } = {}) {
+async function refreshConversations({ keepSelection = true, skipRender = false } = {}) {
   const payload = await api("/api/conversations");
   state.conversations = Array.isArray(payload?.conversations) ? payload.conversations : [];
 
@@ -1390,7 +1404,7 @@ async function refreshConversations({ keepSelection = true } = {}) {
     state.selectedConversationId = null;
     state.selectedConversationDetail = null;
     state.selectedReportTaskId = null;
-    renderAll();
+    if (!skipRender) renderAll();
     return;
   }
 
@@ -1402,23 +1416,23 @@ async function refreshConversations({ keepSelection = true } = {}) {
     state.selectedConversationId = null;
     state.selectedConversationDetail = null;
     state.selectedReportTaskId = null;
-    renderAll();
+    if (!skipRender) renderAll();
     return;
   }
 
   if (state.selectedConversationId) {
-    await selectConversation(state.selectedConversationId, { silent: true });
+    await selectConversation(state.selectedConversationId, { silent: true, skipRender });
   } else {
-    renderAll();
+    if (!skipRender) renderAll();
   }
 }
 
-async function selectConversation(conversationId, { silent = false } = {}) {
+async function selectConversation(conversationId, { silent = false, skipRender = false } = {}) {
   state.selectedConversationId = conversationId;
   if (!conversationId) {
     state.selectedConversationDetail = null;
     state.selectedReportTaskId = null;
-    renderAll();
+    if (!skipRender) renderAll();
     return;
   }
   try {
@@ -1445,7 +1459,7 @@ async function selectConversation(conversationId, { silent = false } = {}) {
     }
     state.pendingUserMessage = "";
     state.clarificationMessage = "";
-    renderAll();
+    if (!skipRender) renderAll();
     refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
   } catch (err) {
     if (!silent) setNotice(`Failed to load conversation: ${err.message}`, true);
@@ -1581,8 +1595,8 @@ async function handleTerminalRunState(run) {
     try {
       const taskDetail = await api(`/api/tasks/${encodeURIComponent(run.task_id)}`);
       const conversationId = String(taskDetail?.task?.conversation_id || "").trim() || `conv_${run.task_id}`;
-      await refreshConversations({ keepSelection: true });
-      await selectConversation(conversationId, { silent: true });
+      await refreshConversations({ keepSelection: true, skipRender: true });
+      await selectConversation(conversationId, { silent: true, skipRender: true });
       if (status === "completed") {
         state.selectedReportTaskId = run.task_id;
       }
@@ -1591,7 +1605,7 @@ async function handleTerminalRunState(run) {
     }
   } else {
     try {
-      await refreshConversations({ keepSelection: true });
+      await refreshConversations({ keepSelection: true, skipRender: true });
     } catch (err) {
       setNotice(`Could not refresh conversations: ${err.message}`, true);
     }
@@ -1627,10 +1641,6 @@ async function submitContinue(taskId) {
   const detail = state.selectedConversationDetail;
   const iteration = findIteration(detail, normalizedTaskId);
   const task = iteration?.task || null;
-  const previousAwaiting = Boolean(task?.awaiting_hitl);
-  if (task) task.awaiting_hitl = false;
-  renderMessages();
-
   const planVersionId = iteration?.active_plan_version?.version_id || null;
   let payload;
   try {
@@ -1640,8 +1650,6 @@ async function submitContinue(taskId) {
     });
   } catch (err) {
     if (String(err?.message || "").trim() !== "Not Found") {
-      if (task) task.awaiting_hitl = previousAwaiting;
-      renderMessages();
       throw err;
     }
     try {
@@ -1650,11 +1658,10 @@ async function submitContinue(taskId) {
         body: JSON.stringify({}),
       });
     } catch (fallbackErr) {
-      if (task) task.awaiting_hitl = previousAwaiting;
-      renderMessages();
       throw fallbackErr;
     }
   }
+  if (task) task.awaiting_hitl = false;
   storeRunData(payload);
   renderMessages();
   startRunPolling(payload.run_id);
@@ -1726,7 +1733,7 @@ function bindEvents() {
       const taskId = String(startBtn.dataset.taskId || "").trim();
       if (!taskId) return;
       startBtn.disabled = true;
-      startBtn.remove();
+      startBtn.textContent = "Starting...";
       submitContinue(taskId).catch((err) => {
         renderMessages();
         setNotice(`Start failed: ${err.message}`, true);
@@ -1849,7 +1856,7 @@ async function bootstrap() {
   updateSendVisibility();
   renderAll();
   await refreshHealth();
-  await refreshConversations({ keepSelection: true });
+  await refreshConversations({ keepSelection: true, skipRender: true });
   renderAll();
 }
 

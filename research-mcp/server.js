@@ -100,6 +100,8 @@ const HF_TOKEN = String(process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN ||
 const BIOGRID_ACCESS_KEY = String(process.env.BIOGRID_ACCESS_KEY || "").trim();
 const BIOGRID_ORCS_ACCESS_KEY = String(process.env.BIOGRID_ORCS_ACCESS_KEY || process.env.BIOGRID_ACCESS_KEY || "").trim();
 const OPENALEX_MAILTO = process.env.OPENALEX_MAILTO || process.env.CONTACT_EMAIL || "";
+const NCBI_API_KEY = String(process.env.NCBI_API_KEY || process.env.PUBMED_API_KEY || "").trim();
+const NCBI_EMAIL = String(process.env.NCBI_EMAIL || process.env.CONTACT_EMAIL || OPENALEX_MAILTO || "").trim();
 const BQ_PROJECT_ID = String(process.env.BQ_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || "").trim();
 const BQ_LOCATION = String(process.env.BQ_LOCATION || process.env.GOOGLE_CLOUD_LOCATION || "US").trim() || "US";
 const BQ_DATASET_ALLOWLIST = String(process.env.BQ_DATASET_ALLOWLIST || "").trim();
@@ -430,6 +432,22 @@ function buildUniProtUrl(pathname, params = new URLSearchParams()) {
   const query = params.toString();
   return query ? `${UNIPROT_API}${pathname}?${query}` : `${UNIPROT_API}${pathname}`;
 }
+
+function buildNcbiEutilsUrl(baseUrl, params = new URLSearchParams()) {
+  const nextParams = new URLSearchParams(params);
+  if (NCBI_API_KEY && !nextParams.has("api_key")) {
+    nextParams.set("api_key", NCBI_API_KEY);
+  }
+  if (NCBI_EMAIL && !nextParams.has("email")) {
+    nextParams.set("email", NCBI_EMAIL);
+  }
+  if (!nextParams.has("tool")) {
+    nextParams.set("tool", "research-mcp");
+  }
+  const query = nextParams.toString();
+  return query ? `${baseUrl}?${query}` : baseUrl;
+}
+
 function buildHfDatasetsServerUrl(pathname, params = new URLSearchParams()) {
   const query = params.toString();
   return query ? `${HF_DATASETS_SERVER_API}${pathname}?${query}` : `${HF_DATASETS_SERVER_API}${pathname}`;
@@ -840,6 +858,37 @@ function validateBigQuerySelectSql(sql) {
     return { ok: false, error: "Query includes a forbidden SQL keyword." };
   }
   return { ok: true, normalizedSql };
+}
+
+function buildBigQueryErrorHint(query, errorMessage) {
+  const normalizedMessage = normalizeWhitespace(errorMessage || "");
+  const normalizedQuery = String(query || "");
+  const hints = [];
+
+  if (
+    /concatenated string literals/i.test(normalizedMessage)
+    || /Expected end of input but got identifier/i.test(normalizedMessage)
+  ) {
+    if (normalizedQuery.includes("'")) {
+      hints.push("If a SQL string contains an apostrophe, escape it as two single quotes, e.g. 'Alzheimer''s disease'.");
+    } else {
+      hints.push("Check string quoting and unmatched apostrophes in SQL literals.");
+    }
+  }
+
+  if (
+    /does not exist in STRUCT<element STRUCT/i.test(normalizedMessage)
+    || /Cannot access field .* on a value with type ARRAY<STRUCT/i.test(normalizedMessage)
+  ) {
+    hints.push("A nested ARRAY<STRUCT> usually needs UNNEST with an alias before accessing inner fields.");
+    hints.push("Re-inspect the schema and preview one row with SELECT TO_JSON_STRING(t) FROM `dataset.table` AS t LIMIT 1.");
+  }
+
+  if (/Unrecognized name/i.test(normalizedMessage)) {
+    hints.push("Re-check exact column names with list_bigquery_tables(dataset=..., table=...).");
+  }
+
+  return hints.join(" ");
 }
 
 function resolveDatasetKeyAgainstAllowlist(shortName) {
@@ -4129,8 +4178,13 @@ server.registerTool(
         ],
       };
     } catch (error) {
+      const message = normalizeWhitespace(error?.message || "unknown BigQuery error");
+      const hint = buildBigQueryErrorHint(normalizedSql, message);
       return {
-        content: [{ type: "text", text: `Error in run_bigquery_select_query: ${error.message}` }],
+        content: [{
+          type: "text",
+          text: `Error in run_bigquery_select_query: ${message}${hint ? `\nHint: ${hint}` : ""}`,
+        }],
       };
     }
   }
@@ -4292,7 +4346,9 @@ server.registerTool(
     },
   },
   async ({ query, status, limit }) => {
-    const boundedLimit = limit ? Math.max(1, Math.min(200, Math.round(limit))) : 50;
+    const isExactNctQuery = /^NCT\d{8}$/i.test(normalizeWhitespace(query || ""));
+    const minimumLimit = isExactNctQuery ? 1 : 5;
+    const boundedLimit = limit ? Math.max(minimumLimit, Math.min(200, Math.round(limit))) : 50;
     const boundedPages = Math.ceil(boundedLimit / 100);
     const studies = [];
     let resultCount = 0;
@@ -4325,6 +4381,7 @@ server.registerTool(
         nextPageToken = data?.nextPageToken || "";
         if (!nextPageToken || pageStudies.length === 0) break;
       }
+      studies.sort((left, right) => scoreClinicalTrialStudy(right, query) - scoreClinicalTrialStudy(left, query));
       hasMorePages = Boolean(nextPageToken);
       // Do NOT set resultCount = studies.length when API did not provide totalCount —
       // that would imply "Showing 100 of 100 total" when there may be many more.
@@ -4667,7 +4724,7 @@ async function resolvePmidFromDoi(rawDoi) {
     retmode: "json",
     retmax: "1",
   });
-  const url = `${PUBMED_ESEARCH}?${params.toString()}`;
+  const url = buildNcbiEutilsUrl(PUBMED_ESEARCH, params);
   const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 10000, maxBackoffMs: 2500 });
   return normalizePmidValue(data?.esearchresult?.idlist?.[0] || "");
 }
@@ -4679,7 +4736,7 @@ async function fetchPubmedArticleXml(cleanPmid) {
     retmode: "xml",
     rettype: "abstract",
   });
-  const url = `${PUBMED_EFETCH}?${params.toString()}`;
+  const url = buildNcbiEutilsUrl(PUBMED_EFETCH, params);
   const resp = await fetchWithRetry(url, { retries: 2, timeoutMs: 12000, maxBackoffMs: 2500 });
   return resp.text();
 }
@@ -4690,7 +4747,11 @@ async function fetchPmcFullTextXml(cleanPmcid) {
     throw new Error("A valid PMCID is required to fetch PMC full text.");
   }
   const candidateUrls = [
-    `${PUBMED_EFETCH}?db=pmc&id=${encodeURIComponent(pmcid)}&retmode=xml`,
+    buildNcbiEutilsUrl(PUBMED_EFETCH, new URLSearchParams({
+      db: "pmc",
+      id: pmcid,
+      retmode: "xml",
+    })),
     `https://www.ebi.ac.uk/europepmc/webservices/rest/${encodeURIComponent(pmcid)}/fullTextXML`,
   ];
   let lastError = null;
@@ -4741,6 +4802,135 @@ function parsePubmedArticleSummary(xml) {
   return articles;
 }
 
+function buildPubmedRateLimitHint() {
+  const hints = [
+    "PubMed E-utilities is rate-limited.",
+    "Retry shortly or use search_europe_pmc_literature as a fallback for retrieval.",
+  ];
+  if (!NCBI_API_KEY) {
+    hints.push("Configuring NCBI_API_KEY will substantially reduce PubMed throttling.");
+  }
+  return hints.join(" ");
+}
+
+function formatPubmedToolError(error) {
+  const message = normalizeWhitespace(error?.message || String(error) || "unknown PubMed error");
+  if (message.includes("429") || /rate limit/i.test(message)) {
+    return `${message} ${buildPubmedRateLimitHint()}`;
+  }
+  return message;
+}
+
+async function fetchPubmedSummaryXml(pmids) {
+  const cleanPmids = dedupeArray(
+    (Array.isArray(pmids) ? pmids : []).map((pmid) => normalizePmidValue(pmid)).filter(Boolean)
+  );
+  if (cleanPmids.length === 0) {
+    throw new Error("At least one PMID is required for PubMed summary lookup.");
+  }
+  const params = new URLSearchParams({
+    db: "pubmed",
+    id: cleanPmids.join(","),
+    retmode: "xml",
+  });
+  const summaryUrl = buildNcbiEutilsUrl(PUBMED_ESUMMARY, params);
+  const response = await fetchWithRetry(summaryUrl, { retries: 2, timeoutMs: 10000, maxBackoffMs: 2500 });
+  const summaryXml = await response.text();
+  if (!/<DocSum>/i.test(summaryXml)) {
+    const preview = compactErrorMessage(summaryXml, 220);
+    throw new Error(`PubMed summary lookup returned no DocSum records. Response preview: ${preview}`);
+  }
+  return summaryXml;
+}
+
+function looksLikeBareGeneSymbol(query) {
+  const normalizedQuery = normalizeWhitespace(query || "");
+  return Boolean(normalizedQuery)
+    && !/\s/.test(normalizedQuery)
+    && /^[A-Za-z0-9-]+$/.test(normalizedQuery)
+    && normalizedQuery.length <= 20;
+}
+
+function scoreUniProtSearchResult(entry, query) {
+  const normalizedQuery = normalizeWhitespace(query || "").toUpperCase();
+  if (!normalizedQuery) return 0;
+
+  const accession = normalizeWhitespace(entry?.primaryAccession || "").toUpperCase();
+  const entryId = normalizeWhitespace(entry?.uniProtkbId || "").toUpperCase();
+  const geneSymbols = extractUniProtGeneSymbols(entry, 10).map((value) => normalizeWhitespace(value).toUpperCase());
+  const proteinName = extractUniProtProteinName(entry).toUpperCase();
+
+  let score = 0;
+  if (accession === normalizedQuery) score += 150;
+  if (entryId === normalizedQuery) score += 120;
+  if (geneSymbols.includes(normalizedQuery)) score += 100;
+  if (geneSymbols[0] === normalizedQuery) score += 30;
+  if (proteinName === normalizedQuery) score += 40;
+  if (proteinName.includes(normalizedQuery)) score += 10;
+  if (normalizeWhitespace(entry?.entryType || "").toLowerCase().includes("reviewed")) score += 5;
+  return score;
+}
+
+function rankUniProtResults(results, query) {
+  return [...(Array.isArray(results) ? results : [])].sort((left, right) => {
+    const scoreDelta = scoreUniProtSearchResult(right, query) - scoreUniProtSearchResult(left, query);
+    if (scoreDelta !== 0) return scoreDelta;
+    return normalizeWhitespace(left?.primaryAccession || "").localeCompare(
+      normalizeWhitespace(right?.primaryAccession || "")
+    );
+  });
+}
+
+const CLINICAL_QUERY_STOPWORDS = new Set([
+  "and",
+  "the",
+  "with",
+  "for",
+  "study",
+  "trial",
+  "trials",
+  "disease",
+  "syndrome",
+  "disorder",
+  "phase",
+  "biomarker",
+  "biomarkers",
+  "treatment",
+]);
+
+function tokenizeClinicalQuery(value) {
+  return dedupeArray(
+    normalizeWhitespace(value || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .split(/\s+/)
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 3 && !CLINICAL_QUERY_STOPWORDS.has(token))
+  );
+}
+
+function scoreClinicalTrialStudy(study, query) {
+  const tokens = tokenizeClinicalQuery(query);
+  if (tokens.length === 0) return 0;
+
+  const protocol = study?.protocolSection || {};
+  const title = normalizeWhitespace(protocol?.identificationModule?.briefTitle || "").toLowerCase();
+  const conditions = normalizeWhitespace((protocol?.conditionsModule?.conditions || []).join(" ")).toLowerCase();
+  const interventions = normalizeWhitespace(
+    (protocol?.armsInterventionsModule?.interventions || []).map((item) => item?.name || "").join(" ")
+  ).toLowerCase();
+  const sponsor = normalizeWhitespace(protocol?.sponsorCollaboratorsModule?.leadSponsor?.name || "").toLowerCase();
+
+  let score = 0;
+  for (const token of tokens) {
+    if (title.includes(token)) score += 4;
+    if (conditions.includes(token)) score += 5;
+    if (interventions.includes(token)) score += 7;
+    if (sponsor.includes(token)) score += 1;
+  }
+  return score;
+}
+
 function normalizeGeoIdentifier(value) {
   return normalizeWhitespace(value || "").toUpperCase().replace(/\s+/g, "");
 }
@@ -4771,7 +4961,7 @@ async function fetchGeoDocSumsByIds(ids) {
     id: cleanIds.join(","),
     retmode: "json",
   });
-  const url = `${PUBMED_ESUMMARY}?${params.toString()}`;
+  const url = buildNcbiEutilsUrl(PUBMED_ESUMMARY, params);
   const data = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 10000, maxBackoffMs: 2500 });
   return buildGeoDocsumMap(data?.result);
 }
@@ -4791,7 +4981,7 @@ async function resolveGeoDocSum(identifier) {
     retmax: "20",
     retmode: "json",
   });
-  const url = `${PUBMED_ESEARCH}?${params.toString()}`;
+  const url = buildNcbiEutilsUrl(PUBMED_ESEARCH, params);
   const searchData = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 10000, maxBackoffMs: 2500 });
   const idList = searchData?.esearchresult?.idlist ?? [];
   if (!Array.isArray(idList) || idList.length === 0) {
@@ -4869,7 +5059,7 @@ server.registerTool(
       if (maxDate) params.set("maxdate", maxDate);
       if (minDate || maxDate) params.set("datetype", "pdat");
 
-      const searchUrl = `${PUBMED_ESEARCH}?${params.toString()}`;
+      const searchUrl = buildNcbiEutilsUrl(PUBMED_ESEARCH, params);
       const searchData = await fetchJsonWithRetry(searchUrl, { retries: 2, timeoutMs: 10000 });
       const idList = searchData?.esearchresult?.idlist ?? [];
       const totalCount = parseInt(searchData?.esearchresult?.count || "0", 10);
@@ -4880,15 +5070,11 @@ server.registerTool(
         };
       }
 
-      const summaryParams = new URLSearchParams({
-        db: "pubmed",
-        id: idList.join(","),
-        retmode: "xml",
-      });
-      const summaryUrl = `${PUBMED_ESUMMARY}?${summaryParams.toString()}`;
-      const summaryResp = await fetch(summaryUrl);
-      const summaryXml = await summaryResp.text();
+      const summaryXml = await fetchPubmedSummaryXml(idList);
       const articles = parsePubmedArticleSummary(summaryXml);
+      if (articles.length === 0 && totalCount > 0) {
+        throw new Error(`PubMed summary parse returned zero article records despite ${totalCount} hit(s).`);
+      }
 
       const formatted = articles.map((a, i) => {
         const authorStr = a.authors.length > 0
@@ -4905,7 +5091,12 @@ server.registerTool(
         }],
       };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error searching PubMed: ${error.message}. Try different search terms.` }] };
+      return {
+        content: [{
+          type: "text",
+          text: `Error searching PubMed: ${formatPubmedToolError(error)} Try different search terms.`,
+        }],
+      };
     }
   }
 );
@@ -5120,7 +5311,7 @@ server.registerTool(
         retmax: String(limit),
         retmode: "json",
       });
-      const searchUrl = `${PUBMED_ESEARCH}?${searchParams.toString()}`;
+      const searchUrl = buildNcbiEutilsUrl(PUBMED_ESEARCH, searchParams);
       const searchData = await fetchJsonWithRetry(searchUrl, { retries: 2, timeoutMs: 10000, maxBackoffMs: 2500 });
       const idList = searchData?.esearchresult?.idlist ?? [];
       const totalCount = Number(searchData?.esearchresult?.count || 0);
@@ -5380,7 +5571,7 @@ server.registerTool(
         sort: sort === "date" ? "pub+date" : "relevance",
       });
 
-      const searchUrl = `${PUBMED_ESEARCH}?${params.toString()}`;
+      const searchUrl = buildNcbiEutilsUrl(PUBMED_ESEARCH, params);
       const searchData = await fetchJsonWithRetry(searchUrl, { retries: 2, timeoutMs: 10000 });
       const idList = searchData?.esearchresult?.idlist ?? [];
       const totalCount = parseInt(searchData?.esearchresult?.count || "0", 10);
@@ -5391,15 +5582,11 @@ server.registerTool(
         };
       }
 
-      const summaryParams = new URLSearchParams({
-        db: "pubmed",
-        id: idList.join(","),
-        retmode: "xml",
-      });
-      const summaryUrl = `${PUBMED_ESUMMARY}?${summaryParams.toString()}`;
-      const summaryResp = await fetch(summaryUrl);
-      const summaryXml = await summaryResp.text();
+      const summaryXml = await fetchPubmedSummaryXml(idList);
       const articles = parsePubmedArticleSummary(summaryXml);
+      if (articles.length === 0 && totalCount > 0) {
+        throw new Error(`PubMed summary parse returned zero article records despite ${totalCount} hit(s).`);
+      }
 
       const formatted = articles.map((a, i) => {
         const authorStr = a.authors.length > 0
@@ -5416,7 +5603,9 @@ server.registerTool(
         }],
       };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error in advanced PubMed search: ${error.message}` }] };
+      return {
+        content: [{ type: "text", text: `Error in advanced PubMed search: ${formatPubmedToolError(error)}` }],
+      };
     }
   }
 );
@@ -8394,7 +8583,16 @@ server.registerTool(
       });
       const url = buildUniProtUrl("/uniprotkb/search", params);
       const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
-      const results = Array.isArray(data?.results) ? data.results : [];
+      const rawResults = Array.isArray(data?.results) ? data.results : [];
+      const rankedResults = rankUniProtResults(rawResults, normalizedQuery);
+      let results = rankedResults;
+      if (looksLikeBareGeneSymbol(normalizedQuery)) {
+        const exactishMatches = rankedResults.filter((entry) => scoreUniProtSearchResult(entry, normalizedQuery) >= 100);
+        if (exactishMatches.length > 0) {
+          results = exactishMatches;
+        }
+      }
+      results = results.slice(0, boundedLimit);
 
       if (results.length === 0) {
         return {
@@ -13369,42 +13567,115 @@ server.registerTool(
   "search_openneuro_datasets",
   {
     description:
-      "Searches public OpenNeuro neuroimaging datasets by imaging modality. " +
+      "Searches public OpenNeuro neuroimaging datasets by keyword and/or imaging modality. " +
       "OpenNeuro is the primary open platform for fMRI, MRI, MEG, EEG, and other neuroimaging data (BIDS format). " +
+      "For disorder-focused discovery, prefer keyword-first search terms such as 'schizophrenia', 'psychosis', or 'first-episode psychosis', then narrow by modality. " +
       "Use modality to filter: 'MRI', 'MEG', 'EEG', 'PET', 'iEEG', or 'behavioral'. Omit modality to browse all public datasets. " +
+      "OpenNeuro does not expose a dedicated disorder filter here; use keyword matching plus dataset metadata inspection. " +
+      "If more pages exist, continue with the returned cursor rather than assuming the first page is exhaustive. " +
       "Returns dataset IDs (e.g. ds000224), names, modalities, and latest snapshot tags. Use get_openneuro_dataset with an ID for full metadata.",
     inputSchema: {
-      modality: z.string().optional().describe("Imaging modality: MRI, MEG, EEG, PET, iEEG, or behavioral. Omit to list all datasets."),
-      maxResults: z.number().optional().describe("Maximum results (default 20, max 50)."),
+      query: z.string().optional().describe("Keyword or phrase to match against public dataset metadata, e.g. 'schizophrenia', 'psychosis', or 'resting state'."),
+      modality: z.string().optional().describe("Imaging modality: MRI, MEG, EEG, PET, iEEG, or behavioral. Omit to browse across all datasets."),
+      after: z.string().optional().describe("Pagination cursor returned by a previous search_openneuro_datasets call. Use when continuing beyond the first page."),
+      maxResults: z.number().optional().describe("Maximum results to return (default 20, max 50)."),
     },
   },
-  async ({ modality, maxResults }) => {
+  async ({ query, modality, after, maxResults }) => {
     const limit = Math.min(Math.max(1, maxResults || 20), 50);
+    const keyword = normalizeWhitespace(query || "");
+    const afterCursor = normalizeWhitespace(after || "");
     const modArg = modality && OPENNEURO_MODALITIES.has(String(modality).trim().toUpperCase())
       ? String(modality).trim().toUpperCase()
       : null;
 
-    const query = modArg
-      ? `{ datasets(first: ${limit}, modality: "${modArg}") { edges { node { id name metadata { modalities } latestSnapshot { tag } } } pageInfo { hasNextPage } } }`
-      : `{ datasets(first: ${limit}) { edges { node { id name metadata { modalities } latestSnapshot { tag } } } pageInfo { hasNextPage } } }`;
+    const fetchOpenNeuroPage = async (pageLimit, cursor) => {
+      const args = [`first: ${pageLimit}`];
+      if (modArg) args.push(`modality: "${modArg}"`);
+      if (cursor) args.push(`after: ${JSON.stringify(cursor)}`);
+      const gql = `{ datasets(${args.join(", ")}) { edges { node { id name metadata { modalities dxStatus studyDomain datasetName } latestSnapshot { tag description { Name } } } } pageInfo { hasNextPage endCursor } } }`;
 
-    let data;
-    try {
       const res = await fetchWithRetry(OPENNEURO_GRAPHQL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query: gql }),
         timeoutMs: 15000,
         retries: 1,
       });
-      data = await res.json();
+      return await res.json();
+    };
+
+    let data;
+    try {
+      if (keyword) {
+        const normalizeForMatch = (value) => String(value || "")
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        const needle = normalizeForMatch(keyword);
+        let cursor = afterCursor || null;
+        let scannedPages = 0;
+        let hasNextPage = false;
+        let endCursor = cursor;
+        const matchedEdges = [];
+
+        while (matchedEdges.length < limit && scannedPages < 40) {
+          const page = await fetchOpenNeuroPage(50, cursor);
+          const errs = page?.errors;
+          if (errs && errs.length > 0) {
+            data = page;
+            break;
+          }
+          const pageEdges = page?.data?.datasets?.edges || [];
+          const pageInfo = page?.data?.datasets?.pageInfo || {};
+          for (const edge of pageEdges) {
+            const node = edge?.node || {};
+            const haystack = normalizeForMatch([
+              node.id,
+              node.name,
+              node.metadata?.datasetName,
+              node.metadata?.dxStatus,
+              node.metadata?.studyDomain,
+              node.latestSnapshot?.description?.Name,
+            ].filter(Boolean).join(" "));
+            if (needle && haystack.includes(needle)) {
+              matchedEdges.push(edge);
+            }
+          }
+          hasNextPage = Boolean(pageInfo?.hasNextPage);
+          endCursor = pageInfo?.endCursor || null;
+          if (matchedEdges.length >= limit) break;
+          if (!hasNextPage) break;
+          cursor = endCursor;
+          scannedPages += 1;
+        }
+
+        data = {
+          data: {
+            datasets: {
+              edges: matchedEdges.slice(0, limit),
+              pageInfo: {
+                hasNextPage,
+                endCursor,
+              },
+            },
+          },
+        };
+      } else {
+        data = await fetchOpenNeuroPage(limit, afterCursor || null);
+      }
     } catch (error) {
       return {
         content: [{
           type: "text",
           text: renderStructuredResponse({
             summary: `OpenNeuro search failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
-            keyFields: [modArg ? `Modality: ${modArg}` : "Modality: all"],
+            keyFields: [
+              keyword ? `Keyword: ${keyword}` : "Keyword: none",
+              modArg ? `Modality: ${modArg}` : "Modality: all",
+            ],
             sources: ["https://openneuro.org/", "https://docs.openneuro.org/api.html"],
             limitations: ["GraphQL API may be temporarily unavailable."],
           }),
@@ -13420,7 +13691,10 @@ server.registerTool(
           type: "text",
           text: renderStructuredResponse({
             summary: `OpenNeuro GraphQL error: ${msg.slice(0, 300)}`,
-            keyFields: [modArg ? `Modality: ${modArg}` : "Modality: all"],
+            keyFields: [
+              keyword ? `Keyword: ${keyword}` : "Keyword: none",
+              modArg ? `Modality: ${modArg}` : "Modality: all",
+            ],
             sources: ["https://openneuro.org/"],
             limitations: ["Check modality spelling: MRI, MEG, EEG, PET, iEEG, behavioral."],
           }),
@@ -13434,8 +13708,11 @@ server.registerTool(
         content: [{
           type: "text",
           text: renderStructuredResponse({
-            summary: `No OpenNeuro datasets found${modArg ? ` for modality ${modArg}` : ""}.`,
-            keyFields: [modArg ? `Modality: ${modArg}` : "Modality: all"],
+            summary: `No OpenNeuro datasets found${keyword ? ` for keyword '${keyword}'` : ""}${modArg ? ` with modality ${modArg}` : ""}.`,
+            keyFields: [
+              keyword ? `Keyword: ${keyword}` : "Keyword: none",
+              modArg ? `Modality: ${modArg}` : "Modality: all",
+            ],
             sources: ["https://openneuro.org/datasets"],
             limitations: ["Valid modalities: MRI, MEG, EEG, PET, iEEG, behavioral."],
           }),
@@ -13446,22 +13723,27 @@ server.registerTool(
     const lines = edges.map((e, i) => {
       const node = e?.node || {};
       const id = node.id || "?";
-      const name = node.name || "Unnamed";
+      const name = node.metadata?.datasetName || node.latestSnapshot?.description?.Name || node.name || "Unnamed";
       const mods = Array.isArray(node.metadata?.modalities) ? node.metadata.modalities.join(", ") : "unknown";
       const tag = node.latestSnapshot?.tag || "—";
-      return `  ${String(i + 1).padStart(3)}. ${id} — ${name} (${mods}) snapshot: ${tag}`;
+      const dx = node.metadata?.dxStatus ? ` dx: ${node.metadata.dxStatus}` : "";
+      const domain = node.metadata?.studyDomain ? ` domain: ${node.metadata.studyDomain}` : "";
+      return `  ${String(i + 1).padStart(3)}. ${id} — ${name} (${mods})${dx}${domain} snapshot: ${tag}`;
     });
 
     const hasMore = data?.data?.datasets?.pageInfo?.hasNextPage;
+    const nextCursor = data?.data?.datasets?.pageInfo?.endCursor || null;
 
     return {
       content: [{
         type: "text",
         text: renderStructuredResponse({
-          summary: `OpenNeuro: ${edges.length} dataset(s)${modArg ? ` (modality: ${modArg})` : ""}.${hasMore ? " More available via pagination." : ""}`,
+          summary: `OpenNeuro: ${edges.length} dataset(s)${keyword ? ` matching '${keyword}'` : ""}${modArg ? ` (modality: ${modArg})` : ""}.${hasMore ? " More available via pagination." : ""}`,
           keyFields: [
+            keyword ? `Keyword: ${keyword}` : "Keyword: none",
             modArg ? `Modality filter: ${modArg}` : "Modality: all",
             `Showing: ${edges.length}`,
+            nextCursor ? `Next cursor: ${nextCursor}` : "Next cursor: none",
             "\nDatasets:",
             ...lines,
           ],
@@ -13470,7 +13752,9 @@ server.registerTool(
             `https://openneuro.org/datasets${modArg ? `?modality=${modArg.toLowerCase()}` : ""}`,
           ],
           limitations: [
-            "Use get_openneuro_dataset with a dataset ID (e.g. ds000224) for full metadata, DOI, and description.",
+            "OpenNeuro dataset browsing is paginated. If a next cursor is present, call search_openneuro_datasets again with after=<cursor> rather than assuming the first page is exhaustive.",
+            "Keyword matching is against public dataset metadata fields such as dataset name, dxStatus, and studyDomain; OpenNeuro does not expose a dedicated disorder filter in this tool.",
+            "Use get_openneuro_dataset with a dataset ID (e.g. ds000224) for detailed metadata, diagnosis/study fields, DOI, and approximate subject counts.",
           ],
         }),
       }],
@@ -13483,7 +13767,7 @@ server.registerTool(
   {
     description:
       "Retrieves detailed metadata for a specific OpenNeuro dataset by ID (e.g. ds000224). " +
-      "Returns dataset name, modalities, DOI, latest snapshot tag, and description. Use after search_openneuro_datasets to inspect promising datasets.",
+      "Returns dataset name, modalities, DOI, diagnosis/study fields when present, latest snapshot tag, tasks, and approximate subject counts from the public summary. Use after search_openneuro_datasets to inspect promising datasets.",
     inputSchema: {
       datasetId: z.string().describe("OpenNeuro dataset ID, e.g. ds000224 or ds001."),
     },
@@ -13495,7 +13779,7 @@ server.registerTool(
     }
     const normalizedId = id.startsWith("ds") ? id : `ds${id}`;
 
-    const query = `{ dataset(id: "${normalizedId}") { id name metadata { modalities } latestSnapshot { tag description { Name DatasetDOI } } } }`;
+    const query = `{ dataset(id: "${normalizedId}") { id name metadata { modalities dxStatus studyDomain studyDesign trialCount datasetName } latestSnapshot { tag description { Name DatasetDOI } summary { subjects tasks modalities } } } }`;
 
     let data;
     try {
@@ -13554,9 +13838,12 @@ server.registerTool(
 
     const mods = Array.isArray(ds.metadata?.modalities) ? ds.metadata.modalities.join(", ") : "unknown";
     const desc = ds.latestSnapshot?.description || {};
+    const summary = ds.latestSnapshot?.summary || {};
     const name = desc.Name || ds.name || "Unnamed";
     const doi = desc.DatasetDOI || "";
     const tag = ds.latestSnapshot?.tag || "—";
+    const subjectCount = Array.isArray(summary.subjects) ? summary.subjects.length : null;
+    const tasks = Array.isArray(summary.tasks) && summary.tasks.length > 0 ? summary.tasks.join(", ") : null;
 
     const keyFields = [
       `Dataset: ${name}`,
@@ -13565,6 +13852,12 @@ server.registerTool(
       `Latest snapshot: ${tag}`,
     ];
     if (doi) keyFields.push(`DOI: ${doi}`);
+    if (ds.metadata?.dxStatus) keyFields.push(`Diagnosis/status: ${ds.metadata.dxStatus}`);
+    if (ds.metadata?.studyDomain) keyFields.push(`Study domain: ${ds.metadata.studyDomain}`);
+    if (ds.metadata?.studyDesign) keyFields.push(`Study design: ${ds.metadata.studyDesign}`);
+    if (subjectCount !== null) keyFields.push(`Approx. subjects in public summary: ${subjectCount}`);
+    if (tasks) keyFields.push(`Tasks: ${tasks}`);
+    if (Number.isFinite(ds.metadata?.trialCount)) keyFields.push(`Trial count: ${ds.metadata.trialCount}`);
 
     return {
       content: [{
@@ -13577,6 +13870,7 @@ server.registerTool(
             doi ? `https://doi.org/${doi.replace(/^doi:/i, "").trim()}` : null,
           ].filter(Boolean),
           limitations: [
+            "Approximate subject counts are derived from the public summary subject list and may not reflect cohort splits or complete phenotype tables.",
             "File listings and subject-level metadata require the OpenNeuro CLI or direct S3/git access.",
           ],
         }),

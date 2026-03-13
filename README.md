@@ -238,7 +238,7 @@ The reasoning trace captures the full decision chain per step and is stored alon
 | **Neuroscience Knowledge Graph** | `search_ebrains_kg`, `get_ebrains_kg_document` | EBRAINS KG (datasets, models, software, contributors, projects) |
 | **Neuroscience Datasets (CONP)** | `search_conp_datasets`, `get_conp_dataset_details` | CONP datasets via `conpdatasets` GitHub catalog |
 | **Cohort Discovery (Neurobagel)** | `query_neurobagel_cohorts` | Neurobagel public node API (harmonized cohort-level dataset discovery) |
-| **Neuroimaging Datasets (OpenNeuro)** | `search_openneuro_datasets`, `get_openneuro_dataset` | OpenNeuro GraphQL (BIDS fMRI/MRI/MEG/EEG datasets by modality) |
+| **Neuroimaging Datasets (OpenNeuro)** | `search_openneuro_datasets`, `get_openneuro_dataset` | OpenNeuro GraphQL (BIDS fMRI/MRI/MEG/EEG datasets by keyword and/or modality, with pagination and metadata inspection) |
 | **Neurophysiology (DANDI)** | `search_dandi_datasets`, `get_dandi_dataset` | DANDI Archive REST API (electrophysiology, calcium imaging, NWB/BIDS) |
 | **Neuroelectromagnetic (NEMAR)** | `search_nemar_datasets`, `get_nemar_dataset_details` | NEMAR (EEG/MEG/iEEG from OpenNeuro, nemarDatasets GitHub, BIDS, HED) |
 | **Brain-CODE (OBI)** | `search_braincode_datasets`, `get_braincode_dataset_details` | Brain-CODE via CONP (Ontario Brain Institute: epilepsy, depression, neurodegeneration, CP, concussion) |

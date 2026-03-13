@@ -6398,6 +6398,9 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
   **How to query**: Always wrap table names in backticks in SQL. Short names are auto-expanded:
   `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`.
   Example: SELECT id, approvedSymbol FROM `open_targets_platform.target` WHERE approvedSymbol = 'BRCA1'.
+  If a filter value contains an apostrophe, escape it as two single quotes:
+  `WHERE name = 'Alzheimer''s disease'`.
+  When trying unfamiliar or nested-field SQL, run the same query once with `dryRun=true` first to catch syntax issues cheaply.
 
   Start every structured data lookup with BigQuery. Use `list_bigquery_tables` to discover tables, \
 and `list_bigquery_tables(dataset="...", table="...")` to inspect column schemas before writing queries.
@@ -6452,6 +6455,8 @@ umiami_lincs (perturbation signatures), ebi_surechembl (patents).
 CRITICAL SQL syntax: Always wrap table references in backticks in your SQL queries. \
 Short names are auto-expanded: `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`. \
 Example: SELECT id, approvedSymbol FROM `open_targets_platform.target` WHERE approvedSymbol = 'BRCA1'.
+If a filter value contains an apostrophe, escape it as two single quotes: `WHERE name = 'Alzheimer''s disease'`. \
+For unfamiliar or nested-field queries, first run the same SQL with `dryRun=true` to catch syntax issues before executing it. \
 Before writing queries:
   1. Call `list_bigquery_tables(dataset="<dataset_name>")` to see all available tables.
   2. Call `list_bigquery_tables(dataset="<dataset_name>", table="<table_name>")` to get the full column schema (names, types, descriptions).
