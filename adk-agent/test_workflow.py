@@ -363,6 +363,161 @@ def test_render_react_step_progress_with_tool_log_and_claims():
     assert "LRRK2" in rendered
 
 
+def test_select_informative_summary_text_strips_activity_prefixes():
+    text = (
+        "Retrieving clinical trial details for NCT05054725: "
+        "This Phase 2 trial is COMPLETED with results posted. "
+        "It evaluated objective response rate in NSCLC with KRAS G12C mutation."
+    )
+
+    summary = workflow._select_informative_summary_text(text)
+
+    assert "Retrieving clinical trial details" not in summary
+    assert summary.startswith("This Phase 2 trial is COMPLETED with results posted.")
+    assert "objective response rate" in summary
+
+
+def test_build_deterministic_step_result_ignores_arrow_activity_lines():
+    step = {
+        "id": "S7",
+        "goal": "Retrieve representative colorectal cancer trial details",
+        "tool_hint": "get_clinical_trial",
+    }
+    final_text = """## Summary
+Retrieving clinical trial details -> Clinical Trial: Sotorasib and Panitumumab Versus Investigator's Choice for Participants With Kirsten Rat Sarcoma (KRAS) p.G12C Mutation
+Retrieving clinical trial details -> Clinical Trial: Phase 3 Study of MRTX849 With Cetuximab vs Chemotherapy in Patients With Advanced Colorectal Cancer With KRAS G12C Mutation
+"""
+    tool_log = [
+        {
+            "tool": "ClinicalTrials.gov",
+            "raw_tool": "get_clinical_trial",
+            "status": "done",
+            "summary": "Retrieving clinical trial details",
+            "result": "NCT05198934 is an active, not recruiting phase 3 trial of sotorasib plus panitumumab in colorectal cancer.",
+        },
+        {
+            "tool": "ClinicalTrials.gov",
+            "raw_tool": "get_clinical_trial",
+            "status": "done",
+            "summary": "Retrieving clinical trial details",
+            "result": "NCT04793958 is an active, not recruiting phase 3 study of adagrasib with cetuximab versus chemotherapy in advanced colorectal cancer.",
+        },
+    ]
+
+    result = workflow._build_deterministic_step_result(
+        step=step,
+        step_id="S7",
+        final_text=final_text,
+        tool_log=tool_log,
+    )
+
+    assert "Retrieving clinical trial details" not in result["result_summary"]
+    assert "Clinical Trial:" not in result["result_summary"]
+    assert "NCT05198934" in result["result_summary"]
+    assert "ClinicalTrials.gov" in result["result_summary"]
+
+
+def test_build_deterministic_step_result_prefers_informative_model_summary():
+    step = {
+        "id": "S6",
+        "goal": "Retrieve representative NSCLC trial details",
+        "tool_hint": "get_clinical_trial",
+    }
+    final_text = (
+        "## Summary\n"
+        "Retrieving clinical trial details -> Clinical Trial: Phase 2 Trial of Adagrasib Monotherapy and in Combination With Pembrolizumab and a Phase 3 Trial of Adagrasib in Combination in Patients With a KRAS G12C Mutation KRYSTAL-7\n"
+    )
+    tool_log = [
+        {
+            "tool": "ClinicalTrials.gov",
+            "raw_tool": "get_clinical_trial",
+            "status": "done",
+            "summary": "Retrieving clinical trial details",
+            "result": "NCT04613596 is a recruiting phase 2/3 KRYSTAL-7 study evaluating adagrasib monotherapy and combination therapy in KRAS G12C-mutant NSCLC.",
+        }
+    ]
+    model_summary = (
+        "Posted completed efficacy results for adagrasib monotherapy in KRAS G12C NSCLC remain limited; "
+        "the main representative study is KRYSTAL-7 (NCT04613596), which is still recruiting."
+    )
+
+    result = workflow._build_deterministic_step_result(
+        step=step,
+        step_id="S6",
+        final_text=final_text,
+        tool_log=tool_log,
+        base_result={"status": "completed", "result_summary": model_summary},
+    )
+
+    assert result["result_summary"] == model_summary
+    assert not result["result_summary"].startswith("ClinicalTrials.gov")
+    assert result["step_progress_note"].startswith("Posted completed efficacy results")
+
+
+def test_build_deterministic_step_result_ignores_process_like_model_summary():
+    step = {
+        "id": "S6",
+        "goal": "Retrieve representative NSCLC trial details",
+        "tool_hint": "get_clinical_trial",
+    }
+    final_text = (
+        "## Summary\n"
+        "Retrieving clinical trial details for NCT04613596: This Phase 2/3 KRYSTAL-7 study is still recruiting and has no posted completed efficacy results yet.\n"
+    )
+    tool_log = [
+        {
+            "tool": "ClinicalTrials.gov",
+            "raw_tool": "get_clinical_trial",
+            "status": "done",
+            "summary": "Retrieving clinical trial details",
+            "result": "NCT04613596 is a recruiting phase 2/3 KRYSTAL-7 study evaluating adagrasib monotherapy and combination therapy in KRAS G12C-mutant NSCLC.",
+        }
+    ]
+
+    result = workflow._build_deterministic_step_result(
+        step=step,
+        step_id="S6",
+        final_text=final_text,
+        tool_log=tool_log,
+        base_result={"status": "completed", "result_summary": "Retrieving clinical trial details for NCT04613596"},
+    )
+
+    assert result["result_summary"] != "Retrieving clinical trial details for NCT04613596"
+    assert "This Phase 2/3 KRYSTAL-7 study is still recruiting" in result["result_summary"]
+
+
+def test_build_deterministic_step_result_falls_back_when_summary_is_only_process_text():
+    step = {
+        "id": "S2",
+        "goal": "Search NSCLC monotherapy trials",
+        "tool_hint": "search_clinical_trials",
+    }
+    final_text = (
+        "## Summary\n"
+        "Searching clinical trials for Sotorasib NSCLC monotherapy found no completed monotherapy studies.\n"
+    )
+    tool_log = [
+        {
+            "tool": "ClinicalTrials.gov",
+            "raw_tool": "search_clinical_trials",
+            "status": "done",
+            "summary": "Searching clinical trials for Sotorasib NSCLC monotherapy",
+            "result": 'No clinical trials found for: "Sotorasib NSCLC monotherapy" with status COMPLETED',
+        }
+    ]
+
+    result = workflow._build_deterministic_step_result(
+        step=step,
+        step_id="S2",
+        final_text=final_text,
+        tool_log=tool_log,
+    )
+
+    assert not result["result_summary"].startswith("Searching clinical trials")
+    assert 'No clinical trials found for: "Sotorasib NSCLC monotherapy"' in result["result_summary"]
+    assert "ClinicalTrials.gov" in result["result_summary"]
+
+
 def test_describe_tool_call_bigquery():
     desc = workflow._describe_tool_call(
         "run_bigquery_select_query",
@@ -896,14 +1051,21 @@ def test_synth_context_instructions_include_evidence_and_execution_summaries():
     payload = json.loads(instructions[1])
     assert "evidence_store_summary" in payload
     assert "claim_synthesis_summary" in payload
+    assert "evidence_briefs" in payload
     assert "execution_metrics_summary" in payload
     assert payload["evidence_store_summary"]["evidence_count"] >= 1
     assert payload["claim_synthesis_summary"]["substantive_claim_count"] >= 1
+    assert payload["evidence_briefs"]
+    assert payload["evidence_briefs"][0]["theme"]
+    assert payload["evidence_briefs"][0]["top_claims"]
+    assert payload["evidence_briefs"][0]["supporting_ids"]
+    assert payload["evidence_briefs"][0]["evidence_notes"]
     assert payload["execution_metrics_summary"]["step_count"] == 1
     assert payload["execution_metrics_summary"]["avg_structured_observations_per_step"] == 1.0
     assert payload["steps"][0]["structured_observations"]
     assert payload["steps"][0]["entity_ids"]
     assert payload["steps"][0]["claim_ids"]
+    assert "cohesive prose" in instructions[-1]
 
 
 def test_claim_synthesis_summary_weights_sources_and_flags_mixed_evidence():

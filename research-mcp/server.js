@@ -178,6 +178,27 @@ function normalizeWhitespace(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+const CLINICAL_TRIAL_STATUS_VALUES = new Set([
+  "RECRUITING",
+  "COMPLETED",
+  "ACTIVE_NOT_RECRUITING",
+  "TERMINATED",
+]);
+
+function normalizeClinicalTrialStatus(value) {
+  const raw = normalizeWhitespace(value).toUpperCase();
+  if (!raw) return "";
+  if (CLINICAL_TRIAL_STATUS_VALUES.has(raw)) {
+    return raw;
+  }
+  const matches = raw.match(/\b(?:RECRUITING|COMPLETED|ACTIVE_NOT_RECRUITING|TERMINATED)\b/g) || [];
+  const uniqueMatches = [...new Set(matches)];
+  if (uniqueMatches.length === 1) {
+    return uniqueMatches[0];
+  }
+  return "";
+}
+
 function normalizeTextPart(part) {
   if (typeof part === "string") {
     const normalized = part.trim();
@@ -4346,6 +4367,7 @@ server.registerTool(
     },
   },
   async ({ query, status, limit }) => {
+    const normalizedStatus = normalizeClinicalTrialStatus(status);
     const isExactNctQuery = /^NCT\d{8}$/i.test(normalizeWhitespace(query || ""));
     const minimumLimit = isExactNctQuery ? 1 : 5;
     const boundedLimit = limit ? Math.max(minimumLimit, Math.min(200, Math.round(limit))) : 50;
@@ -4364,8 +4386,8 @@ server.registerTool(
           format: "json",
         });
 
-        if (status) {
-          params.append("filter.overallStatus", status);
+        if (normalizedStatus) {
+          params.append("filter.overallStatus", normalizedStatus);
         }
         if (nextPageToken) {
           params.append("pageToken", nextPageToken);
@@ -4398,7 +4420,7 @@ server.registerTool(
         content: [
           {
             type: "text",
-            text: `No clinical trials found for: "${query}"${status ? ` with status ${status}` : ""}`,
+            text: `No clinical trials found for: "${query}"${normalizedStatus ? ` with status ${normalizedStatus}` : ""}`,
           },
         ],
       };
@@ -4436,7 +4458,7 @@ server.registerTool(
       content: [
         {
           type: "text",
-          text: `Clinical trials for "${query}":\n${countLine}${hasMorePages ? " (additional pages available)" : ""}${status ? `\nStatus filter: ${status}` : ""}\n\n${formatted}\n\nUse get_clinical_trial with the NCT ID for full details including results.`,
+          text: `Clinical trials for "${query}":\n${countLine}${hasMorePages ? " (additional pages available)" : ""}${normalizedStatus ? `\nStatus filter: ${normalizedStatus}` : ""}\n\n${formatted}\n\nUse get_clinical_trial with the NCT ID for full details including results.`,
         },
       ],
     };
@@ -8333,6 +8355,7 @@ server.registerTool(
   },
   async ({ query, status, maxStudies = 60, maxPages = 4 }) => {
     try {
+      const normalizedStatus = normalizeClinicalTrialStatus(status);
       const boundedStudies = Math.max(10, Math.min(200, Math.round(maxStudies)));
       const boundedPages = Math.max(1, Math.min(8, Math.round(maxPages)));
       const studies = [];
@@ -8347,8 +8370,8 @@ server.registerTool(
           pageSize: String(pageSize),
           format: "json",
         });
-        if (status) {
-          params.append("filter.overallStatus", status);
+        if (normalizedStatus) {
+          params.append("filter.overallStatus", normalizedStatus);
         }
         if (nextPageToken) {
           params.append("pageToken", nextPageToken);
