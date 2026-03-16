@@ -1028,7 +1028,7 @@ class UiRuntime:
                 run.updated_at = _utc_now()
 
     async def _save_task_with_progress(
-        self, task: dict, run_id: str | None = None, *, owner_ip: str = "", merge_progress: bool = True
+        self, task: dict, run_id: str | None = None, *, owner_ip: str = "", merge_progress: bool = True, flush: bool = True
     ) -> None:
         """Save task to store, syncing progress data from the active run unless merge_progress=False."""
         active_run_id = ""
@@ -1049,9 +1049,9 @@ class UiRuntime:
             task["active_run_id"] = active_run_id
         else:
             task.pop("active_run_id", None)
-        self.store.save_task(task, owner_ip=owner_ip)
+        self.store.save_task(task, owner_ip=owner_ip, flush=flush)
         conversation_id = str(task.get("conversation_id", "") or "").strip()
-        if conversation_id:
+        if flush and conversation_id:
             await self._persist_conversation_state(
                 conversation_id,
                 task_id=str(task.get("task_id", "") or "").strip(),
@@ -1069,7 +1069,7 @@ class UiRuntime:
         )
         async with self.runs_lock:
             self.runs[run.run_id] = run
-        self.store.save_run(run.to_dict())
+        self.store.save_run(run.to_dict(), flush=True)
         return run
 
     async def _update_run(self, run_id: str, **updates) -> None:
@@ -1083,7 +1083,7 @@ class UiRuntime:
             run.updated_at = _utc_now()
             run_payload = run.to_dict()
         if run_payload:
-            self.store.save_run(run_payload)
+            self.store.save_run(run_payload, flush=True)
 
     async def _append_progress_event(
         self,
@@ -1447,7 +1447,7 @@ class UiRuntime:
                     break
 
                 if plan_status != "completed":
-                    await self._save_task_with_progress(task, run_id)
+                    await self._save_task_with_progress(task, run_id, flush=False)
                     await self._append_progress_event(
                         run_id,
                         phase="execute",
@@ -1702,9 +1702,7 @@ class UiRuntime:
             run = self.runs.get(run_id)
             if not run:
                 return self.store.get_run(run_id)
-            payload = run.to_dict()
-        self.store.save_run(payload)
-        return payload
+            return run.to_dict()
 
 
 def _extract_next_steps(markdown: str) -> list[str]:

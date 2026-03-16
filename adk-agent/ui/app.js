@@ -8,6 +8,7 @@ const state = {
   runsByTaskId: {},
   pendingRunId: null,
   pollTimer: null,
+  pollInFlight: false,
   isLoading: false,
   health: null,
   clarificationMessage: "",
@@ -22,6 +23,8 @@ const state = {
   debugOpen: false,
   debugByTaskId: {},
   activityExpandedByTask: {},
+  handlingTerminalRunIds: new Set(),
+  startingTaskIds: new Set(),
 };
 
 const el = {
@@ -447,8 +450,10 @@ function planHtmlForIteration(iteration) {
 
 function checkpointHtml(taskId, planHtml, showAction, buttonLabel) {
   if (!planHtml && !showAction) return "";
+  const normalizedTaskId = String(taskId || "").trim();
+  const isStarting = state.startingTaskIds.has(normalizedTaskId);
   const action = showAction
-    ? `<button class="primary-btn checkpoint-start-btn" data-action="checkpoint-start" data-task-id="${escapeHtml(taskId)}">${escapeHtml(buttonLabel || "Start research")}</button>`
+    ? `<button class="primary-btn checkpoint-start-btn" data-action="checkpoint-start" data-task-id="${escapeHtml(normalizedTaskId)}" ${isStarting ? 'disabled aria-disabled="true"' : ""}>${escapeHtml(isStarting ? "Starting..." : (buttonLabel || "Start research"))}</button>`
     : "";
   return `
     <article class="message assistant checkpoint-message">
@@ -900,6 +905,15 @@ function iterationActivitySnapshot(iteration) {
   const task = iteration?.task || {};
   const taskId = String(task.task_id || "").trim();
   if (!taskId) return null;
+  if (state.startingTaskIds.has(taskId)) {
+    return buildActivitySnapshot({
+      taskId,
+      status: "running",
+      events: [{ type: "execution.running", human_line: "Executing plan..." }],
+      summaries: [],
+      planApproved: true,
+    });
+  }
   const run = getRunForTask(taskId);
   const taskStatus = String(task.status || "").trim();
   const runStatus = String(run?.status || "").trim();
@@ -939,6 +953,8 @@ function taskHasStarted(task) {
 }
 
 function placeActivityAfterPlan(task, activeRun) {
+  const taskId = String(task?.task_id || "").trim();
+  if (taskId && state.startingTaskIds.has(taskId)) return true;
   const status = String(activeRun?.status || task?.status || "").trim();
   // When we have an active run that's executing, plan was approved - place below immediately
   // (avoids delay until conversation is re-fetched with updated hitl_history)
@@ -1524,6 +1540,7 @@ function stopRunPolling() {
     state.pollTimer = null;
   }
   state.activeRunIds.clear();
+  state.pollInFlight = false;
   setLoading(false);
 }
 
@@ -1531,29 +1548,42 @@ function ensurePollTimerRunning() {
   if (state.pollTimer || state.activeRunIds.size === 0) return;
   setLoading(true);
   const poll = async () => {
+    if (state.pollInFlight) return;
     const ids = Array.from(state.activeRunIds);
-    if (ids.length === 0) return;
-    const results = await Promise.allSettled(
-      ids.map((runId) => api(`/api/runs/${encodeURIComponent(runId)}`))
-    );
-    for (let i = 0; i < ids.length; i++) {
-      const runId = ids[i];
-      const r = results[i];
-      if (r.status === "rejected") {
-        state.activeRunIds.delete(runId);
-        setNotice(`Run polling failed: ${r.reason?.message || "Unknown error"}`, true);
-        continue;
+    if (ids.length === 0) {
+      if (state.pollTimer) {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
       }
-      const run = r.value;
-      storeRunData(run);
-      updateInlineActivityCard(run);
-      updateLoadingSpinnerLabel();
-      await handleTerminalRunState(run);
-    }
-    if (state.activeRunIds.size === 0 && state.pollTimer) {
-      clearInterval(state.pollTimer);
-      state.pollTimer = null;
       setLoading(false);
+      return;
+    }
+    state.pollInFlight = true;
+    try {
+      const results = await Promise.allSettled(
+        ids.map((runId) => api(`/api/runs/${encodeURIComponent(runId)}`))
+      );
+      for (let i = 0; i < ids.length; i++) {
+        const runId = ids[i];
+        const r = results[i];
+        if (r.status === "rejected") {
+          state.activeRunIds.delete(runId);
+          setNotice(`Run polling failed: ${r.reason?.message || "Unknown error"}`, true);
+          continue;
+        }
+        const run = r.value;
+        storeRunData(run);
+        updateInlineActivityCard(run);
+        updateLoadingSpinnerLabel();
+        await handleTerminalRunState(run);
+      }
+    } finally {
+      state.pollInFlight = false;
+      if (state.activeRunIds.size === 0 && state.pollTimer) {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
+        setLoading(false);
+      }
     }
   };
   poll();
@@ -1573,45 +1603,55 @@ async function handleTerminalRunState(run) {
   const isQueuedFeedbackAck = status === "queued" && kind === "feedback_task";
   const terminalStates = new Set(["completed", "failed", "awaiting_hitl", "needs_clarification"]);
   if (!terminalStates.has(status) && !isQueuedFeedbackAck) return;
+  if (state.handlingTerminalRunIds.has(run.run_id)) return;
 
-  state.activeRunIds.delete(run.run_id);
-  if (state.pendingRunId === run.run_id) state.pendingRunId = null;
-  if (state.activeRunIds.size === 0 && state.pollTimer) {
-    clearInterval(state.pollTimer);
-    state.pollTimer = null;
-    setLoading(false);
-  }
+  state.handlingTerminalRunIds.add(run.run_id);
+  try {
+    if (run.task_id) {
+      state.startingTaskIds.delete(String(run.task_id || "").trim());
+    }
 
-  if (status === "failed") {
-    setNotice(run.error || "Run failed.", true);
-  } else if (status === "needs_clarification") {
-    state.clarificationMessage = run.clarification || "Clarification required before execution.";
-    setNotice("");
-  } else {
-    setNotice("");
-  }
+    state.activeRunIds.delete(run.run_id);
+    if (state.pendingRunId === run.run_id) state.pendingRunId = null;
+    if (state.activeRunIds.size === 0 && state.pollTimer) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+      setLoading(false);
+    }
 
-  if (run.task_id) {
-    try {
-      const taskDetail = await api(`/api/tasks/${encodeURIComponent(run.task_id)}`);
-      const conversationId = String(taskDetail?.task?.conversation_id || "").trim() || `conv_${run.task_id}`;
-      await refreshConversations({ keepSelection: true, skipRender: true });
-      await selectConversation(conversationId, { silent: true, skipRender: true });
-      if (status === "completed") {
-        state.selectedReportTaskId = run.task_id;
+    if (status === "failed") {
+      setNotice(run.error || "Run failed.", true);
+    } else if (status === "needs_clarification") {
+      state.clarificationMessage = run.clarification || "Clarification required before execution.";
+      setNotice("");
+    } else {
+      setNotice("");
+    }
+
+    if (run.task_id) {
+      try {
+        const taskDetail = await api(`/api/tasks/${encodeURIComponent(run.task_id)}`);
+        const conversationId = String(taskDetail?.task?.conversation_id || "").trim() || `conv_${run.task_id}`;
+        state.selectedConversationId = conversationId;
+        await refreshConversations({ keepSelection: true, skipRender: true });
+        if (status === "completed") {
+          state.selectedReportTaskId = run.task_id;
+        }
+      } catch (err) {
+        setNotice(`Could not refresh conversations: ${err.message}`, true);
       }
-    } catch (err) {
-      setNotice(`Could not refresh conversations: ${err.message}`, true);
+    } else {
+      try {
+        await refreshConversations({ keepSelection: true, skipRender: true });
+      } catch (err) {
+        setNotice(`Could not refresh conversations: ${err.message}`, true);
+      }
     }
-  } else {
-    try {
-      await refreshConversations({ keepSelection: true, skipRender: true });
-    } catch (err) {
-      setNotice(`Could not refresh conversations: ${err.message}`, true);
-    }
-  }
 
-  renderAll();
+    renderAll();
+  } finally {
+    state.handlingTerminalRunIds.delete(run.run_id);
+  }
 }
 
 async function submitNewQuery(query, { conversationId = null, parentTaskId = null } = {}) {
@@ -1637,31 +1677,35 @@ async function submitNewQuery(query, { conversationId = null, parentTaskId = nul
 
 async function submitContinue(taskId) {
   const normalizedTaskId = String(taskId || "").trim();
-  if (!normalizedTaskId) return;
+  if (!normalizedTaskId || state.startingTaskIds.has(normalizedTaskId)) return;
   const detail = state.selectedConversationDetail;
   const iteration = findIteration(detail, normalizedTaskId);
   const task = iteration?.task || null;
   const planVersionId = iteration?.active_plan_version?.version_id || null;
+  state.startingTaskIds.add(normalizedTaskId);
+  if (task) task.awaiting_hitl = false;
+  renderMessages();
   let payload;
   try {
-    payload = await api(`/api/tasks/${encodeURIComponent(normalizedTaskId)}/start`, {
-      method: "POST",
-      body: JSON.stringify({ plan_version_id: planVersionId }),
-    });
-  } catch (err) {
-    if (String(err?.message || "").trim() !== "Not Found") {
-      throw err;
-    }
     try {
+      payload = await api(`/api/tasks/${encodeURIComponent(normalizedTaskId)}/start`, {
+        method: "POST",
+        body: JSON.stringify({ plan_version_id: planVersionId }),
+      });
+    } catch (err) {
+      if (String(err?.message || "").trim() !== "Not Found") {
+        throw err;
+      }
       payload = await api(`/api/tasks/${encodeURIComponent(normalizedTaskId)}/continue`, {
         method: "POST",
         body: JSON.stringify({}),
       });
-    } catch (fallbackErr) {
-      throw fallbackErr;
     }
+  } catch (err) {
+    state.startingTaskIds.delete(normalizedTaskId);
+    renderMessages();
+    throw err;
   }
-  if (task) task.awaiting_hitl = false;
   storeRunData(payload);
   renderMessages();
   startRunPolling(payload.run_id);

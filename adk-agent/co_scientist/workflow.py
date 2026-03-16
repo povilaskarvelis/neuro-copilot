@@ -6292,7 +6292,6 @@ def _synth_before_model_callback(*, callback_context: CallbackContext, llm_reque
 
     callback_context.state[STATE_SYNTH_BUFFER] = ""
     llm_request.config = llm_request.config or types.GenerateContentConfig()
-    # Synthesizer uses 2.5 Flash by default; skip thinking_config (3.1-only feature)
     llm_request.config.response_mime_type = None
     llm_request.append_instructions(_synth_context_instructions(task_state, callback_context))
     return None

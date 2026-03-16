@@ -13,7 +13,7 @@ REGION="${REGION:-us-central1}"
 SERVICE_NAME="${SERVICE_NAME:-ai-co-scientist}"
 REPO_NAME="${REPO_NAME:-co-scientist-images}"
 IMAGE_NAME="${IMAGE_NAME:-ai-co-scientist}"
-USE_VERTEX_AI="${USE_VERTEX_AI:-false}"
+USE_VERTEX_AI="${USE_VERTEX_AI:-true}"
 GOOGLE_API_KEY="${GOOGLE_API_KEY:-}"
 GA4_MEASUREMENT_ID="${GA4_MEASUREMENT_ID:-G-NTCXHW3B2G}"
 
@@ -101,10 +101,12 @@ DEPLOY_FLAGS=(
   --platform managed
   --allow-unauthenticated
   --port 8080
-  --cpu 2
-  --memory 2Gi
-  --min-instances 0
+  --cpu 4
+  --memory 4Gi
+  --min-instances 1
   --max-instances 3
+  --concurrency 160
+  --no-cpu-throttling
   --timeout 900
   --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
   --set-env-vars "GOOGLE_CLOUD_LOCATION=${REGION}"

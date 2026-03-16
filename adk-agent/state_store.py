@@ -19,12 +19,12 @@ def _utc_now() -> str:
 
 
 class SupportsWorkflowStateStore(Protocol):
-    def save_task(self, task: dict[str, Any], *, owner_ip: str = "") -> None: ...
+    def save_task(self, task: dict[str, Any], *, owner_ip: str = "", flush: bool = True) -> None: ...
     def get_task(self, task_id: str) -> dict[str, Any] | None: ...
     def list_conversations(self, *, owner_ip: str = "") -> list[dict[str, Any]]: ...
     def conversation_owned_by(self, conversation_id: str, owner_ip: str) -> bool: ...
     def get_conversation_tasks(self, conversation_id: str) -> list[dict[str, Any]]: ...
-    def save_run(self, run: dict[str, Any]) -> None: ...
+    def save_run(self, run: dict[str, Any], *, flush: bool = False) -> None: ...
     def get_run(self, run_id: str) -> dict[str, Any] | None: ...
     def mark_incomplete_runs_failed(self, reason: str) -> int: ...
     def save_workflow_session(
@@ -71,7 +71,7 @@ class JsonTaskStore:
     def has_any_data(self) -> bool:
         return bool(self._data.get("conversations") or self._data.get("tasks") or self._data.get("runs"))
 
-    def save_task(self, task: dict[str, Any], *, owner_ip: str = "") -> None:
+    def save_task(self, task: dict[str, Any], *, owner_ip: str = "", flush: bool = True) -> None:
         stored_task = copy.deepcopy(task)
         stored_task["updated_at"] = _utc_now()
         self._data["tasks"][stored_task["task_id"]] = stored_task
@@ -94,7 +94,8 @@ class JsonTaskStore:
             conv["title"] = stored_task.get("title") or conv.get("title", "")
             if owner_ip:
                 conv["owner_ip"] = owner_ip
-        self._save()
+        if flush:
+            self._save()
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         task = self._data["tasks"].get(task_id)
@@ -134,11 +135,12 @@ class JsonTaskStore:
         tasks = [self._data["tasks"].get(tid) for tid in conv.get("task_ids", [])]
         return [copy.deepcopy(task) for task in tasks if isinstance(task, dict)]
 
-    def save_run(self, run: dict[str, Any]) -> None:
+    def save_run(self, run: dict[str, Any], *, flush: bool = False) -> None:
         stored_run = copy.deepcopy(run)
         stored_run["updated_at"] = _utc_now()
         self._data["runs"][stored_run["run_id"]] = stored_run
-        self._save()
+        if flush:
+            self._save()
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         run = self._data["runs"].get(run_id)
@@ -329,7 +331,7 @@ class PostgresTaskStore:
                 (conversation_id, title, owner_ip, created_at, updated_at),
             )
 
-    def save_task(self, task: dict[str, Any], *, owner_ip: str = "") -> None:
+    def save_task(self, task: dict[str, Any], *, owner_ip: str = "", flush: bool = True) -> None:
         _, _, Jsonb = _require_psycopg()
         stored_task = copy.deepcopy(task)
         stored_task["updated_at"] = _utc_now()
@@ -448,7 +450,7 @@ class PostgresTaskStore:
                 tasks.append(copy.deepcopy(payload))
         return tasks
 
-    def save_run(self, run: dict[str, Any]) -> None:
+    def save_run(self, run: dict[str, Any], *, flush: bool = False) -> None:
         _, _, Jsonb = _require_psycopg()
         stored_run = copy.deepcopy(run)
         stored_run["updated_at"] = _utc_now()
