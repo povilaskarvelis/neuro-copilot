@@ -23,6 +23,10 @@ RUN cd /app/research-mcp && npm ci --omit=dev
 COPY adk-agent /app/adk-agent
 COPY research-mcp /app/research-mcp
 
+# Never bake runtime state or generated reports into the deployable image.
+RUN rm -rf /app/adk-agent/state /app/adk-agent/reports \
+    && mkdir -p /app/adk-agent/state /app/adk-agent/reports
+
 WORKDIR /app/adk-agent
 EXPOSE 8080
 

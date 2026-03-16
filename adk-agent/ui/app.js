@@ -1607,6 +1607,9 @@ async function handleTerminalRunState(run) {
 
   state.handlingTerminalRunIds.add(run.run_id);
   try {
+    const wasPendingRun = state.pendingRunId === run.run_id;
+    const previousSelection = state.selectedConversationId;
+
     if (run.task_id) {
       state.startingTaskIds.delete(String(run.task_id || "").trim());
     }
@@ -1619,28 +1622,43 @@ async function handleTerminalRunState(run) {
       setLoading(false);
     }
 
-    if (status === "failed") {
-      setNotice(run.error || "Run failed.", true);
-    } else if (status === "needs_clarification") {
-      state.clarificationMessage = run.clarification || "Clarification required before execution.";
-      setNotice("");
-    } else {
-      setNotice("");
-    }
-
     if (run.task_id) {
       try {
         const taskDetail = await api(`/api/tasks/${encodeURIComponent(run.task_id)}`);
         const conversationId = String(taskDetail?.task?.conversation_id || "").trim() || `conv_${run.task_id}`;
-        state.selectedConversationId = conversationId;
+        const sameConversation = previousSelection && previousSelection === conversationId;
+        const shouldAutoFocus = wasPendingRun || !previousSelection || sameConversation;
+
+        if (status === "failed") {
+          if (shouldAutoFocus) setNotice(run.error || "Run failed.", true);
+        } else if (status === "needs_clarification") {
+          if (shouldAutoFocus) {
+            state.clarificationMessage = run.clarification || "Clarification required before execution.";
+            setNotice("");
+          }
+        } else if (shouldAutoFocus) {
+          setNotice("");
+        }
+
+        if (shouldAutoFocus) {
+          state.selectedConversationId = conversationId;
+        }
         await refreshConversations({ keepSelection: true, skipRender: true });
-        if (status === "completed") {
+        if (status === "completed" && shouldAutoFocus) {
           state.selectedReportTaskId = run.task_id;
         }
       } catch (err) {
         setNotice(`Could not refresh conversations: ${err.message}`, true);
       }
     } else {
+      if (status === "failed") {
+        setNotice(run.error || "Run failed.", true);
+      } else if (status === "needs_clarification") {
+        state.clarificationMessage = run.clarification || "Clarification required before execution.";
+        setNotice("");
+      } else {
+        setNotice("");
+      }
       try {
         await refreshConversations({ keepSelection: true, skipRender: true });
       } catch (err) {

@@ -10,5 +10,7 @@
 adk-agent/.env
 adk-agent/.adk
 adk-agent/reports
+adk-agent/state
+adk-agent/state/**
 node_modules
 research-mcp/node_modules

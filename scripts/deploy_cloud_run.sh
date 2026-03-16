@@ -5,7 +5,7 @@ set -euo pipefail
 # PROJECT_ID  – GCP project (pass via env or edit default below)
 # GOOGLE_API_KEY – Google AI Studio key (pass via env; stored in Secret Manager)
 # ── Optional overrides ───────────────────────────────────────────────────────
-# REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI, GA4_MEASUREMENT_ID
+# REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI, GA4_MEASUREMENT_ID, CONCURRENCY
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROJECT_ID="gen-lang-client-0943167408"
@@ -16,6 +16,7 @@ IMAGE_NAME="${IMAGE_NAME:-ai-co-scientist}"
 USE_VERTEX_AI="${USE_VERTEX_AI:-}"
 GOOGLE_API_KEY="${GOOGLE_API_KEY:-}"
 GA4_MEASUREMENT_ID="${GA4_MEASUREMENT_ID:-G-NTCXHW3B2G}"
+CONCURRENCY="${CONCURRENCY:-16}"
 
 # Source local .env if API key not already in environment
 if [[ -z "${GOOGLE_API_KEY}" && -f "adk-agent/.env" ]]; then
@@ -52,6 +53,7 @@ fi
 
 echo "Using project=${PROJECT_ID} region=${REGION} service=${SERVICE_NAME}"
 echo "LLM backend: $([ "${USE_VERTEX_AI}" = "true" ] && echo "Vertex AI" || echo "AI Studio API key")"
+echo "Cloud Run concurrency: ${CONCURRENCY}"
 
 # ── Artifact Registry ────────────────────────────────────────────────────────
 
@@ -116,7 +118,7 @@ DEPLOY_FLAGS=(
   --memory 4Gi
   --min-instances 1
   --max-instances 3
-  --concurrency 160
+  --concurrency "${CONCURRENCY}"
   --no-cpu-throttling
   --timeout 900
   --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"

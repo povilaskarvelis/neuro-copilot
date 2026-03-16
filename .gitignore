@@ -12,6 +12,7 @@ venv/
 .pytest_cache/
 .adk/
 adk-agent/reports/
+adk-agent/state/
 output/
 outputs/
 
@@ -29,5 +30,4 @@ Thumbs.db
 
 # Local challenge notes
 challenges.txt
-
 

@@ -123,6 +123,21 @@ def _derive_run_error_message(response_text: str, default: str) -> str:
     return _compact_text(cleaned, max_chars=260) or default
 
 
+def _fire_and_forget_threadsafe(coro: Any, loop: asyncio.AbstractEventLoop, *, label: str = "") -> None:
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+
+    def _log_failure(done_future) -> None:
+        try:
+            done_future.result()
+        except Exception as exc:  # noqa: BLE001
+            if label:
+                logger.debug("%s failed: %s", label, exc)
+            else:
+                logger.debug("Threadsafe background task failed: %s", exc)
+
+    future.add_done_callback(_log_failure)
+
+
 _TRANSIENT_WORKFLOW_RESPONSE_PATTERNS = (
     re.compile(r"^_?\s*rate limit hit\s+[—-]\s+waited\s+\d+s,\s+retrying[.…_ ]*$", re.IGNORECASE),
 )
@@ -824,12 +839,11 @@ class UiRuntime:
                         )
                     # Emit a live summary snapshot so the frontend has step_details + tool_log
                     if wf_state:
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                self._emit_step_summary(run_id, wf_state, step_counter), caller_loop
-                            ).result(timeout=5)
-                        except Exception:  # noqa: BLE001
-                            pass
+                        _fire_and_forget_threadsafe(
+                            self._emit_step_summary(run_id, wf_state, step_counter),
+                            caller_loop,
+                            label=f"emit_step_summary:{run_id}",
+                        )
             for part in parts:
                 fr = getattr(part, "function_response", None)
                 error_metrics = _extract_tool_error_metrics(fr)
@@ -926,9 +940,11 @@ class UiRuntime:
                 # Emit intermediate step summary so frontend gets tool_log data mid-run
                 wf_snap = await self._read_workflow_state(conversation_id)
                 if wf_snap:
-                    asyncio.run_coroutine_threadsafe(
-                        self._emit_step_summary(run_id, wf_snap, step_counter), caller_loop
-                    ).result(timeout=10)
+                    _fire_and_forget_threadsafe(
+                        self._emit_step_summary(run_id, wf_snap, step_counter),
+                        caller_loop,
+                        label=f"emit_step_summary:{run_id}",
+                    )
 
             elif author == "planner" and not bool(getattr(event, "partial", False)):
                 _fire_progress(
@@ -960,10 +976,11 @@ class UiRuntime:
 
         wf_state = await self._read_workflow_state(conversation_id)
         if wf_state and step_counter > 0:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._emit_step_summary(run_id, wf_state, step_counter), caller_loop
+            _fire_and_forget_threadsafe(
+                self._emit_step_summary(run_id, wf_state, step_counter),
+                caller_loop,
+                label=f"emit_step_summary:{run_id}",
             )
-            fut.result(timeout=10)
 
         _preferred_authors = (
             "report_synthesizer",

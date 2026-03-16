@@ -144,6 +144,36 @@ def test_derive_run_error_message_strips_markdown_noise():
     assert message == "Execution Error Vertex AI quota or rate limit exhausted. 429 RESOURCE_EXHAUSTED"
 
 
+def test_fire_and_forget_threadsafe_does_not_block_on_future_result(monkeypatch):
+    class FakeFuture:
+        def __init__(self) -> None:
+            self.result_calls = []
+            self.callback_count = 0
+
+        def add_done_callback(self, callback) -> None:
+            self.callback_count += 1
+
+        def result(self, *args, **kwargs):
+            self.result_calls.append((args, kwargs))
+            return None
+
+    future = FakeFuture()
+
+    async def sample_coro():
+        return None
+
+    def fake_run_coroutine_threadsafe(coro, loop):
+        coro.close()
+        return future
+
+    monkeypatch.setattr(ui_server.asyncio, "run_coroutine_threadsafe", fake_run_coroutine_threadsafe)
+
+    ui_server._fire_and_forget_threadsafe(sample_coro(), object(), label="emit_step_summary:test")
+
+    assert future.callback_count == 1
+    assert future.result_calls == []
+
+
 @pytest.mark.asyncio
 async def test_get_or_create_session_rehydrates_persisted_state(runtime):
     runtime.store.save_workflow_session(
