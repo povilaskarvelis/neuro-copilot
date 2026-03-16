@@ -88,6 +88,8 @@ STATE_SYNTH_BUFFER = "temp:co_scientist_synth_stream_buffer"
 STATE_PLANNER_RENDERED = "temp:co_scientist_planner_rendered"
 STATE_EXECUTOR_RENDERED = "temp:co_scientist_executor_rendered"
 STATE_EXECUTOR_ACTIVE_STEP_ID = "temp:co_scientist_executor_active_step_id"
+STATE_REACT_PARSE_RETRIES = "temp:co_scientist_react_parse_retries"
+STATE_EXECUTOR_LAST_ERROR = "temp:co_scientist_executor_last_error"
 STATE_EXECUTOR_PREV_STEP_STATUS = "temp:co_scientist_executor_prev_step_status"
 STATE_EXECUTOR_REASONING_TRACE = "temp:co_scientist_executor_reasoning_trace"
 STATE_EXECUTOR_TOOL_LOG = "temp:co_scientist_executor_tool_log"
@@ -6410,7 +6412,12 @@ def _make_planner_after_model_callback(*, require_approval: bool):
     return _callback
 
 
-RATE_LIMIT_BACKOFF_SECONDS = 30
+RATE_LIMIT_BACKOFF_SECONDS = int(os.environ.get("ADK_RATE_LIMIT_BACKOFF_SECONDS", "5"))
+RATE_LIMIT_AUTO_RETRY = os.environ.get("ADK_RATE_LIMIT_AUTO_RETRY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _using_vertex_ai_backend() -> bool:
+    return os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() == "true"
 
 
 def _on_model_error(
@@ -6431,14 +6438,29 @@ def _on_model_error(
         for hint in ("429", "resource exhausted", "rate limit", "quota")
     )
     if is_rate_limit:
-        logger.info(
-            "Rate limit detected — waiting %ds before auto-retry",
-            RATE_LIMIT_BACKOFF_SECONDS,
-        )
-        time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
-        user_msg = (
-            f"_Rate limit hit — waited {RATE_LIMIT_BACKOFF_SECONDS}s, retrying…_"
-        )
+        backend_label = "Vertex AI" if _using_vertex_ai_backend() else "Google AI Studio"
+        if RATE_LIMIT_AUTO_RETRY and RATE_LIMIT_BACKOFF_SECONDS > 0:
+            logger.info(
+                "Rate limit detected from %s — waiting %ds before auto-retry",
+                backend_label,
+                RATE_LIMIT_BACKOFF_SECONDS,
+            )
+            time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+            user_msg = (
+                f"_Rate limit hit from {backend_label} — waited {RATE_LIMIT_BACKOFF_SECONDS}s, retrying…_"
+            )
+        else:
+            mitigation = (
+                "This deployment is currently using Vertex AI. If local runs are fine, redeploy with `USE_VERTEX_AI=false` to use the configured API key backend, or increase Vertex quota."
+                if _using_vertex_ai_backend()
+                else "Retry after quota resets, reduce concurrent usage, or switch to a backend with available quota."
+            )
+            user_msg = (
+                "## Execution Error\n\n"
+                f"{backend_label} quota or rate limit exhausted.\n\n"
+                f"`{error_msg[:300]}`\n\n"
+                f"{mitigation}"
+            )
     else:
         user_msg = (
             f"## Execution Error\n\n"

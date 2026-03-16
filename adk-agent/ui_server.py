@@ -36,11 +36,13 @@ from report_pdf import write_markdown_pdf
 from co_scientist.tool_registry import TOOL_SOURCE_NAMES
 from co_scientist.workflow import (
     STATE_EXECUTOR_ACTIVE_STEP_ID,
+    STATE_EXECUTOR_LAST_ERROR,
     STATE_PRIOR_RESEARCH,
     STATE_WORKFLOW_TASK,
     _derive_step_data_sources,
     _describe_tool_call,
     STATE_PLAN_PENDING_APPROVAL,
+    STATE_REACT_PARSE_RETRIES,
     _is_continue_execution_command,
     create_workflow_agent,
     _resolve_source_label,
@@ -109,6 +111,16 @@ def _compact_text(value: str, *, max_chars: int = 180) -> str:
     if len(text) <= max_chars:
         return text
     return f"{text[: max_chars - 3].rstrip()}..."
+
+
+def _derive_run_error_message(response_text: str, default: str) -> str:
+    text = str(response_text or "").strip()
+    if not text:
+        return default
+    cleaned = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+    cleaned = cleaned.replace("`", "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return _compact_text(cleaned, max_chars=260) or default
 
 
 _TRANSIENT_WORKFLOW_RESPONSE_PATTERNS = (
@@ -205,6 +217,22 @@ def _build_step_completed_event_metrics(text: str) -> dict | None:
         "react_trace": str(step_info.get("react_trace", "") or "").strip(),
         "react_phases": step_info.get("react_phases", {}) if isinstance(step_info.get("react_phases", {}), dict) else {},
         "rendered_step_markdown": text,
+    }
+
+
+def _extract_executor_retry_metrics(session_state: dict | None) -> dict | None:
+    """Extract executor parse-retry diagnostics from persisted session state."""
+    if not isinstance(session_state, dict):
+        return None
+    step_id = str(session_state.get(STATE_EXECUTOR_ACTIVE_STEP_ID, "") or "").strip()
+    retry_count = int(session_state.get(STATE_REACT_PARSE_RETRIES, 0) or 0)
+    error = str(session_state.get(STATE_EXECUTOR_LAST_ERROR, "") or "").strip()
+    if not step_id and retry_count <= 0 and not error:
+        return None
+    return {
+        "step_id": step_id,
+        "retry_count": retry_count,
+        "error": error,
     }
 
 
@@ -1297,19 +1325,23 @@ class UiRuntime:
                 )
 
             elif planner_failed:
+                planner_error = _derive_run_error_message(
+                    response_text,
+                    "Planner failed to generate a valid research plan.",
+                )
                 task["status"] = "failed"
                 task["report_markdown"] = response_text
                 await self._save_task_with_progress(task, run_id)
                 await self._update_run(
                     run_id, status="failed", task_id=task_id,
-                    error="Planner failed to generate a valid research plan.",
+                    error=planner_error,
                 )
                 await self._append_progress_event(
                     run_id,
                     phase="plan",
                     event_type="plan.failed",
                     status="error",
-                    human_line="Failed to generate research plan. Please try again.",
+                    human_line=planner_error,
                     task_id=task_id,
                 )
             elif plan_pending:

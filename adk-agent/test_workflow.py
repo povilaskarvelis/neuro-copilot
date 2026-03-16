@@ -1158,6 +1158,33 @@ def test_claim_synthesis_summary_weights_sources_and_flags_mixed_evidence():
     assert claim_summary["mixed_evidence_claims"][0]["preferred_interpretation"] == "Paclitaxel is sensitive in A549"
 
 
+def test_on_model_error_surfaces_vertex_rate_limit_without_hidden_retry(monkeypatch):
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {}
+
+    callback_context = DummyCallbackContext()
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.setattr(workflow, "RATE_LIMIT_AUTO_RETRY", False)
+
+    def fail_sleep(_: int) -> None:
+        raise AssertionError("time.sleep should not be called when auto-retry is disabled")
+
+    monkeypatch.setattr(workflow.time, "sleep", fail_sleep)
+
+    response = workflow._on_model_error(
+        callback_context=callback_context,
+        llm_request=None,
+        error=RuntimeError("429 RESOURCE_EXHAUSTED"),
+    )
+
+    assert response is not None
+    text = workflow._llm_response_text(response)
+    assert "Vertex AI quota or rate limit exhausted." in text
+    assert "USE_VERTEX_AI=false" in text
+    assert callback_context.state[workflow.STATE_MODEL_ERROR_PASSTHROUGH] is True
+
+
 def test_postprocess_synth_markdown_renders_structured_sections_from_claims():
     plan = {
         "schema": workflow.PLAN_SCHEMA,

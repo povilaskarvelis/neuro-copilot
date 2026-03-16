@@ -13,7 +13,7 @@ REGION="${REGION:-us-central1}"
 SERVICE_NAME="${SERVICE_NAME:-ai-co-scientist}"
 REPO_NAME="${REPO_NAME:-co-scientist-images}"
 IMAGE_NAME="${IMAGE_NAME:-ai-co-scientist}"
-USE_VERTEX_AI="${USE_VERTEX_AI:-true}"
+USE_VERTEX_AI="${USE_VERTEX_AI:-}"
 GOOGLE_API_KEY="${GOOGLE_API_KEY:-}"
 GA4_MEASUREMENT_ID="${GA4_MEASUREMENT_ID:-G-NTCXHW3B2G}"
 
@@ -31,6 +31,17 @@ if [[ -z "${PROJECT_ID}" ]]; then
   echo "  USE_VERTEX_AI=true   – use Vertex AI instead of AI Studio API key"
   echo "  REGION=us-central1   – GCP region (default: us-central1)"
   exit 1
+fi
+
+# Default to the API-key backend when one is already configured. This keeps
+# Cloud deploys aligned with local behavior instead of silently switching to
+# Vertex AI quotas unless the caller explicitly opts in.
+if [[ -z "${USE_VERTEX_AI}" ]]; then
+  if [[ -n "${GOOGLE_API_KEY}" ]]; then
+    USE_VERTEX_AI="false"
+  else
+    USE_VERTEX_AI="true"
+  fi
 fi
 
 if [[ "${USE_VERTEX_AI}" != "true" && -z "${GOOGLE_API_KEY}" ]]; then

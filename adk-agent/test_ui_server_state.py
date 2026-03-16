@@ -135,6 +135,15 @@ def test_extract_tool_error_metrics_from_function_response():
     }
 
 
+def test_derive_run_error_message_strips_markdown_noise():
+    message = ui_server._derive_run_error_message(
+        "## Execution Error\n\nVertex AI quota or rate limit exhausted.\n\n`429 RESOURCE_EXHAUSTED`",
+        "Fallback error",
+    )
+
+    assert message == "Execution Error Vertex AI quota or rate limit exhausted. 429 RESOURCE_EXHAUSTED"
+
+
 @pytest.mark.asyncio
 async def test_get_or_create_session_rehydrates_persisted_state(runtime):
     runtime.store.save_workflow_session(
