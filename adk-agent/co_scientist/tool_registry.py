@@ -36,7 +36,7 @@ TOOL_DOMAINS: dict[str, list[str]] = {
         "search_hpo_terms", "get_orphanet_disease_profile", "query_monarch_associations",
         "search_quickgo_terms", "get_quickgo_annotations",
         "annotate_variants_vep", "search_civic_variants", "search_civic_genes",
-        "get_variant_annotations", "search_gwas_associations",
+        "search_variants_by_gene", "get_variant_annotations", "search_gwas_associations",
         "get_gene_tissue_expression", "get_depmap_gene_dependency",
         "get_biogrid_orcs_gene_summary",
         "get_gdsc_drug_sensitivity",
@@ -118,6 +118,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "search_pathway_commons_top_pathways": "Search integrated top pathways in Pathway Commons across multiple pathway providers",
     "get_guidetopharmacology_target": "Get curated target-ligand interactions and pharmacology summaries from Guide to Pharmacology",
     "get_dailymed_drug_label": "Summarize key DailyMed SPL label sections such as boxed warnings, indications, contraindications, and warnings",
+    "search_variants_by_gene": "Search MyVariant.info for variants in a gene by symbol. Returns HGVS/rsIDs for downstream get_variant_annotations or annotate_variants_vep. Use when only gene is known.",
     "get_clingen_gene_curation": "Summarize ClinGen gene-disease validity and dosage sensitivity curations for a gene",
     "get_alliance_genome_gene_profile": "Summarize Alliance Genome Resources model-organism and translational evidence for a gene, including orthologs, disease/phenotype counts, and disease models",
     "get_chembl_bioactivities": "Get bioactivity data (IC50, Ki, Kd) for a drug from ChEMBL - selectivity profiling",
@@ -218,7 +219,7 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     },
     "get_variant_annotations": {
         "overlap_group": "variant_evidence",
-        "preferred_for": "aggregate variant annotations across ClinVar, dbSNP, gnomAD, CADD, and COSMIC",
+        "preferred_for": "aggregate variant annotations across ClinVar, dbSNP, gnomAD, CADD, and COSMIC (requires variant ID)",
         "fallback_tools": ["annotate_variants_vep", "search_civic_variants", "get_clingen_gene_curation"],
     },
     "annotate_variants_vep": {
@@ -234,7 +235,12 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     "search_civic_genes": {
         "overlap_group": "variant_evidence",
         "preferred_for": "oncology gene-level CIViC context when the exact variant is not yet known",
-        "fallback_tools": ["search_civic_variants", "get_variant_annotations"],
+        "fallback_tools": ["search_civic_variants", "search_variants_by_gene", "get_variant_annotations"],
+    },
+    "search_variants_by_gene": {
+        "overlap_group": "variant_evidence",
+        "preferred_for": "discovering variants in a gene when only gene symbol is known (use before get_variant_annotations or annotate_variants_vep)",
+        "fallback_tools": ["search_civic_variants", "search_civic_genes"],
     },
     "get_clingen_gene_curation": {
         "overlap_group": "variant_evidence",
@@ -331,8 +337,8 @@ SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
     },
     {
         "topic": "Variant evidence",
-        "tools": ["get_variant_annotations", "annotate_variants_vep", "search_civic_variants", "search_civic_genes", "get_clingen_gene_curation"],
-        "summary": "Use `get_variant_annotations` for aggregate annotation, `annotate_variants_vep` for prediction scores, `search_civic_variants`/`search_civic_genes` for oncology interpretation, and `get_clingen_gene_curation` for gene-level expert curation.",
+        "tools": ["search_variants_by_gene", "get_variant_annotations", "annotate_variants_vep", "search_civic_variants", "search_civic_genes", "get_clingen_gene_curation"],
+        "summary": "When only gene symbol is known: use `search_variants_by_gene` (or `search_civic_variants` for cancer genes) to discover variants, then `get_variant_annotations` or `annotate_variants_vep`. Variant-level tools require rsID or HGVS—not gene symbols.",
     },
     {
         "topic": "Expression context",
@@ -387,6 +393,7 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "get_quickgo_annotations": "QuickGO",
     "search_civic_variants": "CIViC",
     "search_civic_genes": "CIViC",
+    "search_variants_by_gene": "MyVariant.info",
     "get_alphafold_structure": "AlphaFold API",
     "search_gwas_associations": "GWAS Catalog",
     "search_drug_gene_interactions": "DGIdb",

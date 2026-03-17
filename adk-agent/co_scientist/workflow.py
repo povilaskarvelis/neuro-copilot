@@ -164,6 +164,7 @@ KNOWN_MCP_TOOLS = [
     "annotate_variants_vep",
     "search_civic_variants",
     "search_civic_genes",
+    "search_variants_by_gene",
     "get_variant_annotations",
     "search_gwas_associations",
     "get_gene_tissue_expression",
@@ -276,8 +277,7 @@ Follow a strict Reason-Act-Observe cycle:
 3. OBSERVE: Review the tool results. If insufficient or the completion condition is not met, reason again and try a different query or tool.
 4. CONCLUDE: When the step's completion condition is met (or the step is blocked), write your findings summary.
 
-Available MCP tools:
-__TOOL_CATALOG__
+The tool list for the current step is provided in the execution context below.
 
 Source precedence rules for overlapping tools:
 __ROUTING_POLICY__
@@ -686,6 +686,8 @@ def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
         return f"Resolving gene identifiers for {query}" if query else "Resolving gene identifiers"
     if name == "get_variant_annotations":
         return f"Retrieving variant annotations for {query}" if query else "Retrieving variant annotations"
+    if name == "search_variants_by_gene":
+        return f"Searching variants in gene {gene or query}" if (gene or query) else "Searching variants by gene"
     if name == "annotate_variants_vep":
         return f"Annotating variants with Ensembl VEP for {query}" if query else "Annotating variants via VEP"
 
@@ -788,7 +790,7 @@ def _describe_tool_result(name: str, response: Any) -> str:
             response = {}
     err = response.get("error") or response.get("error_message")
     if err:
-        return f"{source}: error — {str(err)[:100]}"
+        return f"Error in {name}: {str(err)[:400]}"
 
     # MCP tools put text in content[0].text; the format is typically:
     #   "Summary:\n{actual summary}\n\nKey Fields:\n..."
@@ -808,7 +810,7 @@ def _describe_tool_result(name: str, response: Any) -> str:
                 "get_clinical_trial",
                 "get_pubmed_abstract",
             )
-            max_chars = 380 if name in long_output_tools else 220
+            max_chars = 500 if name in long_output_tools else 380
             return _truncate_summary(summary_line, max_chars=max_chars)
 
     # Try structured dict keys (for non-MCP tools / direct function tools)
@@ -1000,7 +1002,7 @@ def _summarize_latest_tool_results(llm_request: LlmRequest) -> str:
                     response = {}
             err = response.get("error") or response.get("error_message")
             if err:
-                msg = str(err)[:120]
+                msg = str(err)[:400]
                 observations.append(f"OBSERVE: {source} → error: {msg}")
             else:
                 resp_str = str(response)
@@ -2690,6 +2692,7 @@ CLAIM_SOURCE_TOOL_WEIGHTS: dict[str, float] = {
     "search_reactome_pathways": 0.88,
     "search_civic_variants": 0.88,
     "search_civic_genes": 0.88,
+    "search_variants_by_gene": 0.85,
     "get_pharmacodb_compound_response": 0.87,
     "get_gene_tissue_expression": 0.84,
     "get_biogrid_orcs_gene_summary": 0.84,
@@ -5891,13 +5894,15 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
         _serialize_pretty_json(payload),
     ]
 
-    if step_domains:
-        instructions.append(
-            f"Focused tools for this step (domains: {', '.join(step_domains)}):\n"
-            f"{focused_catalog}\n"
-            "Prefer tools from this focused list. You may use other available tools "
-            "if the focused set is insufficient, but start here."
-        )
+    tools_header = (
+        f"Tools for this step (domains: {', '.join(step_domains)}):" if step_domains
+        else "Tools for this step:"
+    )
+    instructions.append(
+        f"{tools_header}\n{focused_catalog}\n"
+        "Prefer tools from this list. You may use other available tools "
+        "if the focused set is insufficient, but start here."
+    )
     if routing_guidance:
         instructions.append(routing_guidance)
 
@@ -6974,7 +6979,8 @@ and `list_bigquery_tables(dataset="...", table="...")` to inspect column schemas
     - Curated experimental molecular interactions: get_intact_interactions (IntAct)
     - Broader experimental physical/genetic interaction evidence: get_biogrid_interactions (BioGRID)
     - Variant effect predictions (SIFT, PolyPhen, AlphaMissense): annotate_variants_vep (Ensembl VEP)
-    - Aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC): get_variant_annotations (MyVariant.info)
+    - Gene-to-variant discovery when only gene is known: search_variants_by_gene (MyVariant) or search_civic_variants (cancer)
+    - Aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC): get_variant_annotations (MyVariant — requires rsID/HGVS)
     - Clinical variant interpretations in oncology: search_civic_variants, search_civic_genes (CIViC)
     - Protein structure predictions: get_alphafold_structure (AlphaFold — pLDDT confidence, PDB/CIF downloads)
     - GWAS trait-variant associations: search_gwas_associations (GWAS Catalog — p-values, odds ratios, mapped genes)
@@ -7028,7 +7034,8 @@ gene identifier normalization (resolve_gene_identifiers via MyGene.info), \
 ontology cross-mapping (map_ontology_terms_oxo via EBI OxO), \
 GO ontology lookup and annotations (search_quickgo_terms, get_quickgo_annotations via QuickGO), \
 variant effect predictions (annotate_variants_vep for SIFT/PolyPhen/AlphaMissense), \
-aggregated variant annotations (get_variant_annotations for ClinVar/CADD/dbSNP/gnomAD/COSMIC), \
+variant discovery by gene (search_variants_by_gene when only gene is known), \
+aggregated variant annotations (get_variant_annotations for ClinVar/CADD/dbSNP/gnomAD/COSMIC — requires rsID/HGVS), \
 clinical variant interpretations (search_civic_variants, search_civic_genes for CIViC), \
 protein structure predictions (get_alphafold_structure for pLDDT), \
 GWAS associations (search_gwas_associations), drug-gene interactions (search_drug_gene_interactions), \
@@ -7289,6 +7296,9 @@ class _ActiveStepToolPredicate:
         if tool.name not in self._available_tool_set:
             return False
 
+        if readonly_context is None:
+            return False
+
         state = getattr(readonly_context, "state", None)
         task_state = _get_task_state_from_state_map(state)
         scoped_tools = _resolve_active_step_tool_allowlist(
@@ -7296,12 +7306,11 @@ class _ActiveStepToolPredicate:
             available_tools=self._available_tools,
         )
         if not scoped_tools:
-            return True
+            return False
         return tool.name in set(scoped_tools)
 
 
 def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
-    tool_catalog = _format_tool_catalog(tool_hints)
     routing_policy = _format_source_precedence_rules(tool_hints)
     if prefer_bigquery:
         bq_policy = BQ_EXECUTOR_POLICY
@@ -7310,7 +7319,6 @@ def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: 
 
     return (
         STEP_EXECUTOR_INSTRUCTION_TEMPLATE
-        .replace("__TOOL_CATALOG__", tool_catalog)
         .replace("__ROUTING_POLICY__", routing_policy)
         .replace("__BQ_POLICY__", bq_policy)
     )
@@ -7341,8 +7349,9 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
             "- For ontology crosswalks across MONDO/EFO/DOID/MeSH/OMIM/UMLS, use map_ontology_terms_oxo (EBI OxO).\n"
             "- For GO term search and GO annotations, use search_quickgo_terms and get_quickgo_annotations (QuickGO).\n"
             "- For literature search that needs preprints or Europe PMC citation metadata, use search_europe_pmc_literature (Europe PMC).\n"
-            "- For variant pathogenicity predictions, use annotate_variants_vep (Ensembl VEP — SIFT, PolyPhen, AlphaMissense).\n"
-            "- For aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC), use get_variant_annotations (MyVariant.info).\n"
+            "- When only a gene is known but variant-level tools are needed: first use search_variants_by_gene (MyVariant) or search_civic_variants (cancer genes) to discover variants, then get_variant_annotations or annotate_variants_vep with the returned HGVS/rsID.\n"
+            "- For variant pathogenicity predictions, use annotate_variants_vep (Ensembl VEP — SIFT, PolyPhen, AlphaMissense). Requires HGVS; not gene symbols.\n"
+            "- For aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC), use get_variant_annotations (MyVariant.info). Requires rsID or HGVS; not gene symbols.\n"
             "- For clinical variant interpretations in oncology, use search_civic_variants or search_civic_genes (CIViC).\n"
             "- For protein structure predictions and confidence scores, use get_alphafold_structure (AlphaFold API).\n"
             "- For GWAS trait-variant associations and genetic evidence, use search_gwas_associations (GWAS Catalog).\n"
@@ -7577,6 +7586,7 @@ def create_workflow_agent(
         after_model_callback=_make_planner_after_model_callback(
             require_approval=require_plan_approval,
         ),
+        on_model_error_callback=_on_model_error,
     )
     step_executor = LlmAgent(
         name="step_executor",
@@ -7634,6 +7644,7 @@ def create_workflow_agent(
         instruction=GENERAL_QA_INSTRUCTION,
         tools=[],
         disallow_transfer_to_parent=True,
+        on_model_error_callback=_on_model_error,
     )
 
     clarifier = LlmAgent(
@@ -7646,6 +7657,7 @@ def create_workflow_agent(
         instruction=CLARIFIER_INSTRUCTION,
         tools=[],
         disallow_transfer_to_parent=True,
+        on_model_error_callback=_on_model_error,
     )
 
     report_assistant = LlmAgent(
@@ -7661,6 +7673,7 @@ def create_workflow_agent(
         tools=executor_tools,
         disallow_transfer_to_parent=True,
         before_model_callback=_report_assistant_before_model_callback,
+        on_model_error_callback=_on_model_error,
         on_tool_error_callback=_on_tool_error,
     )
 
@@ -7673,6 +7686,7 @@ def create_workflow_agent(
         instruction=ROUTER_INSTRUCTION,
         sub_agents=[general_qa, clarifier, report_assistant, research_workflow],
         before_model_callback=_router_before_model_callback,
+        on_model_error_callback=_on_model_error,
     )
 
     return router, mcp_toolset

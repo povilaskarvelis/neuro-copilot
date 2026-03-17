@@ -67,6 +67,8 @@ const HF_DATASETS_SERVER_API = "https://datasets-server.huggingface.co";
 const GITHUB_API = "https://api.github.com";
 const CONP_GITHUB_ORG = "conpdatasets";
 const NEMAR_GITHUB_ORG = "nemarDatasets";
+const NEMAR_DATAEXPLORER_API = "https://nemar.org/dataexplorer";
+const NEMAR_DATAEXPLORER_VIEW_API = `${NEMAR_DATAEXPLORER_API}/viewapi`;
 const BRAINCODE_CONP_QUERY = "braincode";
 const NEUROBAGEL_API = "https://api.neurobagel.org";
 const OPENNEURO_GRAPHQL = "https://openneuro.org/crn/graphql";
@@ -176,6 +178,39 @@ let orphanetGeneCatalogCache = null;
 
 function normalizeWhitespace(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function stripHtmlToText(value, { preserveParagraphs = false } = {}) {
+  let text = String(value || "");
+  if (!text) return "";
+  text = text
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, preserveParagraphs ? "\n\n" : "\n")
+    .replace(/<\/h[1-6]>/gi, preserveParagraphs ? "\n\n" : "\n")
+    .replace(/<li[^>]*>/gi, preserveParagraphs ? "\n- " : " ")
+    .replace(/<\/li>/gi, preserveParagraphs ? "\n" : " ")
+    .replace(/<[^>]+>/g, " ");
+  text = decodeHtmlEntities(text);
+  if (!preserveParagraphs) {
+    return normalizeWhitespace(text);
+  }
+  return text
+    .split(/\r?\n/)
+    .map((line) => normalizeWhitespace(line))
+    .filter((line, idx, lines) => line || (idx > 0 && lines[idx - 1]))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 const CLINICAL_TRIAL_STATUS_VALUES = new Set([
@@ -8800,7 +8835,10 @@ server.registerTool(
   {
     description:
       "Predict functional effects of human variants using Ensembl VEP. Returns consequence type, SIFT, PolyPhen, " +
-      "and AlphaMissense predictions. Use for assessing pathogenicity of specific mutations.",
+      "and AlphaMissense predictions. Use for assessing pathogenicity of specific mutations. " +
+      "REQUIRES variant-level input: HGVS notation (e.g. BRAF:p.Val600Glu, chr2:g.166210844T>C). Does NOT accept gene symbols. " +
+      "Accepts both hg19 (from MyVariant) and hg38 coordinates — auto-detects assembly. " +
+      "If only a gene is known, first use search_variants_by_gene or search_civic_variants to discover variants.",
     inputSchema: {
       variants: z
         .array(z.string())
@@ -8811,23 +8849,110 @@ server.registerTool(
     },
   },
   async ({ variants, includeAlphaMissense = true }) => {
-    const cleaned = (variants || []).map((v) => normalizeWhitespace(v)).filter(Boolean).slice(0, 10);
+    const normalizeHgvs = (v) => {
+      const s = normalizeWhitespace(v);
+      const ncMatch = s.match(/^NC_0*(\d{2})\.\d+:(.+)$/);
+      if (ncMatch) {
+        const num = parseInt(ncMatch[1], 10);
+        const rest = ncMatch[2];
+        const chr = num <= 22 ? `chr${num}` : num === 23 ? "chrX" : num === 24 ? "chrY" : null;
+        if (chr) return `${chr}:${rest}`;
+      }
+      return s;
+    };
+    const cleaned = (variants || []).map(normalizeHgvs).filter(Boolean).slice(0, 10);
     if (cleaned.length === 0) {
       return { content: [{ type: "text", text: "Provide at least one variant in HGVS notation." }] };
     }
 
+    const looksLikeGeneSymbol = (s) => {
+      const token = s.split(/\s+/)[0] || s;
+      return (
+        token.length >= 2 &&
+        token.length <= 20 &&
+        /^[A-Z0-9][A-Za-z0-9_-]*$/i.test(token) &&
+        !/^rs\d+$/i.test(token) &&
+        !/[>:]|\.g\.|\.p\.|\.c\./.test(token)
+      );
+    };
+    const getGeneSymbol = (s) => (s.split(/\s+/)[0] || s).toUpperCase();
+
+    const geneLike = cleaned.filter(looksLikeGeneSymbol);
+    if (geneLike.length > 0) {
+      const gene = getGeneSymbol(geneLike[0]);
+      const geneQuery = `dbnsfp.genename:${gene}`;
+      const geneParams = new URLSearchParams({
+        q: geneQuery,
+        fields: "_id,dbsnp.rsid,cadd.consequence,gnomad_exome.af",
+        size: "15",
+      });
+      const geneUrl = `${MYVARIANT_API}/query?${geneParams}`;
+      const geneData = await fetchJsonWithRetry(geneUrl, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+      const geneHits = Array.isArray(geneData?.hits) ? geneData.hits : [];
+      if (geneHits.length > 0) {
+        const keyFields = geneHits.map((h) => {
+          const hgvs = normalizeWhitespace(h._id || "");
+          const rsid = normalizeWhitespace(h.dbsnp?.rsid || "");
+          const cons = normalizeWhitespace(h.cadd?.consequence || "");
+          return [hgvs, rsid ? `rsID: ${rsid}` : "", cons].filter(Boolean).join(" | ");
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: `Input "${gene}" appears to be a gene symbol. VEP requires HGVS notation. Found ${geneHits.length} variant(s) in that gene—call annotate_variants_vep(variants=["chrX:g...."]) with one of the HGVS _id below.`,
+                keyFields,
+                sources: [geneUrl],
+                limitations: [
+                  "Use the HGVS _id (e.g. chr2:g.165310468G>A) from above with annotate_variants_vep for SIFT/PolyPhen/AlphaMissense.",
+                ],
+              }),
+            },
+          ],
+        };
+      }
+    }
+
+    // MyVariant.info returns hg19 coordinates by default (e.g. chr2:g.166210844T>C).
+    // Ensembl VEP REST API defaults to GRCh38 and will reject hg19 coords with ref-allele mismatches.
+    // Detect hg19-style chr coords and use the GRCh37 endpoint; try GRCh38 first for NC_ / protein HGVS.
+    const hasGenomicChrCoord = cleaned.some((v) => /^chr\d+:g\.\d+/i.test(v));
+    const hasProteinOrGeneHgvs = cleaned.some((v) => /^[A-Z][A-Za-z0-9]+:p\./i.test(v) || /^[A-Z][A-Za-z0-9]+:c\./i.test(v));
+
     const body = { hgvs_notations: cleaned };
     if (includeAlphaMissense) body.AlphaMissense = 1;
 
-    const url = `${ENSEMBL_REST_API}/vep/human/hgvs`;
-    const data = await fetchJsonWithRetry(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(body),
-      retries: 1,
-      timeoutMs: 20000,
-      maxBackoffMs: 3000,
-    });
+    // Use GRCh37 endpoint for hg19 genomic coords (from MyVariant), GRCh38 for protein/coding HGVS
+    const useGrch37 = hasGenomicChrCoord && !hasProteinOrGeneHgvs;
+    const vepBase = useGrch37 ? "https://grch37.rest.ensembl.org" : ENSEMBL_REST_API;
+    const url = `${vepBase}/vep/human/hgvs`;
+    let data;
+    try {
+      data = await fetchJsonWithRetry(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(body),
+        retries: 1,
+        timeoutMs: 20000,
+        maxBackoffMs: 3000,
+      });
+    } catch (err) {
+      // If ref-allele mismatch on GRCh38, retry with GRCh37 (likely hg19 coords)
+      if (!useGrch37 && /reference allele/i.test(String(err?.message || ""))) {
+        const fallbackUrl = `https://grch37.rest.ensembl.org/vep/human/hgvs`;
+        data = await fetchJsonWithRetry(fallbackUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(body),
+          retries: 1,
+          timeoutMs: 20000,
+          maxBackoffMs: 3000,
+        });
+      } else {
+        throw err;
+      }
+    }
 
     const results = Array.isArray(data) ? data : [];
     if (results.length === 0) {
@@ -9221,6 +9346,117 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
+// MyVariant.info — gene-level variant discovery (bridge to variant-level tools)
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "search_variants_by_gene",
+  {
+    description:
+      "Search MyVariant.info for variants in a gene by symbol. Returns hg19 HGVS IDs and basic annotations (ClinVar, gnomAD AF) " +
+      "for variants that can then be passed to get_variant_annotations or annotate_variants_vep (both accept hg19 coords). " +
+      "Use when only a gene symbol is known (e.g. SCN2A) and variant coordinates are needed for downstream tools. " +
+      "Supports optional consequence filter (e.g. missense) to narrow results.",
+    inputSchema: {
+      gene: z.string().describe("Gene symbol (e.g. SCN2A, BRAF, TP53)"),
+      consequenceFilter: z
+        .string()
+        .optional()
+        .describe("Optional: filter by consequence (e.g. missense, synonymous, nonsense, frameshift, splice). 'missense' maps to CADD NON_SYNONYMOUS."),
+      limit: z.coerce.number().optional().default(25).describe("Max variants to return (default 25, max 100)"),
+    },
+  },
+  async ({ gene, consequenceFilter, limit = 25 }) => {
+    const normalizedGene = normalizeWhitespace(gene || "").toUpperCase();
+    if (!normalizedGene) {
+      return { content: [{ type: "text", text: "Provide a gene symbol (e.g. SCN2A)." }] };
+    }
+    const boundedLimit = Math.max(1, Math.min(100, Math.round(Number(limit) || 25)));
+
+    const consequenceAliases = {
+      missense: "NON_SYNONYMOUS",
+      nonsynonymous: "NON_SYNONYMOUS",
+      non_synonymous: "NON_SYNONYMOUS",
+      synonymous: "SYNONYMOUS",
+      stop_gained: "STOP_GAINED",
+      nonsense: "STOP_GAINED",
+      frameshift: "FRAME_SHIFT",
+      splice: "SPLICE_SITE",
+      splice_site: "SPLICE_SITE",
+    };
+
+    let query = `dbnsfp.genename:${normalizedGene}`;
+    if (consequenceFilter) {
+      const cf = normalizeWhitespace(consequenceFilter).toLowerCase().replace(/["\\]/g, "").replace(/\s+/g, "_");
+      const mapped = consequenceAliases[cf] || cf.toUpperCase();
+      if (mapped) query += ` AND cadd.consequence:${mapped}`;
+    }
+
+    const fields = "_id,dbsnp.rsid,dbsnp.gene,cadd.consequence,clinvar.rcv,gnomad_exome.af,gnomad_genome.af,dbnsfp.sift,dbnsfp.polyphen2";
+    const params = new URLSearchParams({
+      q: query,
+      fields,
+      size: String(boundedLimit),
+    });
+    const url = `${MYVARIANT_API}/query?${params}`;
+    const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 15000, maxBackoffMs: 3000 });
+
+    const hits = Array.isArray(data?.hits) ? data.hits : [];
+    const total = Number(data?.total) ?? 0;
+
+    const keyFields = hits.map((h) => {
+      const hgvs = normalizeWhitespace(h._id || "");
+      const rsid = normalizeWhitespace(h.dbsnp?.rsid || "");
+      const consequence = normalizeWhitespace(h.cadd?.consequence || "");
+      let af = "";
+      if (h.gnomad_exome?.af != null) af = `gnomAD exome AF: ${Number(h.gnomad_exome.af).toExponential(2)}`;
+      else if (h.gnomad_genome?.af != null) af = `gnomAD genome AF: ${Number(h.gnomad_genome.af).toExponential(2)}`;
+      const parts = [hgvs];
+      if (rsid) parts.push(`rsID: ${rsid}`);
+      if (consequence) parts.push(consequence);
+      if (af) parts.push(af);
+      return parts.join(" | ");
+    });
+
+    if (hits.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No variants found for gene ${normalizedGene} in MyVariant.info.`,
+              keyFields: [`Gene: ${normalizedGene}`, `Total matching: ${total}`],
+              sources: [url],
+              limitations: [
+                "Check gene symbol spelling. Use resolve_gene_identifiers first if uncertain.",
+                "Some genes may have limited variant coverage in dbNSFP.",
+              ],
+            }),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Found ${hits.length} variant${hits.length === 1 ? "" : "s"} for ${normalizedGene}${total > boundedLimit ? ` (${total} total, showing ${boundedLimit})` : ""}. Use get_variant_annotations with the HGVS _id or rsID for full annotations.`,
+            keyFields,
+            sources: [url, "https://myvariant.info/"],
+            limitations: [
+              "Results include HGVS IDs (_id) that can be passed to get_variant_annotations or annotate_variants_vep.",
+              "gnomAD AF is hg19. For rare-disease genes, many variants may have low/absent population frequency.",
+            ],
+          }),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
 // MyVariant.info — aggregated variant annotations (ClinVar, dbSNP, CADD, etc.)
 // ---------------------------------------------------------------------------
 
@@ -9229,8 +9465,10 @@ server.registerTool(
   {
     description:
       "Get aggregated variant annotations from MyVariant.info, which combines 20+ sources including ClinVar, " +
-      "dbSNP, CADD, gnomAD, COSMIC, and more. Accepts HGVS notation or rsID. " +
-      "Use for comprehensive variant characterization in a single call.",
+      "dbSNP, CADD, gnomAD, COSMIC, and more. " +
+      "Accepts rsID (e.g. rs113488022) or HGVS: chr2:g.165310413C>T or NC_000002.12:g.165310413C>T (RefSeq/hg38; auto-converted). " +
+      "Does NOT accept gene symbols. If only a gene is known, use search_variants_by_gene first. " +
+      "gnomAD fields: gnomad_exome, gnomad_genome (not gnomad_genomes).",
     inputSchema: {
       variantId: z
         .string()
@@ -9242,28 +9480,117 @@ server.registerTool(
     },
   },
   async ({ variantId, fields }) => {
-    const normalizedId = normalizeWhitespace(variantId || "");
+    const rawId = variantId ?? "";
+    const normalizedId = normalizeWhitespace(String(rawId));
     if (!normalizedId) {
-      return { content: [{ type: "text", text: 'Provide a variant ID (rsID or HGVS notation, e.g. "rs113488022").' }] };
+      return { content: [{ type: "text", text: 'Provide variantId (rsID or HGVS notation, e.g. "rs113488022" or "chr2:g.165310413C>T").' }] };
     }
 
     const defaultFields = "clinvar,cadd,dbsnp,gnomad_exome,gnomad_genome,cosmic,dbnsfp,snpeff";
-    const requestFields = normalizeWhitespace(fields || "") || defaultFields;
+    let requestFields = normalizeWhitespace(fields || "") || defaultFields;
+    if (/gnomad_genomes/i.test(requestFields)) {
+      requestFields = requestFields.replace(/gnomad_genomes/g, "gnomad_genome");
+    }
 
-    const isRsId = /^rs\d+$/i.test(normalizedId);
+    let resolvedId = normalizedId;
+    let useHg38 = false;
+    const ncMatch = normalizedId.match(/^NC_0*(\d{2})\.\d+:(.+)$/);
+    if (ncMatch) {
+      const num = parseInt(ncMatch[1], 10);
+      const rest = ncMatch[2];
+      const chr = num <= 22 ? `chr${num}` : num === 23 ? "chrX" : num === 24 ? "chrY" : null;
+      if (chr) {
+        resolvedId = `${chr}:${rest}`;
+        useHg38 = true;
+      }
+    }
+
+    const isRsId = /^rs\d+$/i.test(resolvedId);
     let url;
     if (isRsId) {
-      const params = new URLSearchParams({ q: `dbsnp.rsid:${normalizedId}`, fields: requestFields, size: "1" });
+      const params = new URLSearchParams({ q: `dbsnp.rsid:${resolvedId}`, fields: requestFields, size: "1" });
       url = `${MYVARIANT_API}/query?${params}`;
     } else {
       const params = new URLSearchParams({ fields: requestFields });
-      url = `${MYVARIANT_API}/variant/${encodeURIComponent(normalizedId)}?${params}`;
+      if (useHg38) params.set("assembly", "hg38");
+      url = `${MYVARIANT_API}/variant/${encodeURIComponent(resolvedId)}?${params}`;
     }
 
-    const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+    let data;
+    try {
+      data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+    } catch (err) {
+      if (useHg38 && /404/.test(String(err?.message || ""))) {
+        const paramsHg19 = new URLSearchParams({ fields: requestFields });
+        const urlHg19 = `${MYVARIANT_API}/variant/${encodeURIComponent(resolvedId)}?${paramsHg19}`;
+        try {
+          data = await fetchJsonWithRetry(urlHg19, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+          useHg38 = false;
+        } catch {
+          throw err;
+        }
+      } else {
+        throw err;
+      }
+    }
 
     const hit = isRsId ? (Array.isArray(data?.hits) ? data.hits[0] : null) : data;
     if (!hit || hit.notfound) {
+      // If input looks like a gene symbol, try search_variants_by_gene logic to return useful results
+      const firstToken = normalizedId.split(/\s+/)[0] || normalizedId;
+      const looksLikeGeneSymbol =
+        firstToken.length >= 2 &&
+        firstToken.length <= 20 &&
+        /^[A-Z0-9][A-Za-z0-9_-]*$/i.test(firstToken) &&
+        !/^rs\d+$/i.test(firstToken) &&
+        !/[>:]|\.g\.|\.p\.|\.c\./.test(firstToken);
+
+      if (looksLikeGeneSymbol) {
+        const geneSymbol = firstToken.toUpperCase();
+        const geneQuery = `dbnsfp.genename:${geneSymbol}`;
+        const geneParams = new URLSearchParams({
+          q: geneQuery,
+          fields: "_id,dbsnp.rsid,dbsnp.gene,cadd.consequence,gnomad_exome.af,gnomad_genome.af",
+          size: "15",
+        });
+        const geneUrl = `${MYVARIANT_API}/query?${geneParams}`;
+        const geneData = await fetchJsonWithRetry(geneUrl, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+        const geneHits = Array.isArray(geneData?.hits) ? geneData.hits : [];
+        const total = Number(geneData?.total) ?? 0;
+
+        if (geneHits.length > 0) {
+          const keyFields = geneHits.map((h) => {
+            const hgvs = normalizeWhitespace(h._id || "");
+            const rsid = normalizeWhitespace(h.dbsnp?.rsid || "");
+            const cons = normalizeWhitespace(h.cadd?.consequence || "");
+            let af = "";
+            if (h.gnomad_exome?.af != null) af = `gnomAD AF: ${Number(h.gnomad_exome.af).toExponential(2)}`;
+            else if (h.gnomad_genome?.af != null) af = `gnomAD AF: ${Number(h.gnomad_genome.af).toExponential(2)}`;
+            const parts = [hgvs];
+            if (rsid) parts.push(`rsID: ${rsid}`);
+            if (cons) parts.push(cons);
+            if (af) parts.push(af);
+            return parts.join(" | ");
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: renderStructuredResponse({
+                  summary: `Input "${normalizedId}" appears to be a gene symbol. Found ${geneHits.length} variant(s) in gene ${geneSymbol}. Call get_variant_annotations(variantId="...") with one of the HGVS _id or rsID below for full annotations.`,
+                  keyFields,
+                  sources: [geneUrl],
+                  limitations: [
+                    "Pass the HGVS _id (e.g. chr2:g.165310468G>A) or rsID as variantId for full ClinVar/gnomAD/CADD annotations.",
+                    "For VEP predictions, use annotate_variants_vep with the same HGVS ID.",
+                  ],
+                }),
+              },
+            ],
+          };
+        }
+      }
+
       return {
         content: [
           {
@@ -9274,6 +9601,7 @@ server.registerTool(
               sources: [url],
               limitations: [
                 'Check variant format. Examples: "rs113488022", "chr7:g.140753336A>T".',
+                "If this is a gene symbol, use search_variants_by_gene(gene='...') first to discover variants.",
                 "MyVariant.info uses hg19 coordinates by default.",
               ],
             }),
@@ -12350,6 +12678,27 @@ const EBRAINS_KG_VALID_TYPES = new Set([
   "Learning Resource", "Web service", "Workflow", "(Meta)Data Model",
 ]);
 
+async function fetchEbrainsKgSearch({ query, type, from, size }) {
+  const url =
+    `${EBRAINS_KG_SEARCH_API}/groups/public/search` +
+    `?q=${encodeURIComponent(query)}&type=${encodeURIComponent(type)}&from=${from}&size=${size}`;
+
+  const res = await fetchWithRetry(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+    timeoutMs: 20000,
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => "");
+    const statusDetail = errorText ? `: ${compactErrorMessage(errorText, 220)}` : "";
+    throw new Error(`HTTP ${res.status}${statusDetail}`);
+  }
+
+  return res.json();
+}
+
 server.registerTool(
   "search_ebrains_kg",
   {
@@ -12368,23 +12717,97 @@ server.registerTool(
   async ({ query, type, from: offset, size }) => {
     const limit = Math.min(Math.max(1, size || 20), 50);
     const pageFrom = Math.max(0, offset || 0);
-    const typeParam = type && EBRAINS_KG_VALID_TYPES.has(type) ? `&type=${encodeURIComponent(type)}` : "";
+    const requestedType = type && EBRAINS_KG_VALID_TYPES.has(type) ? type : null;
 
-    const url =
-      `${EBRAINS_KG_SEARCH_API}/groups/public/search` +
-      `?q=${encodeURIComponent(query)}${typeParam}&from=${pageFrom}&size=${limit}`;
+    let hits = [];
+    let total = 0;
+    let types = {};
+    const limitations = [
+      "Only publicly released (curated) resources are included in search results.",
+      "Use get_ebrains_kg_document with the ID and type to retrieve full metadata, DOIs, authors, and file information.",
+      "EBRAINS primarily hosts data from the Human Brain Project and European neuroscience initiatives.",
+    ];
 
-    const res = await fetchWithRetry(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-      timeoutMs: 20000,
-    });
-    const data = await res.json();
+    if (requestedType) {
+      const data = await fetchEbrainsKgSearch({
+        query,
+        type: requestedType,
+        from: pageFrom,
+        size: limit,
+      });
+      hits = data.hits || [];
+      total = data.total || 0;
+      types = data.types || {};
+    } else {
+      // The public search endpoint now fails with HTTP 500 when "type" is omitted.
+      // Aggregate a best-effort cross-type search client-side instead.
+      const searchWindow = Math.min(pageFrom + limit, 50);
+      const searchTypes = Array.from(EBRAINS_KG_VALID_TYPES);
+      const settled = await Promise.all(
+        searchTypes.map(async (typeName) => {
+          try {
+            const data = await fetchEbrainsKgSearch({
+              query,
+              type: typeName,
+              from: 0,
+              size: searchWindow,
+            });
+            return { typeName, data, error: null };
+          } catch (error) {
+            return { typeName, data: null, error };
+          }
+        })
+      );
 
-    const hits = data.hits || [];
-    const total = data.total || 0;
-    const types = data.types || {};
+      const successful = settled.filter((entry) => entry.data);
+      const failed = settled
+        .filter((entry) => entry.error)
+        .map((entry) => `${entry.typeName}: ${compactErrorMessage(entry.error?.message || "unknown error", 160)}`);
+
+      if (successful.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `EBRAINS Knowledge Graph search failed for "${query}" across all resource types.`,
+              keyFields: [
+                `Query: ${query}`,
+                "Type filter: all (aggregated)",
+                failed.length > 0 ? `Failures: ${failed.join("; ")}` : "Failures: unknown",
+              ],
+              sources: ["https://search.kg.ebrains.eu/"],
+              limitations: [
+                "The EBRAINS public search API returns HTTP 500 when no type filter is supplied.",
+              ],
+            }),
+          }],
+        };
+      }
+
+      const combinedHits = [];
+      const seenIds = new Set();
+      for (const entry of successful) {
+        for (const hit of entry.data.hits || []) {
+          if (!hit?.id || seenIds.has(hit.id)) continue;
+          seenIds.add(hit.id);
+          combinedHits.push(hit);
+        }
+      }
+
+      hits = combinedHits.slice(pageFrom, pageFrom + limit);
+      total = successful.reduce((sum, entry) => sum + (entry.data.total || 0), 0);
+      types = successful[0].data.types || {};
+
+      limitations.push(
+        "The EBRAINS public search API returns HTTP 500 when no type filter is supplied, so this tool aggregates per-type searches when type is omitted."
+      );
+      if (pageFrom + limit > 50) {
+        limitations.push("Cross-type pagination is approximate beyond the first 50 results per resource type.");
+      }
+      if (failed.length > 0) {
+        limitations.push(`Partial type failures: ${failed.join("; ")}`);
+      }
+    }
 
     if (hits.length === 0) {
       const typeCounts = Object.entries(types)
@@ -12394,10 +12817,10 @@ server.registerTool(
         content: [{
           type: "text",
           text: renderStructuredResponse({
-            summary: `No EBRAINS Knowledge Graph results for "${query}"${type ? ` (type: ${type})` : ""}.${typeCounts ? ` Available counts across types: ${typeCounts}` : ""}`,
-            keyFields: [`Query: ${query}`, type ? `Type filter: ${type}` : "Type: all"],
+            summary: `No EBRAINS Knowledge Graph results for "${query}"${requestedType ? ` (type: ${requestedType})` : ""}.${typeCounts ? ` Available counts across types: ${typeCounts}` : ""}`,
+            keyFields: [`Query: ${query}`, requestedType ? `Type filter: ${requestedType}` : "Type: all (aggregated)"],
             sources: ["https://search.kg.ebrains.eu/"],
-            limitations: ["Only publicly released resources are searched."],
+            limitations,
           }),
         }],
       };
@@ -12431,24 +12854,20 @@ server.registerTool(
       content: [{
         type: "text",
         text: renderStructuredResponse({
-          summary: `EBRAINS Knowledge Graph: ${total} result(s) for "${query}"${type ? ` (type: ${type})` : ""}. Showing ${pageFrom + 1}–${pageFrom + hits.length}.`,
+          summary: `EBRAINS Knowledge Graph: ${total} result(s) for "${query}"${requestedType ? ` (type: ${requestedType})` : ""}. Showing ${pageFrom + 1}–${pageFrom + hits.length}.`,
           keyFields: [
             `Query: ${query}`,
-            type ? `Type filter: ${type}` : "Type: all",
+            requestedType ? `Type filter: ${requestedType}` : "Type: all (aggregated)",
             `Total: ${total}`,
             `Type breakdown: ${typeSummary}`,
             `\nResults:`,
             ...lines,
           ],
           sources: [
-            `https://search.kg.ebrains.eu/?q=${encodeURIComponent(query)}${type ? `&category=${encodeURIComponent(type)}` : ""}`,
+            `https://search.kg.ebrains.eu/?q=${encodeURIComponent(query)}${requestedType ? `&category=${encodeURIComponent(requestedType)}` : ""}`,
             "https://search.kg.ebrains.eu/",
           ],
-          limitations: [
-            "Only publicly released (curated) resources are included in search results.",
-            "Use get_ebrains_kg_document with the ID and type to retrieve full metadata, DOIs, authors, and file information.",
-            "EBRAINS primarily hosts data from the Human Brain Project and European neuroscience initiatives.",
-          ],
+          limitations,
         }),
       }],
     };
@@ -12790,16 +13209,109 @@ server.registerTool(
 // NEMAR (NeuroElectroMagnetic data Archive) dataset tools
 // ---------------------------------------------------------------------------
 
+const NEMAR_MODALITY_ALIASES = new Map([
+  ["eeg", "EEG"],
+  ["meg", "MEG"],
+  ["ieeg", "iEEG"],
+  ["emg", "EMG"],
+]);
+
+function parseNEMARQuery(rawQuery) {
+  const raw = normalizeWhitespace(rawQuery || "");
+  if (!raw) {
+    return { rawQuery: "", keyword: "", modalities: [], modalityParam: "" };
+  }
+  const keywordTokens = [];
+  const modalities = [];
+  for (const token of raw.split(/\s+/)) {
+    const normalizedToken = token.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const modality = NEMAR_MODALITY_ALIASES.get(normalizedToken);
+    if (modality) {
+      if (!modalities.includes(modality)) modalities.push(modality);
+      continue;
+    }
+    keywordTokens.push(token);
+  }
+  const keyword = normalizeWhitespace(keywordTokens.join(" "));
+  return {
+    rawQuery: raw,
+    keyword,
+    modalities,
+    modalityParam: modalities.length > 0 ? `OR ${modalities.join(" ")}` : "",
+  };
+}
+
+function parseNEMARAgeRange(item) {
+  const ageMin = Number(item?.age_min || 0);
+  const ageMax = Number(item?.age_max || 0);
+  if (ageMin > 0 && ageMax > 0) return `${ageMin}-${ageMax}`;
+  if (ageMin > 0) return `${ageMin}+`;
+  if (ageMax > 0) return `0-${ageMax}`;
+  return "unknown";
+}
+
+function sortNEMARDatasets(items, mode) {
+  const datasets = [...items];
+  const newestValue = (item) => String(item?.latestSnapshot_created || item?.publishDate || item?.created || "");
+  if (mode === "name") {
+    datasets.sort((a, b) =>
+      normalizeWhitespace(a?.description_name || a?.name || "").localeCompare(
+        normalizeWhitespace(b?.description_name || b?.name || "")
+      )
+    );
+    return datasets;
+  }
+  datasets.sort((a, b) => newestValue(b).localeCompare(newestValue(a)));
+  return datasets;
+}
+
+function extractNEMARDetailField(html, label) {
+  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = html.match(
+    new RegExp(`<strong[^>]*>${escapedLabel}:?\\s*<\\/strong>\\s*<span[^>]*>([\\s\\S]*?)<\\/span>`, "i")
+  );
+  return match ? normalizeWhitespace(stripHtmlToText(match[1])) : "";
+}
+
+function parseNEMARDetailPage(html, datasetId) {
+  const titleMatch = html.match(/<h2[^>]*>\s*([\s\S]*?)\s*<\/h2>/i);
+  const title = titleMatch ? normalizeWhitespace(stripHtmlToText(titleMatch[1])) : "";
+  const readmeMatch = html.match(/<div class="nemar-readme">([\s\S]*?)<\/div>\s*<\/div>/i);
+  const readmeText = readmeMatch ? stripHtmlToText(readmeMatch[1], { preserveParagraphs: true }) : "";
+  const openNeuroUrlMatch = html.match(/<a href="([^"]+)"[^>]*>\s*OpenNeuro\s*<\/a>/i);
+
+  if (!title) return null;
+
+  return {
+    datasetId,
+    title,
+    participants: extractNEMARDetailField(html, "Participants"),
+    eventFiles: extractNEMARDetailField(html, "Event files"),
+    hedAnnotation: extractNEMARDetailField(html, "HED annotation"),
+    bidsVersion: extractNEMARDetailField(html, "BIDS Version"),
+    publishedDate: extractNEMARDetailField(html, "Published date"),
+    tasks: extractNEMARDetailField(html, "Tasks"),
+    modalities: extractNEMARDetailField(html, "Available modalities"),
+    formats: extractNEMARDetailField(html, "Format(s)"),
+    readmePreview: readmeText ? (readmeText.length > 1200 ? `${readmeText.slice(0, 1197)}...` : readmeText) : "",
+    sources: [
+      `${NEMAR_DATAEXPLORER_API}/detail?dataset_id=${encodeURIComponent(datasetId)}`,
+      openNeuroUrlMatch?.[1] || "",
+      "https://nemar.org/dataexplorer",
+    ].filter(Boolean),
+  };
+}
+
 server.registerTool(
   "search_nemar_datasets",
   {
     description:
-      "Searches NEMAR (NeuroElectroMagnetic data Archive) for EEG, MEG, and iEEG datasets. " +
+      "Searches NEMAR (NeuroElectroMagnetic data Archive) for EEG, MEG, iEEG, and related datasets using the public NEMAR Data Explorer. " +
       "NEMAR hosts OpenNeuro neuroelectromagnetic data at SDSC with BIDS format, HED event descriptions, and NSG compute integration. " +
-      "Datasets are GitHub repos in the nemarDatasets organization. Use keywords like 'EEG', 'MEG', 'iEEG', 'resting state', 'visual', 'auditory', or study names. " +
-      "Omit query or use 'EEG' to browse. Use get_nemar_dataset_details with a repo name (e.g. nm000104) for full metadata.",
+      "Use keywords like 'EEG', 'MEG', 'iEEG', 'resting state', 'visual', 'auditory', or study names. " +
+      "Omit query or use modality words like 'EEG' or 'iEEG' to browse. Use get_nemar_dataset_details with a dataset id (e.g. ds005522) or legacy repo id for more metadata.",
     inputSchema: {
-      query: z.string().optional().describe("Search term for repo name/description/topics. Use 'EEG', 'MEG', 'iEEG', 'resting', 'visual', or study keywords. Omit to list recent datasets."),
+      query: z.string().optional().describe("Search term for dataset title/README metadata. Include modality words like 'EEG', 'MEG', or 'iEEG' to filter. Omit to browse."),
       sortBy: z.enum(["updated", "stars", "name"]).optional().describe("Result ordering. Default 'updated'."),
       maxResults: z.number().optional().describe("Maximum results (default 20, max 50)."),
     },
@@ -12807,28 +13319,17 @@ server.registerTool(
   async ({ query, sortBy, maxResults }) => {
     const limit = Math.min(Math.max(1, maxResults || 20), 50);
     const mode = String(sortBy || "updated").toLowerCase();
-    const q = normalizeWhitespace(query || "");
-    const searchQ = q ? `${q} org:${NEMAR_GITHUB_ORG}` : `org:${NEMAR_GITHUB_ORG}`;
-    const params = new URLSearchParams({
-      q: searchQ,
-      per_page: String(limit),
-      page: "1",
-    });
-    if (mode === "updated" || mode === "stars") {
-      params.set("sort", mode);
-      params.set("order", "desc");
-    }
+    const { rawQuery, keyword, modalities, modalityParam } = parseNEMARQuery(query || "");
+    const params = new URLSearchParams({ file_format: "all" });
+    if (keyword) params.set("search", keyword);
+    if (modalityParam) params.set("modality", modalityParam);
 
-    const url = `${GITHUB_API}/search/repositories?${params.toString()}`;
     let data;
     try {
-      data = await fetchJsonWithRetry(url, {
+      data = await fetchJsonWithRetry(`${NEMAR_DATAEXPLORER_VIEW_API}?${params.toString()}`, {
         retries: 1,
-        timeoutMs: 12000,
-        headers: {
-          Accept: "application/vnd.github+json",
-          "User-Agent": "research-mcp",
-        },
+        timeoutMs: 15000,
+        headers: { Accept: "application/json", "User-Agent": "research-mcp" },
       });
     } catch (error) {
       return {
@@ -12836,46 +13337,66 @@ server.registerTool(
           type: "text",
           text: renderStructuredResponse({
             summary: `NEMAR dataset search failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
-            keyFields: [q ? `Query: ${q}` : "Browse: all", `Organization: ${NEMAR_GITHUB_ORG}`],
-            sources: ["https://nemar.org/", "https://github.com/nemarDatasets"],
-            limitations: ["GitHub API rate limits may apply to unauthenticated requests."],
+            keyFields: [
+              rawQuery ? `Query: ${rawQuery}` : "Browse: all",
+              modalityParam ? `Modality filter: ${modalities.join(", ")}` : "Modality: all",
+            ],
+            sources: ["https://nemar.org/discover", "https://nemar.org/dataexplorer"],
+            limitations: ["Results depend on the availability of NEMAR's public Data Explorer API."],
           }),
         }],
       };
     }
 
-    const items = Array.isArray(data?.items) ? data.items : [];
-    const total = Number(data?.total_count || 0);
+    const rawItems = Array.isArray(data) ? data : [];
+    const total = rawItems.length;
+    const items = sortNEMARDatasets(rawItems, mode === "stars" ? "updated" : mode).slice(0, limit);
+    const limitations = [
+      "NEMAR results are sourced from the public Data Explorer, which may rank matches using hidden metadata not visible in the summary card.",
+      "Use get_nemar_dataset_details with a dataset id (for example ds005522) to inspect README-level task and anatomy details.",
+    ];
+    if (mode === "stars") {
+      limitations.push("NEMAR's public explorer does not expose GitHub stars; results were ordered by recency instead.");
+    }
+
     if (items.length === 0) {
       return {
         content: [{
           type: "text",
           text: renderStructuredResponse({
-            summary: `No NEMAR datasets found${q ? ` for "${q}"` : ""}.`,
-            keyFields: [q ? `Query: ${q}` : "Browse: all", `Organization: ${NEMAR_GITHUB_ORG}`],
-            sources: ["https://nemar.org/discover", "https://github.com/nemarDatasets"],
-            limitations: ["Try 'EEG', 'MEG', or 'iEEG' to find modality-specific datasets."],
+            summary: `No NEMAR datasets found${rawQuery ? ` for "${rawQuery}"` : ""}.`,
+            keyFields: [
+              rawQuery ? `Query: ${rawQuery}` : "Browse: all",
+              modalityParam ? `Modality filter: ${modalities.join(", ")}` : "Modality: all",
+            ],
+            sources: ["https://nemar.org/discover", "https://nemar.org/dataexplorer"],
+            limitations: ["Try modality-filtered queries like 'iEEG hippocampus' or 'MEG resting state'."],
           }),
         }],
       };
     }
 
-    const lines = items.map((repo, idx) => {
-      const name = repo?.name || "unknown";
-      const desc = normalizeWhitespace(repo?.description || "");
-      const descPreview = desc ? (desc.length > 100 ? `${desc.slice(0, 97)}...` : desc) : "No description.";
-      const stars = Number(repo?.stargazers_count || 0);
-      const updatedAt = repo?.updated_at ? String(repo.updated_at).slice(0, 10) : "unknown";
-      return `  ${String(idx + 1).padStart(3)}. ${name} — ${descPreview} | stars: ${stars} | updated: ${updatedAt}`;
+    const lines = items.map((dataset, idx) => {
+      const datasetId = dataset?.id || "unknown";
+      const title = normalizeWhitespace(dataset?.description_name || dataset?.name || "Untitled dataset");
+      const titlePreview = title.length > 100 ? `${title.slice(0, 97)}...` : title;
+      const modalityText = normalizeWhitespace(dataset?.modalities || dataset?.primaryModality || "unknown");
+      const participants = Number.isFinite(Number(dataset?.participants)) ? Number(dataset.participants) : "unknown";
+      const ageRange = parseNEMARAgeRange(dataset);
+      const formats = normalizeWhitespace(dataset?.file_formats || "unknown");
+      const publishedAt = String(dataset?.publishDate || dataset?.latestSnapshot_created || dataset?.created || "unknown").slice(0, 10);
+      return `  ${String(idx + 1).padStart(3)}. ${datasetId} — ${titlePreview} | modality: ${modalityText} | participants: ${participants} | ages: ${ageRange} | formats: ${formats} | published: ${publishedAt}`;
     });
 
     return {
       content: [{
         type: "text",
         text: renderStructuredResponse({
-          summary: `NEMAR: ${items.length} dataset(s)${q ? ` matching "${q}"` : ""} in ${NEMAR_GITHUB_ORG}.`,
+          summary: `NEMAR: ${items.length} dataset(s)${rawQuery ? ` matching "${rawQuery}"` : ""} from the public Data Explorer.`,
           keyFields: [
-            q ? `Query: ${q}` : "Browse: all",
+            rawQuery ? `Query: ${rawQuery}` : "Browse: all",
+            keyword ? `Parsed text query: ${keyword}` : "Parsed text query: none",
+            modalityParam ? `Modality filter: ${modalities.join(", ")}` : "Modality: all",
             `Total matches: ${total}`,
             "\nResults:",
             ...lines,
@@ -12883,11 +13404,8 @@ server.registerTool(
           sources: [
             "https://nemar.org/discover",
             "https://nemar.org/dataexplorer",
-            "https://github.com/nemarDatasets",
           ],
-          limitations: [
-            "NEMAR datasets are EEG/MEG/iEEG from OpenNeuro, hosted at SDSC. Use get_nemar_dataset_details with repo name for full metadata.",
-          ],
+          limitations,
         }),
       }],
     };
@@ -12898,20 +13416,68 @@ server.registerTool(
   "get_nemar_dataset_details",
   {
     description:
-      "Fetches detailed metadata for a NEMAR dataset repository (e.g. nm000104). " +
-      "Returns description, stars, topics, README preview, and links. Use after search_nemar_datasets.",
+      "Fetches detailed metadata for a NEMAR dataset by dataset id or legacy repository id (for example ds005522 or nm000104). " +
+      "Returns README-derived task details, modalities, formats, and links when available. Use after search_nemar_datasets.",
     inputSchema: {
-      repo: z.string().describe("Repository name from search_nemar_datasets (e.g. 'nm000104'). Can be full path 'nemarDatasets/nm000104'."),
+      repo: z.string().describe("NEMAR dataset id or legacy repository name from search_nemar_datasets (for example 'ds005522', 'nm000104', or 'nemarDatasets/nm000104')."),
     },
   },
   async ({ repo }) => {
     const rawRepo = normalizeWhitespace(repo || "");
     if (!rawRepo) {
-      return { content: [{ type: "text", text: "Provide a NEMAR dataset repo name (e.g. nm000104)." }] };
+      return { content: [{ type: "text", text: "Provide a NEMAR dataset id or repo name (for example ds005522 or nm000104)." }] };
     }
     const repoName = rawRepo.includes("/") ? rawRepo.split("/").pop() : rawRepo;
     if (!repoName) {
       return { content: [{ type: "text", text: "Unable to parse repository name." }] };
+    }
+
+    if (/^(?:ds|nm|on)\d+$/i.test(repoName)) {
+      const detailUrl = `${NEMAR_DATAEXPLORER_API}/detail?dataset_id=${encodeURIComponent(repoName)}`;
+      try {
+        const detailResponse = await fetchWithRetry(detailUrl, {
+          retries: 1,
+          timeoutMs: 15000,
+          headers: {
+            Accept: "text/html,application/xhtml+xml",
+            "User-Agent": "research-mcp",
+          },
+        });
+        const html = await detailResponse.text();
+        const parsed = parseNEMARDetailPage(html, repoName);
+        if (parsed) {
+          const keyFields = [
+            `Dataset ID: ${parsed.datasetId}`,
+            `Title: ${parsed.title}`,
+          ];
+          if (parsed.participants) keyFields.push(`Participants: ${parsed.participants}`);
+          if (parsed.eventFiles) keyFields.push(`Event files: ${parsed.eventFiles}`);
+          if (parsed.hedAnnotation) keyFields.push(`HED annotation: ${parsed.hedAnnotation}`);
+          if (parsed.modalities) keyFields.push(`Modalities: ${parsed.modalities}`);
+          if (parsed.formats) keyFields.push(`Formats: ${parsed.formats}`);
+          if (parsed.tasks) keyFields.push(`Tasks: ${parsed.tasks}`);
+          if (parsed.bidsVersion) keyFields.push(`BIDS version: ${parsed.bidsVersion}`);
+          if (parsed.publishedDate) keyFields.push(`Published: ${parsed.publishedDate}`);
+          if (parsed.readmePreview) keyFields.push(`\nREADME preview:\n${parsed.readmePreview}`);
+
+          return {
+            content: [{
+              type: "text",
+              text: renderStructuredResponse({
+                summary: `NEMAR dataset: ${parsed.title} (${parsed.datasetId}).`,
+                keyFields,
+                sources: parsed.sources,
+                limitations: [
+                  "Metadata is parsed from NEMAR's public dataset detail page and README rendering.",
+                  "Some anatomy or electrode-localization details may only be fully available in sidecar files or accompanying publications.",
+                ],
+              }),
+            }],
+          };
+        }
+      } catch (_) {
+        // Fall through to GitHub repo lookup for legacy mirrored datasets.
+      }
     }
 
     const repoUrl = `${GITHUB_API}/repos/${NEMAR_GITHUB_ORG}/${encodeURIComponent(repoName)}`;
@@ -12930,10 +13496,10 @@ server.registerTool(
         content: [{
           type: "text",
           text: renderStructuredResponse({
-            summary: `NEMAR dataset not found: ${NEMAR_GITHUB_ORG}/${repoName}.`,
-            keyFields: [`Repository: ${NEMAR_GITHUB_ORG}/${repoName}`, `Error: ${compactErrorMessage(error?.message || "unknown error", 220)}`],
-            sources: [`https://github.com/${NEMAR_GITHUB_ORG}/${repoName}`, "https://nemar.org/"],
-            limitations: ["Repository may be private or the name incorrect."],
+            summary: `NEMAR dataset not found in NEMAR detail pages or GitHub mirror: ${repoName}.`,
+            keyFields: [`Identifier: ${repoName}`, `Error: ${compactErrorMessage(error?.message || "unknown error", 220)}`],
+            sources: [`https://nemar.org/dataexplorer/detail?dataset_id=${encodeURIComponent(repoName)}`, `https://github.com/${NEMAR_GITHUB_ORG}/${repoName}`],
+            limitations: ["The identifier may be incorrect, private, or not mirrored on GitHub."],
           }),
         }],
       };
@@ -12952,7 +13518,9 @@ server.registerTool(
         const cleaned = normalizeWhitespace(readmeText.replace(/[#*_`>-]/g, " "));
         readmePreview = cleaned.length > 400 ? `${cleaned.slice(0, 397)}...` : cleaned;
       }
-    } catch (_) {}
+    } catch (_) {
+      // README preview is best-effort only.
+    }
 
     const topics = Array.isArray(repoData?.topics) ? repoData.topics : [];
     const keyFields = [
@@ -12968,7 +13536,7 @@ server.registerTool(
       content: [{
         type: "text",
         text: renderStructuredResponse({
-          summary: `NEMAR dataset: ${repoData?.full_name || `${NEMAR_GITHUB_ORG}/${repoName}`}.`,
+          summary: `NEMAR GitHub mirror dataset: ${repoData?.full_name || `${NEMAR_GITHUB_ORG}/${repoName}`}.`,
           keyFields,
           sources: [
             repoData?.html_url || `https://github.com/${NEMAR_GITHUB_ORG}/${repoName}`,
@@ -12976,7 +13544,7 @@ server.registerTool(
             "https://nemar.org/",
           ],
           limitations: [
-            "Data download and NSG compute access require the NEMAR website or DataLad. Dataset IDs map to OpenNeuro equivalents.",
+            "This is a legacy GitHub-mirror fallback. Prefer NEMAR dataset ids like ds005522 for live Data Explorer metadata.",
           ],
         }),
       }],

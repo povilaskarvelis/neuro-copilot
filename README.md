@@ -260,27 +260,6 @@ All accessed via `list_bigquery_tables` and `run_bigquery_select_query` with rea
 - **BigQuery guardrails** — read-only queries with configurable max rows (default 200, hard cap 1000) and bytes-billed limits.
 - **Source precedence policy** — overlapping tools are given explicit routing guidance so the planner/executor prefer the right source for each evidence type (for example IntAct vs STRING, DailyMed vs FAERS, PubMed vs Europe PMC).
 
-## Example Queries
-
-```
-Evaluate LRRK2 as a drug target for Parkinson disease — what is the genetic evidence, druggability, and competitive landscape?
-```
-```
-Is KRAS G12C structurally druggable? What do predicted protein structures and known interaction partners suggest about tractable binding sites?
-```
-```
-What are the population-level variant frequencies for BRCA1, and which variants are classified as clinically significant?
-```
-```
-What post-marketing safety signals exist for JAK inhibitors, and how selective are they across the kinase family?
-```
-```
-What immune epitopes are known for PD-L1, and which signaling pathways does it participate in?
-```
-```
-Who are the most active researchers working on CAR-T therapy for solid tumors, and what are the recent breakthroughs?
-```
-
 ## Quick Start
 
 ### Prerequisites
