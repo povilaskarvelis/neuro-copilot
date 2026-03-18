@@ -187,6 +187,76 @@ def test_initialize_and_advance_task_state_one_step_at_a_time():
     assert task_state["execution_metrics"]["summary"]["blocked_count"] == 1
 
 
+def test_initialize_task_state_repairs_blank_tool_hint_from_goal_text():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Prioritize Rett-like syndrome genes besides MECP2",
+        "success_criteria": ["Rank candidate genes with phenotype support"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Match Rett-like phenotype features such as developmental delay, seizures, and hand stereotypies to candidate genes",
+                "tool_hint": "   ",
+                "domains": ["genomics"],
+                "completion_condition": "Record phenotype-driven support for the strongest candidates",
+            },
+        ],
+    }
+
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Prioritize Rett-like syndrome genes besides MECP2",
+    )
+
+    assert task_state["steps"][0]["tool_hint"] == "query_monarch_associations"
+
+
+def test_initialize_task_state_repairs_blank_tool_hint_from_source_label():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Review curated gene-disease evidence",
+        "success_criteria": ["Capture ClinGen evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Collect curated gene-disease validity evidence for top candidates",
+                "tool_hint": "",
+                "source": "ClinGen",
+                "domains": ["genomics"],
+                "completion_condition": "Summarize expert curation status for each gene",
+            },
+        ],
+    }
+
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Review curated gene-disease evidence",
+    )
+
+    assert task_state["steps"][0]["tool_hint"] == "get_clingen_gene_curation"
+
+
+def test_validate_plan_internal_canonicalizes_source_label_tool_hint():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Find corroborating papers",
+        "success_criteria": ["Capture PMIDs"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Find corroborating literature for the lead genes",
+                "tool_hint": "PubMed",
+                "domains": ["literature"],
+                "completion_condition": "Record at least three PMIDs",
+            },
+        ],
+    }
+
+    validated = workflow._validate_plan_internal(plan)
+
+    assert validated["steps"][0]["tool_hint"] == "search_pubmed"
+
+
 def test_resolve_active_step_tool_allowlist_scopes_to_current_step():
     task_state = {
         "plan_status": "ready",

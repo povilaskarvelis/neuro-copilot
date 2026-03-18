@@ -207,6 +207,100 @@ KNOWN_MCP_TOOLS = [
     "check_gpqa_access",
 ]
 
+DEFAULT_TOOL_HINT_BY_DOMAIN = {
+    "literature": "search_pubmed",
+    "clinical": "search_clinical_trials",
+    "protein": "search_uniprot_proteins",
+    "genomics": "query_monarch_associations",
+    "chemistry": "search_drug_gene_interactions",
+    "immunology": "search_iedb_epitope_evidence",
+    "neuroscience": "search_ebrains_kg",
+    "data": "run_bigquery_select_query",
+}
+
+EMPTY_LIKE_TOOL_HINTS = {
+    "",
+    "na",
+    "n/a",
+    "none",
+    "null",
+    "tbd",
+    "todo",
+    "unknown",
+    "unspecified",
+    "notsure",
+    "notapplicable",
+}
+
+TOOL_HINT_INFERENCE_RULES: list[tuple[tuple[str, ...], str]] = [
+    (
+        ("clingen", "gene-disease validity", "gene disease validity", "dosage sensitivity", "curated gene-disease"),
+        "get_clingen_gene_curation",
+    ),
+    (
+        ("model organism", "ortholog", "orthologs", "zebrafish", "drosophila", "mouse model", "worm model"),
+        "get_alliance_genome_gene_profile",
+    ),
+    (
+        ("tractability", "druggability", "drug-gene", "drug gene", "target tractability", "small molecule", "ligand"),
+        "search_drug_gene_interactions",
+    ),
+    (
+        ("identifier", "identifiers", "gene symbol", "aliases", "alias", "ensembl", "entrez"),
+        "resolve_gene_identifiers",
+    ),
+    (
+        ("ontology", "mondo", "efo", "doid", "mesh", "omim", "umls"),
+        "map_ontology_terms_oxo",
+    ),
+    (
+        ("variant", "variants", "hgvs", "rsid", "rs id", "clinvar"),
+        "search_variants_by_gene",
+    ),
+    (
+        ("phenotype", "phenotypes", "rett", "seizure", "hand stereotyp", "developmental delay", "hpo", "rare disease", "syndrome"),
+        "query_monarch_associations",
+    ),
+    (
+        ("expression", "tissue", "single-cell", "single cell", "localization"),
+        "get_human_protein_atlas_gene",
+    ),
+    (
+        ("interaction", "interactome", "protein-protein", "protein protein"),
+        "get_intact_interactions",
+    ),
+    (
+        ("pathway", "reactome"),
+        "search_reactome_pathways",
+    ),
+    (
+        ("clinical trial", "clinical trials", "trial", "trials", "nct"),
+        "search_clinical_trials",
+    ),
+    (
+        ("pmid", "doi", "pubmed", "literature", "paper", "papers", "citation", "citations"),
+        "search_pubmed",
+    ),
+]
+
+
+def _normalize_lookup_key(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def _build_default_tool_hint_by_source_label() -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for tool_name in KNOWN_MCP_TOOLS:
+        label = str(tool_registry.TOOL_SOURCE_NAMES.get(tool_name, "")).strip()
+        key = _normalize_lookup_key(label)
+        if key and key not in labels:
+            labels[key] = tool_name
+    labels[_normalize_lookup_key("BigQuery")] = "run_bigquery_select_query"
+    return labels
+
+
+DEFAULT_TOOL_HINT_BY_SOURCE_LABEL = _build_default_tool_hint_by_source_label()
+
 
 PLANNER_INSTRUCTION_TEMPLATE = """
 You are the internal planner for biomedical investigation.
@@ -1866,6 +1960,48 @@ def _as_string_list(value: Any, field_name: str, *, limit: int = 20) -> list[str
     return _dedupe_str_list(value, limit=limit)
 
 
+def _canonicalize_tool_hint_candidate(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().strip("`"))
+    if not text:
+        return ""
+    lookup_key = _normalize_lookup_key(text)
+    if lookup_key in EMPTY_LIKE_TOOL_HINTS:
+        return ""
+    if text in KNOWN_MCP_TOOLS or text in tool_registry.TOOL_SOURCE_NAMES:
+        return text
+    if "." in text:
+        base = text.split(".", 1)[0].strip()
+        if base in KNOWN_MCP_TOOLS or base in tool_registry.TOOL_SOURCE_NAMES:
+            return base
+    mapped = DEFAULT_TOOL_HINT_BY_SOURCE_LABEL.get(lookup_key) or DEFAULT_TOOL_HINT_BY_DOMAIN.get(lookup_key)
+    return mapped or text
+
+
+def _infer_plan_step_tool_hint(step: dict[str, Any], domains: list[str]) -> str:
+    for field_name in ("tool_hint", "tool", "source", "database", "dataset"):
+        candidate = _canonicalize_tool_hint_candidate(step.get(field_name))
+        if candidate:
+            return candidate
+
+    context_fields = [
+        step.get("goal"),
+        step.get("completion_condition"),
+        step.get("notes"),
+        step.get("rationale"),
+        step.get("description"),
+    ]
+    context_text = " ".join(re.sub(r"\s+", " ", str(value or "").strip()).lower() for value in context_fields if value)
+    for keywords, tool_name in TOOL_HINT_INFERENCE_RULES:
+        if any(keyword in context_text for keyword in keywords):
+            return tool_name
+
+    for domain in domains:
+        default_tool = DEFAULT_TOOL_HINT_BY_DOMAIN.get(_normalize_lookup_key(domain))
+        if default_tool:
+            return default_tool
+    return "search_pubmed"
+
+
 def _validate_plan_internal(raw: dict[str, Any]) -> dict[str, Any]:
     if str(raw.get("schema", "")).strip() != PLAN_SCHEMA:
         raise ValueError(f"schema must be {PLAN_SCHEMA}")
@@ -1891,11 +2027,15 @@ def _validate_plan_internal(raw: dict[str, Any]) -> dict[str, Any]:
             domains = [d for d in domains if d in tool_registry.TOOL_DOMAINS]
         else:
             domains = []
+        raw_tool_hint = re.sub(r"\s+", " ", str(step.get("tool_hint", "") or "").strip())
+        tool_hint = _infer_plan_step_tool_hint(step, domains)
+        if not raw_tool_hint:
+            logger.warning("[planner] repaired empty tool_hint for steps[%d] -> %s", idx - 1, tool_hint)
         steps.append(
             {
                 "id": canonical_id,
                 "goal": _as_nonempty_str(step.get("goal"), f"steps[{idx - 1}].goal"),
-                "tool_hint": _as_nonempty_str(step.get("tool_hint"), f"steps[{idx - 1}].tool_hint"),
+                "tool_hint": _as_nonempty_str(tool_hint, f"steps[{idx - 1}].tool_hint"),
                 "domains": domains,
                 "completion_condition": _as_nonempty_str(
                     step.get("completion_condition"),
@@ -5938,6 +6078,8 @@ def _planner_json_instruction_suffix() -> str:
         "Return ONLY valid JSON matching `plan_internal.v1` for this objective. "
         "Each step MUST include a \"domains\" array with 1-3 domain names from: "
         f"{', '.join(tool_registry.ALL_DOMAIN_NAMES)}. "
+        "If you are unsure which tool fits a step, choose the closest valid tool from the catalog instead of leaving "
+        "\"tool_hint\" blank. "
         "Do not include markdown fences or commentary."
     )
 
