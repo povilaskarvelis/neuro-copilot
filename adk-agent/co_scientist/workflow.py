@@ -45,6 +45,9 @@ from google.genai import types
 from mcp.client.stdio import StdioServerParameters
 
 from . import tool_registry
+from .skill_loader import create_execution_skill_toolset
+from .skill_loader import create_planner_skill_toolset
+from .skill_loader import create_report_assistant_skill_toolset
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,15 @@ SYNTHESIZER_MODEL = os.getenv("ADK_SYNTHESIZER_MODEL", "gemini-2.5-pro")
 ROUTER_MODEL = os.getenv("ADK_ROUTER_MODEL", "gemini-2.5-flash")
 THINKING_CONFIG_V3 = types.ThinkingConfig(thinking_level="HIGH")
 THINKING_CONFIG_V2 = types.ThinkingConfig(include_thoughts=True, thinking_budget=8192)
+DEFAULT_PLANNER_SKILLS_ENABLED = (
+    str(os.getenv("ADK_PLANNER_SKILLS_ENABLED", "1")).strip().lower() not in {"0", "false", "no"}
+)
+DEFAULT_EXECUTION_SKILLS_ENABLED = (
+    str(os.getenv("ADK_EXECUTION_SKILLS_ENABLED", "1")).strip().lower() not in {"0", "false", "no"}
+)
+DEFAULT_REPORT_ASSISTANT_SKILLS_ENABLED = (
+    str(os.getenv("ADK_REPORT_ASSISTANT_SKILLS_ENABLED", "1")).strip().lower() not in {"0", "false", "no"}
+)
 
 
 def _thinking_config_for_model(model: str) -> types.ThinkingConfig | None:
@@ -313,6 +325,9 @@ __DOMAIN_CATALOG__
 
 Source precedence rules for overlapping tools:
 __ROUTING_POLICY__
+
+Specialized planning skills:
+__SKILL_POLICY__
 
 Rules:
 - Build a concrete execution plan before any evidence collection begins.
@@ -6571,7 +6586,7 @@ def _make_planner_before_model_callback(*, require_approval: bool, model_name: s
                 tc = _thinking_config_for_model(str(model_name))
                 if tc:
                     llm_request.config.thinking_config = tc
-                llm_request.config.response_mime_type = "application/json"
+                llm_request.config.response_mime_type = None
                 llm_request.append_instructions([
                     f"Revise the previous plan for this objective: {original_objective}",
                     f"User revision feedback: {revision_feedback}",
@@ -6606,7 +6621,7 @@ def _make_planner_before_model_callback(*, require_approval: bool, model_name: s
         tc = _thinking_config_for_model(str(model_name))
         if tc:
             llm_request.config.thinking_config = tc
-        llm_request.config.response_mime_type = "application/json"
+        llm_request.config.response_mime_type = None
         llm_request.append_instructions([_planner_json_instruction_suffix()])
         return None
 
@@ -7142,120 +7157,6 @@ def _synth_after_model_callback(*, callback_context: CallbackContext, llm_respon
     return _replace_llm_response_text(llm_response, final_markdown)
 
 
-BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_tables` and `run_bigquery_select_query`):
-
-  === Drug targets, diseases & evidence ===
-  **bigquery-public-data.open_targets_platform** (61 tables) — Comprehensive drug target data.
-    IMPORTANT: Always run `list_bigquery_tables(dataset="open_targets_platform")` first to see all
-    tables and then `SELECT * FROM open_targets_platform.<table> LIMIT 1` to inspect column names
-    before writing queries. Table and column names are NOT obvious — do NOT guess them.
-
-    Key tables and their primary columns:
-    - **target**: id (Ensembl gene ID, e.g. "ENSG00000012048"), approvedSymbol ("BRCA1"),
-      approvedName, biotype, tractability, safetyLiabilities, pathways, proteinIds
-    - **disease**: id (MONDO or EFO ID — many common diseases use MONDO_* as primary ID,
-      e.g. "MONDO_0004975" for Alzheimer's, "EFO_0001075" for ovarian carcinoma),
-      name, therapeuticAreas, synonyms, ontology. Always query by name first, accept whatever ID is returned.
-    - **evidence**: targetId (Ensembl ID), diseaseId (MONDO or EFO ID), datasourceId, datatypeId,
-      score, literature, drugId. Filter by targetId + diseaseId, NOT gene symbols.
-    - **known_drug**, **drug_molecule**, **drug_mechanism_of_action**, **drug_warning**: drug data.
-      IMPORTANT: Always run `list_bigquery_tables(dataset='open_targets_platform', table='known_drug')` (and same for drug_mechanism_of_action) to get exact column names before querying — schema can change. Use targetId (Ensembl ID) to join known_drug to targets; there is no drugId field in the target table. For IN UNNEST, use correct types: `col IN UNNEST(ARRAY<STRING>['a','b'])` not `col IN UNNEST(nested_struct)`.
-    - **evidence_*** (evidence_gwas_credible_sets, evidence_chembl, evidence_clingen, etc.): typed evidence
-    - **openfda_significant_adverse_drug_reactions**: post-marketing safety signals
-    - **go**, **mouse_phenotype**, **literature**: gene ontology, phenotypes, literature mining
-    - **l2g_prediction**, **credible_set**, **colocalisation**: genetic evidence, variant-to-gene mapping
-    - **expression**: tissue/cell expression data
-    - **interaction**, **interaction_evidence**: protein-protein interactions
-
-    Query pattern: To find evidence for a gene + disease, first look up the Ensembl ID from
-    `target` (WHERE approvedSymbol = 'BRCA1') and the EFO ID from `disease` (WHERE name LIKE
-    '%ovarian%'), then query `evidence` using those IDs.
-
-  === Chemistry & bioactivity ===
-  **bigquery-public-data.ebi_chembl** — Bioactive compounds, target bioactivity (IC50/Ki/EC50), assay data,
-    mechanism of action, drug indications. Tables: activities, compound_records, target_dictionary, etc.
-  **bigquery-public-data.ebi_surechembl** — Chemical structures extracted from patents. Tables: map, match.
-    Use for chemical IP landscape and freedom-to-operate analysis.
-
-  === Genomics & variants ===
-  **bigquery-public-data.gnomAD** — Population allele frequencies by chromosome (v2_1_1_exomes__chr*,
-    v2_1_1_genomes__chr*). Use for variant frequency lookups and gene constraint analysis.
-  **bigquery-public-data.human_genome_variants** — 1000 Genomes Phase 3 variants, Platinum Genomes,
-    Simons Genome Diversity Project. Tables: *_variants_*, *_sample_info, *_pedigree.
-  **bigquery-public-data.human_variant_annotation** — ClinVar variant annotations (hg19/hg38 builds).
-    Contains clinical significance classifications (pathogenic, benign, etc.), variant types, and condition
-    associations. Does NOT contain SIFT/PolyPhen prediction scores.
-
-  === Drug nomenclature & regulatory ===
-  **bigquery-public-data.nlm_rxnorm** — RxNorm drug nomenclature, ingredient relationships, and
-    clinical drug pathways. Use for standardizing drug names across sources.
-  **bigquery-public-data.fda_drug** — FDA drug labels, NDC product listings, enforcement actions.
-    Use for label information and regulatory data. NOTE: for post-marketing adverse event reports
-    (FAERS), use the search_fda_adverse_events tool instead — it queries the openFDA API directly
-    and returns richer data than the BigQuery tables.
-
-  === Perturbation biology ===
-  **bigquery-public-data.umiami_lincs** — LINCS L1000 perturbation signatures: cell lines, small molecules,
-    nucleic acid reagents, readouts, and perturbation signatures. Use for metadata-level LINCS lookup,
-    exact signature/perturbagen follow-up, and mechanism-of-action characterization when identifiers are
-    already known. Avoid broad ad hoc scans of the `readout` table for gene lists unless the byte-billed
-    guardrail has been intentionally raised; the raw readout table is extremely large and generic gene filters
-    still tend to trigger full-table scans.
-
-  **How to query**: Always wrap table names in backticks in SQL. Short names are auto-expanded:
-  `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`.
-  Example: SELECT id, approvedSymbol FROM `open_targets_platform.target` WHERE approvedSymbol = 'BRCA1'.
-  If a filter value contains an apostrophe, escape it as two single quotes:
-  `WHERE name = 'Alzheimer''s disease'`.
-  When trying unfamiliar or nested-field SQL, run the same query once with `dryRun=true` first to catch syntax issues cheaply.
-
-  Start every structured data lookup with BigQuery when the task is truly dataset-like or identifier-ready.
-  Use `list_bigquery_tables` to discover tables, and `list_bigquery_tables(dataset="...", table="...")` to inspect
-  column schemas before writing queries. Do not turn schema inspection into a standalone investigation goal unless
-  the user asked about the schema itself.
-  Write Standard SQL via `run_bigquery_select_query`. Use non-BigQuery MCP tools for:
-    - Literature search: search_pubmed, search_pubmed_advanced, get_pubmed_abstract, get_paper_fulltext (PubMed/NCBI/PMC)
-    - Literature search: search_openalex_works (OpenAlex — broader coverage, preprints)
-    - Literature enrichment with preprints and citation metadata: search_europe_pmc_literature (Europe PMC)
-    - Immunology epitope / assay evidence: search_iedb_epitope_evidence (IEDB — epitope, T-cell, and MHC ligand evidence)
-    - Clinical trials: search_clinical_trials, get_clinical_trial, summarize_clinical_trials_landscape
-    - Researcher discovery: search_openalex_authors, rank_researchers_by_activity
-    - Gene identifier normalization: resolve_gene_identifiers (MyGene.info)
-    - Ontology cross-mapping: map_ontology_terms_oxo (EBI OxO — MONDO/EFO/DOID/MeSH/OMIM/UMLS)
-    - Gene Ontology lookup and annotations: search_quickgo_terms, get_quickgo_annotations (QuickGO)
-    - Protein profiles: search_uniprot_proteins, get_uniprot_protein_profile
-    - Pathways: search_reactome_pathways
-    - Protein interactions: get_string_interactions
-    - Curated experimental molecular interactions: get_intact_interactions (IntAct)
-    - Broader experimental physical/genetic interaction evidence: get_biogrid_interactions (BioGRID)
-    - Variant effect predictions (SIFT, PolyPhen, AlphaMissense): annotate_variants_vep (Ensembl VEP)
-    - Gene-to-variant discovery when only gene is known: search_variants_by_gene (MyVariant) or search_civic_variants (cancer)
-    - Aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC): get_variant_annotations (MyVariant — requires rsID/HGVS)
-    - Clinical variant interpretations in oncology: search_civic_variants, search_civic_genes (CIViC)
-    - Protein structure predictions: get_alphafold_structure (AlphaFold — pLDDT confidence, PDB/CIF downloads)
-    - GWAS trait-variant associations: search_gwas_associations (GWAS Catalog — p-values, odds ratios, mapped genes)
-    - Drug-gene interactions & druggability: search_drug_gene_interactions (DGIdb — approved/experimental drugs)
-    - Tissue-level gene expression: get_gene_tissue_expression (GTEx v8 — median TPM across 54 tissues)
-    - Protein-level tissue, single-cell, and localization summaries: get_human_protein_atlas_gene (Human Protein Atlas)
-    - Cancer-cell dependency and target vulnerability: get_depmap_gene_dependency (DepMap)
-    - Published CRISPR screen evidence with phenotype/cell-line context: get_biogrid_orcs_gene_summary (BioGRID ORCS)
-    - Compound sensitivity and pharmacogenomics: get_gdsc_drug_sensitivity (GDSC / CancerRxGene)
-    - Broad repurposing single-dose response: get_prism_repurposing_response (PRISM Repurposing)
-    - Cross-dataset public pharmacogenomics: get_pharmacodb_compound_response (PharmacoDB)
-    - Single-cell dataset discovery by cell type/tissue/disease: search_cellxgene_datasets (CELLxGENE Discover / Census metadata)
-    - Integrated top pathways across multiple pathway providers: search_pathway_commons_top_pathways (Pathway Commons)
-    - Curated target-ligand pharmacology: get_guidetopharmacology_target (Guide to Pharmacology)
-    - Current US drug label sections and boxed warnings: get_dailymed_drug_label (DailyMed)
-    - Curated gene-disease validity and dosage sensitivity: get_clingen_gene_curation (ClinGen)
-    - Model-organism orthologs and translational gene context: get_alliance_genome_gene_profile (Alliance Genome Resources)
-    - Experimental protein structures: search_protein_structures (RCSB PDB — resolution, method, ligands)
-    - Cancer mutation profiles: get_cancer_mutation_profile (cBioPortal — TCGA pan-cancer mutation frequencies)
-    - Drug bioactivity & selectivity: get_chembl_bioactivities (ChEMBL API — IC50/Ki/Kd by target, kinase selectivity profiling. Prefer over BigQuery ebi_chembl for bioactivity lookups)
-    - Chemical compound data: get_pubchem_compound (PubChem — molecular properties, SMILES, drug-likeness)
-    - Post-marketing adverse events: search_fda_adverse_events (openFDA FAERS — reaction counts, seriousness, indications)
-"""
-
-
 BQ_EXECUTOR_POLICY = """- BigQuery-first policy: For any structured data lookup, prefer `list_bigquery_tables` \
 and `run_bigquery_select_query` over non-BQ tools. \
 Available datasets: open_targets_platform (targets, diseases, drugs, evidence), ebi_chembl (bioactivity), \
@@ -7585,50 +7486,32 @@ def _format_domain_catalog() -> str:
     return "\n".join(lines)
 
 
-def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
+def _planner_skill_guidance(*, planner_skills_enabled: bool) -> str:
+    if not planner_skills_enabled:
+        return "- No specialized planning skills are available for this run."
+    return (
+        "- Use `structured-data-planning` before planning BigQuery-backed, identifier-ready, or aggregate structured-data investigations.\n"
+        "- Use `archive-dataset-discovery-planning` before planning archive or neuroscience dataset discovery tasks.\n"
+        "- Load only the skills relevant to the current objective, then return the final plan JSON."
+    )
+
+
+def _build_planner_instruction(
+    tool_hints: list[str],
+    *,
+    prefer_bigquery: bool,
+    planner_skills_enabled: bool,
+) -> str:
     tool_catalog = _format_tool_catalog(tool_hints)
     domain_catalog = _format_domain_catalog()
     routing_policy = _format_source_precedence_rules(tool_hints)
+    skill_policy = _planner_skill_guidance(planner_skills_enabled=planner_skills_enabled)
     if prefer_bigquery:
         bq_policy = (
-            "- BigQuery-first policy:\n"
-            f"{BQ_DATASET_CATALOG}"
-            "\n- tool_hint for BigQuery steps: use the specific dataset name (e.g. open_targets_platform,"
-            " gnomad, ebi_chembl)"
-            " rather than run_bigquery_select_query, so the plan clearly shows which source is being accessed.\n"
-            "- For gene symbol / alias / Ensembl / Entrez normalization, use resolve_gene_identifiers (MyGene.info).\n"
-            "- For ontology crosswalks across MONDO/EFO/DOID/MeSH/OMIM/UMLS, use map_ontology_terms_oxo (EBI OxO).\n"
-            "- For GO term search and GO annotations, use search_quickgo_terms and get_quickgo_annotations (QuickGO).\n"
-            "- For literature search that needs preprints or Europe PMC citation metadata, use search_europe_pmc_literature (Europe PMC).\n"
-            "- For curated epitope, T-cell, and MHC ligand evidence, use search_iedb_epitope_evidence (IEDB).\n"
-            "- When only a gene is known but variant-level tools are needed: first use search_variants_by_gene (MyVariant) or search_civic_variants (cancer genes) to discover variants, then get_variant_annotations or annotate_variants_vep with the returned HGVS/rsID.\n"
-            "- For variant pathogenicity predictions, use annotate_variants_vep (Ensembl VEP — SIFT, PolyPhen, AlphaMissense). Requires HGVS; not gene symbols.\n"
-            "- For aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC), use get_variant_annotations (MyVariant.info). Requires rsID or HGVS; not gene symbols.\n"
-            "- For clinical variant interpretations in oncology, use search_civic_variants or search_civic_genes (CIViC).\n"
-            "- For protein structure predictions and confidence scores, use get_alphafold_structure (AlphaFold API).\n"
-            "- For GWAS trait-variant associations and genetic evidence, use search_gwas_associations (GWAS Catalog).\n"
-            "- For druggability assessment and known drug-gene interactions, use search_drug_gene_interactions (DGIdb).\n"
-            "- For curated experimental interaction evidence, use get_intact_interactions (IntAct).\n"
-            "- For broader experimental physical/genetic interaction coverage and throughput context, use get_biogrid_interactions (BioGRID).\n"
-            "- For curated target-ligand pharmacology and mechanism summaries, use get_guidetopharmacology_target (Guide to Pharmacology).\n"
-            "- For current US label warnings, contraindications, and indications, use get_dailymed_drug_label (DailyMed).\n"
-            "- For tissue-level gene expression and target safety, use get_gene_tissue_expression (GTEx).\n"
-            "- For protein-level tissue specificity, single-cell specificity, and subcellular localization, use get_human_protein_atlas_gene (Human Protein Atlas).\n"
-            "- For target dependency and cancer-cell vulnerability, use get_depmap_gene_dependency (DepMap).\n"
-            "- For published CRISPR screen evidence with phenotype and cell-line context, use get_biogrid_orcs_gene_summary (BioGRID ORCS).\n"
-            "- For compound sensitivity and cancer pharmacogenomics, use get_gdsc_drug_sensitivity (GDSC / CancerRxGene).\n"
-            "- For Broad single-dose repurposing response across pooled cell lines, use get_prism_repurposing_response (PRISM Repurposing).\n"
-            "- For harmonized cross-dataset pharmacogenomics across public screens, use get_pharmacodb_compound_response (PharmacoDB).\n"
-            "- For LINCS L1000 via BigQuery, use `umiami_lincs` only for metadata-sized lookups or when exact signature IDs / perturbagen IDs are already known. Do not plan broad `umiami_lincs.readout` scans for ad hoc gene lists under the default byte-billed cap.\n"
-            "- For single-cell dataset discovery by disease, tissue, cell type, assay, and organism, use search_cellxgene_datasets (CELLxGENE Discover / Census metadata).\n"
-            "- For integrated pathway context across multiple pathway databases, use search_pathway_commons_top_pathways (Pathway Commons).\n"
-            "- For curated gene-disease validity and dosage sensitivity, use get_clingen_gene_curation (ClinGen).\n"
-            "- For model-organism orthologs, disease models, and translational gene summaries, use get_alliance_genome_gene_profile (Alliance Genome Resources).\n"
-            "- For experimental protein structures (X-ray, cryo-EM), use search_protein_structures (RCSB PDB).\n"
-            "- For cancer mutation frequencies across tumor types, use get_cancer_mutation_profile (cBioPortal).\n"
-            "- For drug bioactivity, IC50/Ki/Kd values, and kinase selectivity profiling, use get_chembl_bioactivities (ChEMBL API — prefer over BigQuery ebi_chembl).\n"
-            "- For chemical compound properties, SMILES, drug-likeness, use get_pubchem_compound (PubChem).\n"
-            "- For post-marketing adverse events (FAERS), use search_fda_adverse_events (openFDA) — not BigQuery fda_drug."
+            "- BigQuery-first policy applies when the task is genuinely structured-data or identifier-ready.\n"
+            "- For BigQuery-backed steps, use the specific dataset name as `tool_hint` (for example `open_targets_platform`, `gnomad`, `ebi_chembl`, `human_variant_annotation`, `human_genome_variants`, `umiami_lincs`) rather than `run_bigquery_select_query`.\n"
+            "- Keep schema discovery inside an evidence step unless the user explicitly asked about schemas.\n"
+            "- If a structured source is likely to produce aggregate or dataset-level findings without direct paper identifiers, add a later literature corroboration step."
         )
     else:
         bq_policy = "- BigQuery-first policy is disabled for this run."
@@ -7638,6 +7521,7 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
         .replace("__TOOL_CATALOG__", tool_catalog)
         .replace("__DOMAIN_CATALOG__", domain_catalog)
         .replace("__ROUTING_POLICY__", routing_policy)
+        .replace("__SKILL_POLICY__", skill_policy)
         .replace("__BQ_POLICY__", bq_policy)
     )
 
@@ -7781,6 +7665,9 @@ def create_workflow_agent(
     tool_filter: list[str] | None = None,
     model: str | None = None,
     prefer_bigquery: bool | None = None,
+    planner_skills_enabled: bool | None = None,
+    execution_skills_enabled: bool | None = None,
+    report_assistant_skills_enabled: bool | None = None,
     require_plan_approval: bool = False,
 ) -> tuple[LlmAgent | SequentialAgent, McpToolset | None]:
     """Create the routed ADK agent graph and return (root_agent, mcp_toolset).
@@ -7801,6 +7688,17 @@ def create_workflow_agent(
     synthesizer_model = SYNTHESIZER_MODEL
     router_model = ROUTER_MODEL
     use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
+    use_planner_skills = (
+        DEFAULT_PLANNER_SKILLS_ENABLED if planner_skills_enabled is None else bool(planner_skills_enabled)
+    )
+    use_execution_skills = (
+        DEFAULT_EXECUTION_SKILLS_ENABLED if execution_skills_enabled is None else bool(execution_skills_enabled)
+    )
+    use_report_assistant_skills = (
+        DEFAULT_REPORT_ASSISTANT_SKILLS_ENABLED
+        if report_assistant_skills_enabled is None
+        else bool(report_assistant_skills_enabled)
+    )
 
     base_tool_hints = _dedupe_str_list(KNOWN_MCP_TOOLS if tool_filter is None else tool_filter, limit=120)
     executor_tool_filter: list[str] | ToolPredicate | None
@@ -7808,8 +7706,26 @@ def create_workflow_agent(
         executor_tool_filter = _ActiveStepToolPredicate(base_tool_hints)
     else:
         executor_tool_filter = []
-    mcp_toolset = create_mcp_toolset(tool_filter=executor_tool_filter)
-    executor_tools: list[McpToolset] = [mcp_toolset] if mcp_toolset is not None else []
+    executor_mcp_toolset = create_mcp_toolset(tool_filter=executor_tool_filter)
+    report_assistant_mcp_toolset = create_mcp_toolset(tool_filter=base_tool_hints)
+    executor_tools: list[McpToolset] = [executor_mcp_toolset] if executor_mcp_toolset is not None else []
+    report_assistant_mcp_tools: list[McpToolset] = (
+        [report_assistant_mcp_toolset] if report_assistant_mcp_toolset is not None else []
+    )
+    planner_tools: list[Any] = []
+    workflow_lookup_tools: list[Any] = []
+    report_assistant_tools: list[Any] = []
+    if use_planner_skills:
+        _, planner_skill_toolset = create_planner_skill_toolset()
+        planner_tools = [planner_skill_toolset]
+    if use_execution_skills:
+        _, execution_skill_toolset = create_execution_skill_toolset()
+        workflow_lookup_tools.append(execution_skill_toolset)
+    if use_report_assistant_skills:
+        _, report_assistant_skill_toolset = create_report_assistant_skill_toolset()
+        report_assistant_tools.append(report_assistant_skill_toolset)
+    workflow_lookup_tools.extend(executor_tools)
+    report_assistant_tools.extend(report_assistant_mcp_tools)
     if use_bigquery_priority:
         base_hint_set = set(base_tool_hints)
         prioritized_hints = [name for name in BQ_PRIORITY_TOOLS if name in base_hint_set]
@@ -7829,8 +7745,9 @@ def create_workflow_agent(
         instruction=_build_planner_instruction(
             executor_tool_hints,
             prefer_bigquery=use_bigquery_priority,
+            planner_skills_enabled=use_planner_skills,
         ),
-        tools=[],
+        tools=planner_tools,
         disallow_transfer_to_parent=True,
         before_model_callback=_make_planner_before_model_callback(
             require_approval=require_plan_approval,
@@ -7848,7 +7765,7 @@ def create_workflow_agent(
             executor_tool_hints,
             prefer_bigquery=use_bigquery_priority,
         ),
-        tools=executor_tools,
+        tools=workflow_lookup_tools,
         include_contents="none",
         before_agent_callback=_react_skip_if_done,
         before_model_callback=_react_before_model_callback,
@@ -7923,7 +7840,7 @@ def create_workflow_agent(
         ),
         model=runtime_model,
         instruction=REPORT_ASSISTANT_INSTRUCTION,
-        tools=executor_tools,
+        tools=report_assistant_tools,
         disallow_transfer_to_parent=True,
         before_model_callback=_report_assistant_before_model_callback,
         on_model_error_callback=_on_model_error,
@@ -7942,7 +7859,7 @@ def create_workflow_agent(
         on_model_error_callback=_on_model_error,
     )
 
-    return router, mcp_toolset
+    return router, executor_mcp_toolset
 
 
 __all__ = [

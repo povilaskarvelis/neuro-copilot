@@ -325,6 +325,9 @@ Opens the custom web interface at `http://localhost:8080` with conversation mana
 - Local task and conversation state is stored in `adk-agent/state/workflow_tasks.json` by default.
 - To use Postgres-backed persistence instead of local JSON, set `AI_CO_SCIENTIST_POSTGRES_DSN` (or `POSTGRES_DSN` / `DATABASE_URL`).
 - Generated Markdown/PDF reports are written to `adk-agent/reports/`.
+- Planner skills are enabled by default. Set `ADK_PLANNER_SKILLS_ENABLED=0` to disable repo-local ADK planner skills.
+- Executor lookup skills are enabled by default. Set `ADK_EXECUTION_SKILLS_ENABLED=0` to disable repo-local executor skills.
+- Report-assistant follow-up skills are enabled by default. Set `ADK_REPORT_ASSISTANT_SKILLS_ENABLED=0` to disable repo-local report-assistant skills.
 
 **ADK CLI / ADK Web UI (alternative):**
 
@@ -383,7 +386,9 @@ The deploy script builds a container image via Cloud Build, then deploys the pri
 │   ├── server.py           # Minimal FastAPI HTTP wrapper (legacy)
 │   ├── co_scientist/
 │   │   ├── __init__.py     # Exports root_agent for `adk run` / `adk web`
-│   │   └── workflow.py     # Workflow graph, HITL, history/rollback, callbacks
+│   │   ├── workflow.py     # Workflow graph, HITL, history/rollback, callbacks
+│   │   ├── skill_loader.py # Repo-local wrapper for loading ADK workflow skills
+│   │   └── skills/         # Planner, executor, and report-assistant skill assets
 │   ├── ui/
 │   │   ├── index.html      # Landing page and chat interface
 │   │   ├── about.html      # Static architecture / project overview page

@@ -1,6 +1,10 @@
 import json
 
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
+from google.adk.models.llm_request import LlmRequest
+from google.adk.tools import McpToolset
+from google.adk.tools.skill_toolset import SkillToolset
+from google.genai import types
 
 import co_scientist.workflow as workflow
 from co_scientist.workflow import create_workflow_agent
@@ -29,6 +33,8 @@ def test_native_workflow_graph_shape():
     planner_agent = research_workflow.sub_agents[0]
     assert isinstance(planner_agent, LlmAgent)
     assert planner_agent.model == workflow.PLANNER_MODEL
+    assert len(planner_agent.tools) == 1
+    assert isinstance(planner_agent.tools[0], SkillToolset)
     assert planner_agent.before_model_callback is not None
     assert planner_agent.after_model_callback is not None
 
@@ -40,6 +46,8 @@ def test_native_workflow_graph_shape():
     step_executor = react_loop.sub_agents[0]
     assert isinstance(step_executor, LlmAgent)
     assert step_executor.model == workflow.DEFAULT_MODEL
+    assert len(step_executor.tools) == 1
+    assert isinstance(step_executor.tools[0], SkillToolset)
     assert step_executor.include_contents == "none"
     assert step_executor.before_model_callback is not None
     assert step_executor.after_model_callback is not None
@@ -50,6 +58,14 @@ def test_native_workflow_graph_shape():
     assert report_agent.include_contents == "none"
     assert report_agent.before_model_callback is not None
     assert report_agent.after_model_callback is not None
+
+    report_assistant = next(a for a in root_agent.sub_agents if a.name == "report_assistant")
+    assert isinstance(report_assistant, LlmAgent)
+    assert len(report_assistant.tools) == 1
+    assert isinstance(report_assistant.tools[0], SkillToolset)
+    assert planner_agent.tools[0] is not step_executor.tools[0]
+    assert planner_agent.tools[0] is not report_assistant.tools[0]
+    assert step_executor.tools[0] is not report_assistant.tools[0]
 
 
 def test_native_workflow_graph_shape_with_hitl():
@@ -67,6 +83,119 @@ def test_native_workflow_graph_shape_with_hitl():
 
     synth = research_workflow.sub_agents[2]
     assert synth.before_agent_callback is not None
+
+
+def test_native_workflow_graph_shape_with_planner_skills_disabled():
+    root_agent, mcp_tools = create_workflow_agent(
+        tool_filter=[],
+        planner_skills_enabled=False,
+    )
+    assert mcp_tools is None
+    research_workflow = next(a for a in root_agent.sub_agents if a.name == "research_workflow")
+    planner_agent = research_workflow.sub_agents[0]
+    assert isinstance(planner_agent, LlmAgent)
+    assert planner_agent.tools == []
+
+
+def test_native_workflow_graph_shape_with_execution_skills_disabled():
+    root_agent, mcp_tools = create_workflow_agent(
+        tool_filter=[],
+        execution_skills_enabled=False,
+    )
+    assert mcp_tools is None
+    research_workflow = next(a for a in root_agent.sub_agents if a.name == "research_workflow")
+    react_loop = research_workflow.sub_agents[1]
+    step_executor = react_loop.sub_agents[0]
+    report_assistant = next(a for a in root_agent.sub_agents if a.name == "report_assistant")
+    assert isinstance(step_executor, LlmAgent)
+    assert step_executor.tools == []
+    assert isinstance(report_assistant, LlmAgent)
+    assert len(report_assistant.tools) == 1
+    assert isinstance(report_assistant.tools[0], SkillToolset)
+
+
+def test_native_workflow_graph_shape_with_report_assistant_skills_disabled():
+    root_agent, mcp_tools = create_workflow_agent(
+        tool_filter=[],
+        report_assistant_skills_enabled=False,
+    )
+    assert mcp_tools is None
+    report_assistant = next(a for a in root_agent.sub_agents if a.name == "report_assistant")
+    research_workflow = next(a for a in root_agent.sub_agents if a.name == "research_workflow")
+    react_loop = research_workflow.sub_agents[1]
+    step_executor = react_loop.sub_agents[0]
+    assert isinstance(step_executor, LlmAgent)
+    assert len(step_executor.tools) == 1
+    assert isinstance(step_executor.tools[0], SkillToolset)
+    assert isinstance(report_assistant, LlmAgent)
+    assert report_assistant.tools == []
+
+
+def test_report_assistant_mcp_toolset_is_not_active_step_gated():
+    root_agent, mcp_tools = create_workflow_agent(
+        tool_filter=["get_paper_fulltext"],
+        execution_skills_enabled=False,
+        report_assistant_skills_enabled=False,
+    )
+    assert isinstance(mcp_tools, McpToolset)
+
+    report_assistant = next(a for a in root_agent.sub_agents if a.name == "report_assistant")
+    research_workflow = next(a for a in root_agent.sub_agents if a.name == "research_workflow")
+    react_loop = research_workflow.sub_agents[1]
+    step_executor = react_loop.sub_agents[0]
+
+    report_mcp = next(tool for tool in report_assistant.tools if isinstance(tool, McpToolset))
+    executor_mcp = next(tool for tool in step_executor.tools if isinstance(tool, McpToolset))
+
+    assert report_mcp.tool_filter == ["get_paper_fulltext"]
+    assert isinstance(executor_mcp.tool_filter, workflow._ActiveStepToolPredicate)
+
+
+def test_planner_instruction_preserves_core_rules_but_trims_large_playbooks():
+    instruction = workflow._build_planner_instruction(
+        ["list_bigquery_tables", "run_bigquery_select_query", "search_openneuro_datasets"],
+        prefer_bigquery=True,
+        planner_skills_enabled=True,
+    )
+
+    assert '"schema": "plan_internal.v1"' in instruction
+    assert "Every plan MUST include at least one step" in instruction
+    assert "structured-data-planning" in instruction
+    assert "archive-dataset-discovery-planning" in instruction
+    assert "Available BigQuery datasets" not in instruction
+    assert "open_targets_platform.target" not in instruction
+    assert "Avoid boolean strings like `A OR B`" not in instruction
+
+
+def test_trimmed_tool_registry_descriptions_remove_strategy_prose():
+    assert "boolean strings" not in workflow.tool_registry.TOOL_DESCRIPTIONS["search_openneuro_datasets"]
+    assert "Disease queries rarely match" not in workflow.tool_registry.TOOL_DESCRIPTIONS["search_conp_datasets"]
+    summary = next(
+        rule["summary"]
+        for rule in workflow.tool_registry.SOURCE_PRECEDENCE_RULES
+        if rule["topic"] == "Neuroscience dataset discovery"
+    )
+    assert "A OR B" not in summary
+
+
+def test_planner_before_model_callback_does_not_force_json_mime_type():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {}
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="Assess LRRK2 in Parkinson disease")],
+            )
+
+    callback = workflow._make_planner_before_model_callback(require_approval=False)
+    callback_context = DummyCallbackContext()
+    llm_request = LlmRequest()
+
+    response = callback(callback_context=callback_context, llm_request=llm_request)
+
+    assert response is None
+    assert llm_request.config.response_mime_type is None
+    assert "Return ONLY valid JSON matching `plan_internal.v1`" in str(llm_request.config.system_instruction)
 
 
 def test_plan_approval_command_detection():
@@ -856,7 +985,8 @@ def test_format_source_precedence_rules_mentions_neuroscience_dataset_discovery(
     assert "Neuroscience dataset discovery" in text
     assert "`search_nemar_datasets`" in text
     assert "`search_openneuro_datasets`" in text
-    assert "Avoid boolean strings like `A OR B`" in text
+    assert "`search_dandi_datasets`" in text
+    assert "A OR B" not in text
 
 
 def test_react_step_context_instructions_include_routing_guidance():

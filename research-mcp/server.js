@@ -13625,13 +13625,9 @@ server.registerTool(
   "search_conp_datasets",
   {
     description:
-      "Searches public CONP (Canadian Open Neuroscience Platform) dataset repositories. " +
-      "CONP datasets are GitHub repositories in the conpdatasets organization, indexed by repository name, description, and topics — NOT by disease or diagnosis terms. " +
-      "Use short neuroscience keywords like 'EEG', 'fMRI', 'MRI', 'PET', 'MEG', 'resting state', 'brain', 'PREVENT-AD', 'POND', 'phantom', or study/cohort names. " +
-      "Disease-specific queries (e.g. 'Parkinson disease') rarely match because repos are named after projects, not conditions. " +
-      "If a disease-specific search returns no results, retry with broader modality or method terms, or browse all repos with a single-word query like 'brain' or 'neuro'.",
+      "Searches public CONP (Canadian Open Neuroscience Platform) dataset repositories using GitHub repository metadata.",
     inputSchema: {
-      query: z.string().describe("Short keyword for repo name/description/topics. Use modality or method terms (e.g. 'EEG', 'fMRI', 'MRI', 'PET'), study names (e.g. 'PREVENT-AD', 'POND'), or broad terms ('brain', 'neuro'). Avoid full disease names."),
+      query: z.string().describe("Keyword for repository name, description, or topics."),
       sortBy: z.enum(["updated", "stars", "name"]).optional().describe("Result ordering. Default 'updated'."),
       maxResults: z.number().optional().describe("Maximum results to return (default 20, max 50)."),
     },
@@ -13750,8 +13746,7 @@ server.registerTool(
   "get_conp_dataset_details",
   {
     description:
-      "Fetches detailed metadata for a specific CONP dataset repository, including README preview, license, stars, topics, and links. " +
-      "Use this after search_conp_datasets returns repository names you want to inspect further.",
+      "Fetches detailed metadata for a specific CONP dataset repository, including README preview, license, stars, topics, and links.",
     inputSchema: {
       repo: z.string().describe("Repository name from search_conp_datasets results (e.g. 'preventad-open', 'SIMON-dataset'). Can also be full path like 'conpdatasets/preventad-open'."),
     },
@@ -13960,12 +13955,9 @@ server.registerTool(
   "search_nemar_datasets",
   {
     description:
-      "Searches NEMAR (NeuroElectroMagnetic data Archive) for EEG, MEG, iEEG, and related datasets using the public NEMAR Data Explorer. " +
-      "NEMAR hosts OpenNeuro neuroelectromagnetic data at SDSC with BIDS format, HED event descriptions, and NSG compute integration. " +
-      "Use simple keywords like 'EEG', 'MEG', 'iEEG', 'resting state', 'visual', 'auditory', or study names rather than boolean strings. " +
-      "Omit query or use modality words like 'EEG' or 'iEEG' to browse. Use get_nemar_dataset_details with a dataset id (e.g. ds005522) or legacy repo id for more metadata.",
+      "Searches NEMAR (NeuroElectroMagnetic data Archive) for public EEG, MEG, iEEG, and related datasets using the public Data Explorer.",
     inputSchema: {
-      query: z.string().optional().describe("Search term for dataset title/README metadata. Include modality words like 'EEG', 'MEG', or 'iEEG' to filter. Omit to browse."),
+      query: z.string().optional().describe("Search term for dataset title or metadata. Omit to browse."),
       sortBy: z.enum(["updated", "stars", "name"]).optional().describe("Result ordering. Default 'updated'."),
       maxResults: z.number().optional().describe("Maximum results (default 20, max 50)."),
     },
@@ -14071,7 +14063,7 @@ server.registerTool(
   {
     description:
       "Fetches detailed metadata for a NEMAR dataset by dataset id or legacy repository id (for example ds005522 or nm000104). " +
-      "Returns README-derived task details, modalities, formats, and links when available. Use after search_nemar_datasets.",
+      "Returns README-derived task details, modalities, formats, and links when available.",
     inputSchema: {
       repo: z.string().describe("NEMAR dataset id or legacy repository name from search_nemar_datasets (for example 'ds005522', 'nm000104', or 'nemarDatasets/nm000104')."),
     },
@@ -14214,12 +14206,9 @@ server.registerTool(
   "search_braincode_datasets",
   {
     description:
-      "Searches Brain-CODE (Ontario Brain Institute) datasets available through the CONP archive. " +
-      "Brain-CODE hosts clinical, MRI, EEG, genomic and other neuroscience data from Canadian brain disorder research (epilepsy, depression, neurodegenerative disease, cerebral palsy, concussion). " +
-      "Datasets are mirrored in conpdatasets under braincode_* repos. Use simple keywords like 'mouse', 'fBIRN', 'NDD', 'epilepsy', 'POND', or omit to list all Brain-CODE datasets in CONP. " +
-      "Use get_braincode_dataset_details with a repo name (e.g. braincode_Mouse_Image) for full metadata. Full catalog and controlled releases: braincode.ca.",
+      "Searches Brain-CODE (Ontario Brain Institute) datasets mirrored through the CONP archive.",
     inputSchema: {
-      query: z.string().optional().describe("Keyword to narrow results (e.g. 'mouse', 'fBIRN', 'NDD'). Omit to list all Brain-CODE datasets in CONP."),
+      query: z.string().optional().describe("Keyword to narrow results. Omit to list all mirrored Brain-CODE datasets."),
       maxResults: z.number().optional().describe("Maximum results (default 20, max 50)."),
     },
   },
@@ -14275,10 +14264,9 @@ server.registerTool(
             summary: `No Brain-CODE datasets found${rawQuery ? ` for "${rawQuery}"` : ""}.`,
             keyFields: buildArchiveSearchKeyFields(rawQuery, searchTerms, { browseLabel: "Browse: all Brain-CODE" }),
             sources: ["https://www.braincode.ca/content/public-data-releases", "https://github.com/conpdatasets"],
-            limitations: [
-              "Brain-CODE datasets in CONP use braincode_* naming. Full catalog at braincode.ca.",
-              "The CONP mirror is sparse; browsing all Brain-CODE repos can be more informative than a disease-keyword search.",
-            ],
+          limitations: [
+            "Brain-CODE datasets in CONP use braincode_* naming. Full catalog at braincode.ca.",
+          ],
           }),
         }],
       };
@@ -14310,7 +14298,6 @@ server.registerTool(
           ],
           limitations: [
             "This tool indexes Brain-CODE datasets mirrored in CONP. For controlled releases and full catalog, see braincode.ca.",
-            "Use get_braincode_dataset_details with repo name for full metadata.",
           ],
         }),
       }],
@@ -14674,19 +14661,12 @@ server.registerTool(
   "query_neurobagel_cohorts",
   {
     description:
-      "Queries public Neurobagel cohorts using structured demographic and imaging filters. " +
-      "The public Neurobagel node indexes harmonized OpenNeuro datasets — primarily healthy-participant neuroimaging studies. " +
-      "IMPORTANT query strategy: " +
-      "(1) Start with broad demographic/imaging filters (age range, sex, image_modal) rather than diagnosis codes. " +
-      "Most indexed datasets do NOT have diagnosis annotations, so diagnosis filters often return zero results. " +
-      "(2) Use image_modal for modality: nidm:T1Weighted, nidm:T2Weighted, nidm:FlowWeighted, nidm:DiffusionWeighted, nidm:Electroencephalography, nidm:Magnetoencephalography. " +
-      "(3) Calling with NO filters returns all indexed cohorts — useful for browsing available datasets. " +
-      "(4) Only use diagnosis if you know the specific SNOMED code is present in the graph (rare for the public node).",
+      "Queries public Neurobagel cohorts using structured demographic and imaging filters.",
     inputSchema: {
       minAge: z.number().optional().describe("Minimum participant age in years."),
       maxAge: z.number().optional().describe("Maximum participant age in years."),
       sex: z.string().optional().describe("SNOMED sex: snomed:248152002 (female) or snomed:248153007 (male)."),
-      diagnosis: z.string().optional().describe("SNOMED diagnosis. WARNING: most public datasets lack diagnosis — often returns empty."),
+      diagnosis: z.string().optional().describe("SNOMED diagnosis term."),
       minImagingSessions: z.number().optional().describe("Minimum number of imaging sessions per participant."),
       minPhenotypicSessions: z.number().optional().describe("Minimum number of phenotypic sessions per participant."),
       assessment: z.string().optional().describe("Assessment/tool term in prefix:term format."),
@@ -14834,15 +14814,9 @@ server.registerTool(
   "search_openneuro_datasets",
   {
     description:
-      "Searches public OpenNeuro neuroimaging datasets by keyword and/or imaging modality. " +
-      "OpenNeuro is the primary open platform for fMRI, MRI, MEG, EEG, and other neuroimaging data (BIDS format). " +
-      "For disorder-focused discovery, prefer simple keyword-first search terms such as 'schizophrenia', 'psychosis', or 'first-episode psychosis', then narrow by modality. " +
-      "Use modality to filter: 'MRI', 'MEG', 'EEG', 'PET', 'iEEG', or 'behavioral'. Omit modality to browse all public datasets. " +
-      "OpenNeuro does not expose a dedicated disorder filter here; use keyword matching plus dataset metadata inspection, and avoid boolean strings like 'A OR B'. " +
-      "If more pages exist, continue with the returned cursor rather than assuming the first page is exhaustive. " +
-      "Returns dataset IDs (e.g. ds000224), names, modalities, and latest snapshot tags. Use get_openneuro_dataset with an ID for full metadata.",
+      "Searches public OpenNeuro neuroimaging datasets by keyword and/or imaging modality. Returns dataset IDs, names, modalities, and latest snapshot tags.",
     inputSchema: {
-      query: z.string().optional().describe("Keyword or phrase to match against public dataset metadata, e.g. 'schizophrenia', 'psychosis', or 'resting state'."),
+      query: z.string().optional().describe("Keyword or phrase to match against public dataset metadata."),
       modality: z.string().optional().describe("Imaging modality: MRI, MEG, EEG, PET, iEEG, or behavioral. Omit to browse across all datasets."),
       after: z.string().optional().describe("Pagination cursor returned by a previous search_openneuro_datasets call. Use when continuing beyond the first page."),
       maxResults: z.number().optional().describe("Maximum results to return (default 20, max 50)."),
@@ -14984,7 +14958,6 @@ server.registerTool(
             sources: ["https://openneuro.org/datasets"],
             limitations: [
               "Valid modalities: MRI, MEG, EEG, PET, iEEG, behavioral.",
-              "If disorder keywords are sparse, retry with modality-only browsing or known study/task names before concluding nothing relevant is available.",
             ],
           }),
         }],
@@ -15023,9 +14996,7 @@ server.registerTool(
             `https://openneuro.org/datasets${modArg ? `?modality=${modArg.toLowerCase()}` : ""}`,
           ],
           limitations: [
-            "OpenNeuro dataset browsing is paginated. If a next cursor is present, call search_openneuro_datasets again with after=<cursor> rather than assuming the first page is exhaustive.",
             "Keyword matching is against public dataset metadata fields such as dataset name, dxStatus, and studyDomain; OpenNeuro does not expose a dedicated disorder filter in this tool.",
-            "Use get_openneuro_dataset with a dataset ID (e.g. ds000224) for detailed metadata, diagnosis/study fields, DOI, and approximate subject counts.",
           ],
         }),
       }],
@@ -15038,7 +15009,7 @@ server.registerTool(
   {
     description:
       "Retrieves detailed metadata for a specific OpenNeuro dataset by ID (e.g. ds000224). " +
-      "Returns dataset name, modalities, DOI, diagnosis/study fields when present, latest snapshot tag, tasks, and approximate subject counts from the public summary. Use after search_openneuro_datasets to inspect promising datasets.",
+      "Returns dataset name, modalities, DOI, diagnosis/study fields when present, latest snapshot tag, tasks, and approximate subject counts from the public summary.",
     inputSchema: {
       datasetId: z.string().describe("OpenNeuro dataset ID, e.g. ds000224 or ds001."),
     },
@@ -15158,11 +15129,9 @@ server.registerTool(
   "search_dandi_datasets",
   {
     description:
-      "Searches the DANDI Archive for neurophysiology datasets (electrophysiology, optophysiology, behavioral, immunostaining). " +
-      "DANDI hosts NWB/BIDS-format data from the BRAIN Initiative. Use simple search terms like 'electrophysiology', 'hippocampus', 'calcium imaging', 'spike', or topic keywords rather than boolean strings. " +
-      "Returns dandiset identifiers, names, asset counts, sizes, and embargo status. Use get_dandi_dataset with an identifier for full metadata.",
+      "Searches the DANDI Archive for neurophysiology datasets. Returns dandiset identifiers, names, asset counts, sizes, and embargo status.",
     inputSchema: {
-      query: z.string().optional().describe("Search term (e.g. 'electrophysiology', 'hippocampus', 'calcium'). Omit to list recent dandisets."),
+      query: z.string().optional().describe("Search term. Omit to list recent dandisets."),
       maxResults: z.number().optional().describe("Maximum results (default 20, max 50)."),
     },
   },
@@ -15221,7 +15190,6 @@ server.registerTool(
             sources: ["https://dandiarchive.org/dandisets/"],
             limitations: [
               "Try broader search terms or omit the query to browse all dandisets.",
-              "Disease labels can be sparse; a modality, task, or study-name search may work better than a disorder phrase.",
             ],
           }),
         }],
@@ -15260,7 +15228,7 @@ server.registerTool(
             "https://dandiarchive.org/",
           ],
           limitations: [
-            "Use get_dandi_dataset with a dandiset identifier (e.g. 000003) for full metadata and asset details.",
+            "Use a dandiset identifier to inspect a specific dataset in detail.",
           ],
         }),
       }],
@@ -15273,7 +15241,7 @@ server.registerTool(
   {
     description:
       "Retrieves detailed metadata for a DANDI dandiset by identifier (e.g. 000003). " +
-      "Returns name, version, asset count, size, embargo status, and contact. Use after search_dandi_datasets to inspect promising datasets.",
+      "Returns name, version, asset count, size, embargo status, and contact.",
     inputSchema: {
       dandisetId: z.string().describe("DANDI dandiset identifier, e.g. 000003 or dandi:000003."),
     },
