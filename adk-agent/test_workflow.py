@@ -64,6 +64,7 @@ def test_native_workflow_graph_shape():
     assert isinstance(report_assistant, LlmAgent)
     assert len(report_assistant.tools) == 1
     assert isinstance(report_assistant.tools[0], SkillToolset)
+    assert report_assistant.after_model_callback is not None
     assert planner_agent.tools[0] is not step_executor.tools[0]
     assert planner_agent.tools[0] is not report_assistant.tools[0]
     assert step_executor.tools[0] is not report_assistant.tools[0]
@@ -138,7 +139,8 @@ def test_report_assistant_mcp_toolset_is_not_active_step_gated():
         execution_skills_enabled=False,
         report_assistant_skills_enabled=False,
     )
-    assert isinstance(mcp_tools, McpToolset)
+    assert isinstance(mcp_tools, workflow.ManagedMcpToolsets)
+    assert len(mcp_tools.toolsets) == 2
 
     report_assistant = next(a for a in root_agent.sub_agents if a.name == "report_assistant")
     research_workflow = next(a for a in root_agent.sub_agents if a.name == "research_workflow")
@@ -150,6 +152,17 @@ def test_report_assistant_mcp_toolset_is_not_active_step_gated():
 
     assert report_mcp.tool_filter == ["get_paper_fulltext"]
     assert isinstance(executor_mcp.tool_filter, workflow._ActiveStepToolPredicate)
+
+
+def test_create_workflow_agent_manages_executor_and_report_assistant_mcp_toolsets():
+    root_agent, mcp_tools = create_workflow_agent(
+        tool_filter=["search_clinical_trials"],
+        execution_skills_enabled=False,
+        report_assistant_skills_enabled=False,
+    )
+    assert isinstance(root_agent, LlmAgent)
+    assert isinstance(mcp_tools, workflow.ManagedMcpToolsets)
+    assert len(mcp_tools.toolsets) == 2
 
 
 def test_planner_instruction_preserves_core_rules_but_trims_large_playbooks():
@@ -2314,3 +2327,178 @@ def test_format_reference_apa_falls_back_to_europe_pmc_when_pubmed_meta_is_unava
     assert "Fallback LRRK2 paper" in citation
     assert "Example Journal" in citation
     assert "PMID: [12345678]" in citation
+
+
+def test_report_assistant_before_model_callback_includes_legacy_lookup_provenance_for_expansion_requests():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_WORKFLOW_TASK: {
+                    "objective": "Assess LRRK2 as a Parkinson disease target",
+                    "latest_synthesis": {"markdown": "# Report\n\nClinical trial section."},
+                    "steps": [
+                        {
+                            "id": "S4",
+                            "tool_log": [
+                                {
+                                    "tool": "ClinicalTrials.gov",
+                                    "raw_tool": "search_clinical_trials",
+                                    "status": "done",
+                                    "summary": "Searching clinical trials for LRRK2 Parkinson's disease",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="can you fetch more clinical trials pls")],
+            )
+
+    callback_context = DummyCallbackContext()
+    llm_request = LlmRequest()
+
+    response = workflow._report_assistant_before_model_callback(
+        callback_context=callback_context,
+        llm_request=llm_request,
+    )
+
+    assert response is None
+    instruction_text = str(llm_request.config.system_instruction or "")
+    assert "Current research report for reference:" in instruction_text
+    assert "Prior lookup provenance from this report session" in instruction_text
+    assert 'query="LRRK2 Parkinson\'s disease"' in instruction_text
+    assert "Reuse the exact prior query string and filters" in instruction_text
+
+
+def test_react_after_model_callback_stores_compact_tool_args_for_lookup_provenance():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_WORKFLOW_TASK: {
+                    "steps": [{"id": "S1", "status": "pending"}],
+                },
+                workflow.STATE_EXECUTOR_ACTIVE_STEP_ID: "S1",
+                workflow.STATE_EXECUTOR_TOOL_LOG: "[]",
+            }
+
+    callback_context = DummyCallbackContext()
+    llm_response = workflow._make_text_response("")
+    llm_response.content = types.Content(
+        role="model",
+        parts=[
+            types.Part(
+                function_call=types.FunctionCall(
+                    name="search_clinical_trials",
+                    args={"query": "LRRK2 Parkinson's disease", "status": "RECRUITING", "limit": 100},
+                )
+            )
+        ],
+    )
+
+    response = workflow._react_after_model_callback(
+        callback_context=callback_context,
+        llm_response=llm_response,
+    )
+
+    assert response is None
+    tool_log = json.loads(callback_context.state[workflow.STATE_EXECUTOR_TOOL_LOG])
+    assert tool_log[0]["args"] == {
+        "query": "LRRK2 Parkinson's disease",
+        "status": "RECRUITING",
+        "limit": 100,
+    }
+
+
+def test_report_assistant_after_model_callback_reuses_prior_query_and_expands_trial_depth():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_WORKFLOW_TASK: {
+                    "latest_synthesis": {"markdown": "# Report\n\nClinical trial section."},
+                    "steps": [
+                        {
+                            "id": "S4",
+                            "tool_log": [
+                                {
+                                    "tool": "ClinicalTrials.gov",
+                                    "raw_tool": "search_clinical_trials",
+                                    "status": "done",
+                                    "summary": "Searching clinical trials for LRRK2 Parkinson's disease",
+                                    "args": {"query": "LRRK2 Parkinson's disease", "limit": 50},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="can you fetch more clinical trials pls")],
+            )
+
+    callback_context = DummyCallbackContext()
+    llm_response = workflow._make_text_response("")
+    llm_response.content = types.Content(
+        role="model",
+        parts=[
+            types.Part(
+                function_call=types.FunctionCall(
+                    name="search_clinical_trials",
+                    args={"query": "LRRK2 Parkinson", "limit": 50},
+                )
+            )
+        ],
+    )
+
+    updated = workflow._report_assistant_after_model_callback(
+        callback_context=callback_context,
+        llm_response=llm_response,
+    )
+
+    assert updated is not None
+    call = workflow._extract_function_calls(updated)[0]
+    assert call["name"] == "search_clinical_trials"
+    assert call["args"]["query"] == "LRRK2 Parkinson's disease"
+    assert call["args"]["limit"] == 100
+
+
+def test_report_assistant_after_model_callback_applies_landscape_depth_to_literature_search():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_WORKFLOW_TASK: {
+                    "latest_synthesis": {"markdown": "# Report\n\nLiterature section."},
+                    "steps": [],
+                }
+            }
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="give me a broader literature landscape for LRRK2 in Parkinson's disease")],
+            )
+
+    callback_context = DummyCallbackContext()
+    llm_response = workflow._make_text_response("")
+    llm_response.content = types.Content(
+        role="model",
+        parts=[
+            types.Part(
+                function_call=types.FunctionCall(
+                    name="search_pubmed",
+                    args={"query": "LRRK2 Parkinson's disease"},
+                )
+            )
+        ],
+    )
+
+    updated = workflow._report_assistant_after_model_callback(
+        callback_context=callback_context,
+        llm_response=llm_response,
+    )
+
+    assert updated is not None
+    call = workflow._extract_function_calls(updated)[0]
+    assert call["name"] == "search_pubmed"
+    assert call["args"]["query"] == "LRRK2 Parkinson's disease"
+    assert call["args"]["maxResults"] == 40

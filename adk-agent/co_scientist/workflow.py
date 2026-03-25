@@ -19,6 +19,7 @@ ADK session state via callbacks.
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -68,6 +69,25 @@ DEFAULT_EXECUTION_SKILLS_ENABLED = (
 DEFAULT_REPORT_ASSISTANT_SKILLS_ENABLED = (
     str(os.getenv("ADK_REPORT_ASSISTANT_SKILLS_ENABLED", "1")).strip().lower() not in {"0", "false", "no"}
 )
+
+
+@dataclass
+class ManagedMcpToolsets:
+    """Lifecycle wrapper for one or more MCP toolsets used by the agent graph."""
+
+    toolsets: tuple[McpToolset, ...]
+
+    def __bool__(self) -> bool:
+        return bool(self.toolsets)
+
+    async def close(self) -> None:
+        seen: set[int] = set()
+        for toolset in self.toolsets:
+            identifier = id(toolset)
+            if identifier in seen:
+                continue
+            seen.add(identifier)
+            await toolset.close()
 
 
 def _thinking_config_for_model(model: str) -> types.ThinkingConfig | None:
@@ -615,6 +635,11 @@ Guidelines:
 - Load a relevant follow-up skill when the request is mainly about citation recovery, trial clarification, variant interpretation, GEO datasets, or oncology target-validation nuance.
 - Maintain the report's citation style when referencing sources.
 - When restructuring, preserve all evidence and citations — don't drop content unless asked.
+- When the user asks to fetch more / expand / continue a prior lookup, reuse the exact prior query
+  string and filters unless they explicitly asked to broaden or change scope. Prefer increasing
+  limit, maxStudies, or page depth over rewriting the query.
+- If a source still returns the same slice or exposes no additional pages/totals after a deeper
+  fetch attempt, say that clearly instead of implying a broader count was retrieved.
 - If the user's request requires a comprehensive multi-step investigation (new hypothesis, full
   comparative analysis, deep-dive across multiple databases), tell them: "This would require a full
   research investigation. You can ask me to investigate this formally, and I'll create a new plan
@@ -703,6 +728,528 @@ def _extract_user_turn_text(callback_context: CallbackContext) -> str:
         if str(getattr(part, "text", "") or "").strip()
     )
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_lookup_tool_name(name: str) -> bool:
+    raw = str(name or "").strip()
+    if not raw:
+        return False
+    return raw.startswith(("search_", "list_", "summarize_", "query_")) or raw in {
+        "run_bigquery_select_query",
+        "get_clinical_trial",
+        "get_pubmed_abstract",
+        "get_paper_fulltext",
+    }
+
+
+def _compact_tool_args_for_provenance(args: Mapping[str, Any]) -> dict[str, Any]:
+    """Store a compact subset of tool args so follow-up turns can reuse scope exactly."""
+    preferred_keys = [
+        "query",
+        "status",
+        "limit",
+        "maxStudies",
+        "maxPages",
+        "condition",
+        "disease",
+        "disease_id",
+        "gene",
+        "gene_symbol",
+        "gene_id",
+        "compound",
+        "drug",
+        "drug_name",
+        "nctId",
+        "id",
+    ]
+    compact: dict[str, Any] = {}
+    seen: set[str] = set()
+    items = list(args.items()) if isinstance(args, Mapping) else []
+    ordered_keys = preferred_keys + [key for key, _ in items if key not in preferred_keys]
+    for key in ordered_keys:
+        if key in seen or key in {"pageToken", "cursor", "offset", "page"}:
+            continue
+        seen.add(key)
+        value = args.get(key) if isinstance(args, Mapping) else None
+        if value is None:
+            continue
+        if isinstance(value, str):
+            cleaned = re.sub(r"\s+", " ", value).strip()
+            if cleaned:
+                compact[key] = cleaned[:500]
+        elif isinstance(value, (bool, int, float)):
+            compact[key] = value
+        elif isinstance(value, list):
+            rendered_items: list[Any] = []
+            for item in value:
+                if isinstance(item, str):
+                    cleaned = re.sub(r"\s+", " ", item).strip()
+                    if cleaned:
+                        rendered_items.append(cleaned[:120])
+                elif isinstance(item, (bool, int, float)):
+                    rendered_items.append(item)
+                if len(rendered_items) >= 5:
+                    break
+            if rendered_items:
+                compact[key] = rendered_items
+        if len(compact) >= 8:
+            break
+    return compact
+
+
+def _tool_lookup_family(name: str, summary: str = "") -> str:
+    raw = str(name or "").strip()
+    lowered_summary = str(summary or "").lower()
+    if raw in {"search_clinical_trials", "get_clinical_trial", "summarize_clinical_trials_landscape"}:
+        return "clinical_trials"
+    if raw in {"search_pubmed", "search_pubmed_advanced", "search_openalex_works", "search_europe_pmc_literature", "get_pubmed_abstract", "get_paper_fulltext"}:
+        return "literature"
+    if raw.startswith(("search_openneuro_", "search_nemar_", "search_dandi_", "search_conp_", "search_braincode_", "search_geo_", "search_cellxgene_")):
+        return "datasets"
+    if "trial" in lowered_summary or "clinicaltrials.gov" in lowered_summary:
+        return "clinical_trials"
+    if "pubmed" in lowered_summary or "literature" in lowered_summary or "paper" in lowered_summary:
+        return "literature"
+    if "dataset" in lowered_summary or "geo" in lowered_summary:
+        return "datasets"
+    return "general"
+
+
+def _infer_lookup_focus_family(user_text: str) -> str | None:
+    normalized = _normalize_user_text(user_text)
+    if not normalized:
+        return None
+    if any(term in normalized for term in ("trial", "trials", "nct", "clinicaltrials")):
+        return "clinical_trials"
+    if any(term in normalized for term in ("paper", "papers", "pubmed", "literature", "abstract", "full text", "fulltext", "pmid", "doi")):
+        return "literature"
+    if any(term in normalized for term in ("dataset", "datasets", "geo", "openneuro", "nemar", "dandi", "conp", "braincode", "brain-code")):
+        return "datasets"
+    return None
+
+
+def _is_lookup_expansion_request(user_text: str) -> bool:
+    normalized = _normalize_user_text(user_text)
+    if not normalized:
+        return False
+    return any(
+        term in normalized
+        for term in (
+            "fetch more",
+            "find more",
+            "show more",
+            "get more",
+            "more clinical trials",
+            "more trials",
+            "more papers",
+            "more results",
+            "expand",
+            "broaden",
+            "continue",
+        )
+    )
+
+
+def _render_lookup_provenance_scope(entry: Mapping[str, Any]) -> str:
+    args = entry.get("args")
+    if isinstance(args, Mapping):
+        preferred_keys = [
+            "query",
+            "status",
+            "limit",
+            "maxStudies",
+            "maxPages",
+            "condition",
+            "disease",
+            "disease_id",
+            "gene",
+            "gene_symbol",
+            "gene_id",
+            "compound",
+            "drug",
+            "drug_name",
+            "nctId",
+            "id",
+        ]
+        parts: list[str] = []
+        seen: set[str] = set()
+        ordered_keys = preferred_keys + [key for key in args if key not in preferred_keys]
+        for key in ordered_keys:
+            if key in seen or key not in args:
+                continue
+            seen.add(key)
+            value = args.get(key)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                rendered_value = ", ".join(str(item) for item in value[:5])
+            else:
+                rendered_value = str(value).strip()
+            if not rendered_value:
+                continue
+            if isinstance(value, str):
+                rendered_value = rendered_value.replace('"', '\\"')
+                parts.append(f'{key}="{rendered_value}"')
+            else:
+                parts.append(f"{key}={rendered_value}")
+        if parts:
+            return "; ".join(parts)
+    return str(entry.get("summary", "") or entry.get("result", "") or "").strip()
+
+
+def _infer_provenance_args_from_summary(raw_tool: str, summary: str) -> dict[str, Any]:
+    text = re.sub(r"\s+", " ", str(summary or "").strip())
+    if not text:
+        return {}
+    query_prefixes = {
+        "search_clinical_trials": ("Searching clinical trials for ",),
+        "summarize_clinical_trials_landscape": ("Summarizing trial landscape for ",),
+        "search_pubmed": ("Searching literature for ",),
+        "search_pubmed_advanced": ("Searching literature for ",),
+        "search_openalex_works": ("Searching literature for ",),
+        "search_europe_pmc_literature": ("Searching literature for ",),
+        "search_geo_datasets": ("Searching GEO datasets for ",),
+    }
+    for prefix in query_prefixes.get(str(raw_tool or "").strip(), ()):
+        if text.startswith(prefix):
+            query = text[len(prefix):].strip()
+            return {"query": query} if query else {}
+    if str(raw_tool or "").strip() == "get_clinical_trial":
+        prefix = "Retrieving trial details for "
+        if text.startswith(prefix):
+            nct_id = text[len(prefix):].strip()
+            return {"nctId": nct_id} if nct_id else {}
+    if str(raw_tool or "").strip() == "get_pubmed_abstract":
+        prefix = "Fetching abstract for PMID "
+        if text.startswith(prefix):
+            pmid = text[len(prefix):].strip()
+            return {"pmid": pmid} if pmid else {}
+    return {}
+
+
+def _collect_report_lookup_provenance_entries(
+    task_state: dict[str, Any],
+    user_text: str,
+    *,
+    max_entries: int = 8,
+) -> list[dict[str, Any]]:
+    focus_family = _infer_lookup_focus_family(user_text)
+    entries_out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for step in reversed(task_state.get("steps", [])):
+        step_id = str(step.get("id", "")).strip() or "S?"
+        tool_log = step.get("tool_log") or []
+        if not isinstance(tool_log, list):
+            continue
+        for entry in reversed(tool_log):
+            if not isinstance(entry, Mapping):
+                continue
+            raw_tool = str(entry.get("raw_tool", "") or "").strip()
+            if not _is_lookup_tool_name(raw_tool):
+                continue
+            summary = str(entry.get("summary", "") or "").strip()
+            family = _tool_lookup_family(raw_tool, summary)
+            if focus_family and family != focus_family:
+                continue
+            entry_args = entry.get("args")
+            if not isinstance(entry_args, Mapping):
+                entry_args = _infer_provenance_args_from_summary(raw_tool, summary)
+            compact_args = _compact_tool_args_for_provenance(entry_args) if isinstance(entry_args, Mapping) else {}
+            render_entry: dict[str, Any] = {
+                "summary": summary,
+                "result": str(entry.get("result", "") or "").strip(),
+            }
+            if compact_args:
+                render_entry["args"] = compact_args
+            scope = _render_lookup_provenance_scope(render_entry)
+            if not scope:
+                continue
+            key = f"{raw_tool}|{scope}"
+            if key in seen:
+                continue
+            seen.add(key)
+            entries_out.append({
+                "step_id": step_id,
+                "raw_tool": raw_tool,
+                "family": family,
+                "summary": summary,
+                "scope": scope,
+                "args": compact_args,
+            })
+            if len(entries_out) >= max_entries:
+                return entries_out
+    return entries_out
+
+
+def _build_report_lookup_provenance(task_state: dict[str, Any], user_text: str, *, max_entries: int = 8) -> str:
+    entries = _collect_report_lookup_provenance_entries(
+        task_state,
+        user_text,
+        max_entries=max_entries,
+    )
+    return "\n".join(
+        f"- {entry['step_id']} `{entry['raw_tool']}`: {entry['scope']}"
+        for entry in entries
+    )
+
+
+REPORT_ASSISTANT_RETRIEVAL_PROFILES: dict[str, dict[str, Any]] = {
+    "search_clinical_trials": {
+        "family": "clinical_trials",
+        "size_arg": "limit",
+        "default_base": 50,
+        "cap": 200,
+        "mode_targets": {"representative": 20, "landscape": 100, "deep_dive": 200},
+        "copy_args": ("query", "status"),
+    },
+    "summarize_clinical_trials_landscape": {
+        "family": "clinical_trials",
+        "size_arg": "maxStudies",
+        "default_base": 60,
+        "cap": 200,
+        "mode_targets": {"representative": 40, "landscape": 100, "deep_dive": 200},
+        "copy_args": ("query", "status"),
+        "secondary_int_args": {
+            "maxPages": {
+                "default_base": 4,
+                "cap": 8,
+                "mode_targets": {"representative": 2, "landscape": 6, "deep_dive": 8},
+            }
+        },
+    },
+    "search_pubmed": {
+        "family": "literature",
+        "size_arg": "maxResults",
+        "default_base": 20,
+        "cap": 100,
+        "mode_targets": {"representative": 10, "landscape": 40, "deep_dive": 100},
+        "copy_args": ("query", "minDate", "maxDate", "sort"),
+    },
+    "search_pubmed_advanced": {
+        "family": "literature",
+        "size_arg": "maxResults",
+        "default_base": 20,
+        "cap": 100,
+        "mode_targets": {"representative": 10, "landscape": 40, "deep_dive": 100},
+        "copy_args": ("query", "sort"),
+    },
+    "search_openalex_works": {
+        "family": "literature",
+        "size_arg": "limit",
+        "default_base": 10,
+        "cap": 50,
+        "mode_targets": {"representative": 10, "landscape": 25, "deep_dive": 50},
+        "copy_args": ("query", "fromYear", "toYear"),
+    },
+    "search_europe_pmc_literature": {
+        "family": "literature",
+        "size_arg": "limit",
+        "default_base": 5,
+        "cap": 10,
+        "mode_targets": {"representative": 5, "landscape": 10, "deep_dive": 10},
+        "copy_args": ("query", "source", "openAccessOnly"),
+    },
+    "search_geo_datasets": {
+        "family": "datasets",
+        "size_arg": "maxResults",
+        "default_base": 10,
+        "cap": 50,
+        "mode_targets": {"representative": 10, "landscape": 25, "deep_dive": 50},
+        "copy_args": ("query", "entryType"),
+    },
+}
+
+
+def _infer_report_retrieval_mode(user_text: str) -> str | None:
+    normalized = _normalize_user_text(user_text)
+    if not normalized:
+        return None
+    if _is_lookup_expansion_request(user_text):
+        return "expand_previous"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "comprehensive",
+            "exhaustive",
+            "all available",
+            "full list",
+            "full registry",
+            "deep dive",
+            "deep-dive",
+        )
+    ):
+        return "deep_dive"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "landscape",
+            "overview",
+            "how many",
+            "breakdown",
+            "distribution",
+            "broader",
+            "broad",
+            "more complete",
+        )
+    ):
+        return "landscape"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "representative",
+            "example",
+            "examples",
+            "top few",
+            "quick",
+            "brief",
+            "sample",
+        )
+    ):
+        return "representative"
+    return None
+
+
+def _coerce_positive_int_arg(value: Any) -> int | None:
+    try:
+        numeric = int(round(float(value)))
+    except Exception:  # noqa: BLE001
+        return None
+    return numeric if numeric > 0 else None
+
+
+def _target_retrieval_depth(
+    profile: Mapping[str, Any],
+    *,
+    mode: str,
+    prior_args: Mapping[str, Any],
+    current_args: Mapping[str, Any],
+    size_arg: str,
+) -> int | None:
+    mode_targets = profile.get("mode_targets") or {}
+    cap = _coerce_positive_int_arg(profile.get("cap")) or 200
+    default_base = _coerce_positive_int_arg(profile.get("default_base")) or 20
+    if mode == "expand_previous":
+        prior_value = _coerce_positive_int_arg(prior_args.get(size_arg))
+        current_value = _coerce_positive_int_arg(current_args.get(size_arg))
+        base = prior_value or current_value or default_base
+        landscape_floor = _coerce_positive_int_arg(mode_targets.get("landscape")) or base
+        return min(cap, max(landscape_floor, base * 2))
+    target = _coerce_positive_int_arg(mode_targets.get(mode))
+    if target is None:
+        return None
+    return min(cap, target)
+
+
+def _rewrite_llm_response_function_calls(
+    llm_response: LlmResponse,
+    rewritten_calls: list[dict[str, Any]],
+) -> LlmResponse:
+    updated = llm_response.model_copy(deep=True)
+    content = getattr(updated, "content", None)
+    parts = getattr(content, "parts", None) if content is not None else None
+    if not parts:
+        return updated
+    new_parts: list[types.Part] = []
+    call_index = 0
+    for part in parts:
+        if getattr(part, "function_call", None) is not None and call_index < len(rewritten_calls):
+            rewritten = rewritten_calls[call_index]
+            call_index += 1
+            new_parts.append(
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name=str(rewritten.get("name", "") or "").strip(),
+                        args=rewritten.get("args") or {},
+                    )
+                )
+            )
+        else:
+            new_parts.append(part.model_copy(deep=True))
+    updated.content = types.Content(role=getattr(content, "role", "model") or "model", parts=new_parts)
+    return updated
+
+
+def _apply_report_assistant_adaptive_depth(
+    *,
+    llm_response: LlmResponse,
+    user_text: str,
+    provenance_entries: list[dict[str, Any]],
+) -> LlmResponse | None:
+    mode = _infer_report_retrieval_mode(user_text)
+    if mode is None:
+        return None
+
+    rewritten_calls: list[dict[str, Any]] = []
+    changed = False
+    for call in _extract_function_calls(llm_response):
+        name = str(call.get("name", "") or "").strip()
+        args = dict(call.get("args") or {})
+        profile = REPORT_ASSISTANT_RETRIEVAL_PROFILES.get(name)
+        if profile is None:
+            rewritten_calls.append({"name": name, "args": args})
+            continue
+
+        family = str(profile.get("family", "") or "")
+        prior_entry = next(
+            (entry for entry in provenance_entries if entry.get("raw_tool") == name),
+            None,
+        )
+        if prior_entry is None and family:
+            prior_entry = next(
+                (entry for entry in provenance_entries if entry.get("family") == family),
+                None,
+            )
+        prior_args = dict((prior_entry or {}).get("args") or {})
+
+        adapted_args = dict(args)
+        if mode == "expand_previous":
+            for key in profile.get("copy_args", ()):
+                if key in prior_args and adapted_args.get(key) != prior_args[key]:
+                    adapted_args[key] = prior_args[key]
+                    changed = True
+
+        size_arg = str(profile.get("size_arg", "") or "").strip()
+        if size_arg:
+            target = _target_retrieval_depth(
+                profile,
+                mode=mode,
+                prior_args=prior_args,
+                current_args=adapted_args,
+                size_arg=size_arg,
+            )
+            current_value = _coerce_positive_int_arg(adapted_args.get(size_arg))
+            if target is not None:
+                if mode == "expand_previous":
+                    if current_value != target:
+                        adapted_args[size_arg] = target
+                        changed = True
+                elif current_value is None or current_value < target:
+                    adapted_args[size_arg] = target
+                    changed = True
+
+        for extra_key, extra_profile in (profile.get("secondary_int_args") or {}).items():
+            target = _target_retrieval_depth(
+                extra_profile,
+                mode=mode,
+                prior_args=prior_args,
+                current_args=adapted_args,
+                size_arg=extra_key,
+            )
+            current_value = _coerce_positive_int_arg(adapted_args.get(extra_key))
+            if target is not None:
+                if mode == "expand_previous":
+                    if current_value != target:
+                        adapted_args[extra_key] = target
+                        changed = True
+                elif current_value is None or current_value < target:
+                    adapted_args[extra_key] = target
+                    changed = True
+
+        rewritten_calls.append({"name": name, "args": adapted_args})
+
+    if not changed:
+        return None
+    return _rewrite_llm_response_function_calls(llm_response, rewritten_calls)
 
 
 def _make_content(text: str) -> types.Content:
@@ -1390,7 +1937,7 @@ def _get_tool_log(callback_context: CallbackContext) -> list[dict[str, str]]:
         return []
 
 
-def _set_tool_log(callback_context: CallbackContext, log: list[dict[str, str]]) -> None:
+def _set_tool_log(callback_context: CallbackContext, log: list[dict[str, Any]]) -> None:
     callback_context.state[STATE_EXECUTOR_TOOL_LOG] = json.dumps(log, ensure_ascii=False)
     # Sync tool_log to the active step so it's visible via workflow state reads mid-execution
     task_state = callback_context.state.get(STATE_WORKFLOW_TASK)
@@ -7454,8 +8001,14 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
         for fc in fc_list:
             source = tool_registry.TOOL_SOURCE_NAMES.get(fc["name"], fc["name"])
             description = _describe_tool_call(fc["name"], fc["args"])
-            tool_log.append({"tool": source, "raw_tool": fc["name"], "status": "called",
-                             "summary": description})
+            provenance_args = _compact_tool_args_for_provenance(fc["args"])
+            tool_log.append({
+                "tool": source,
+                "raw_tool": fc["name"],
+                "status": "called",
+                "summary": description,
+                **({"args": provenance_args} if provenance_args else {}),
+            })
         _set_tool_log(callback_context, tool_log)
 
         # Keep the raw reasoning trace for backward compat
@@ -8162,11 +8715,53 @@ def _report_assistant_before_model_callback(
             + "\n\n[... report truncated for context ...]"
         )
 
-    llm_request.append_instructions([
+    user_turn = _extract_user_turn_text(callback_context)
+    lookup_provenance = _build_report_lookup_provenance(task_state, user_turn)
+
+    instructions = [
         "Current research report for reference:",
         report_context,
-    ])
+    ]
+    if lookup_provenance:
+        instructions.extend([
+            "Prior lookup provenance from this report session (reuse exact prior scope for follow-up expansions unless the user asks to change it):",
+            lookup_provenance,
+        ])
+    if lookup_provenance and _is_lookup_expansion_request(user_turn):
+        instructions.append(
+            "The user appears to be asking to expand a previous lookup. Reuse the exact prior query "
+            "string and filters from the lookup provenance above unless they explicitly ask to change "
+            "scope. Prefer increasing limit/maxStudies/maxPages over rewriting the query. If the "
+            "source still returns the same slice or exposes no more pages, say that directly."
+        )
+
+    llm_request.append_instructions(instructions)
     return None
+
+
+def _report_assistant_after_model_callback(
+    *,
+    callback_context: CallbackContext,
+    llm_response: LlmResponse,
+) -> LlmResponse | None:
+    if bool(callback_context.state.get(STATE_MODEL_ERROR_PASSTHROUGH, False)):
+        callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = False
+        return None
+    if not _llm_response_has_function_call(llm_response):
+        return None
+
+    task_state = _get_task_state(callback_context)
+    user_turn = _extract_user_turn_text(callback_context)
+    provenance_entries = (
+        _collect_report_lookup_provenance_entries(task_state, user_turn, max_entries=12)
+        if task_state
+        else []
+    )
+    return _apply_report_assistant_adaptive_depth(
+        llm_response=llm_response,
+        user_text=user_turn,
+        provenance_entries=provenance_entries,
+    )
 
 
 def create_mcp_toolset(tool_filter: list[str] | ToolPredicate | None = None) -> McpToolset | None:
@@ -8200,7 +8795,7 @@ def create_workflow_agent(
     report_assistant_skills_enabled: bool | None = None,
     require_plan_approval: bool = False,
 ) -> tuple[LlmAgent | SequentialAgent, McpToolset | None]:
-    """Create the routed ADK agent graph and return (root_agent, mcp_toolset).
+    """Create the routed ADK agent graph and return (root_agent, managed_mcp_toolsets).
 
     The root agent is an intent-classifying router that transfers to:
       - general_qa: factual biomedical Q&A (no tools)
@@ -8373,6 +8968,7 @@ def create_workflow_agent(
         tools=report_assistant_tools,
         disallow_transfer_to_parent=True,
         before_model_callback=_report_assistant_before_model_callback,
+        after_model_callback=_report_assistant_after_model_callback,
         on_model_error_callback=_on_model_error,
         on_tool_error_callback=_on_tool_error,
     )
@@ -8389,7 +8985,12 @@ def create_workflow_agent(
         on_model_error_callback=_on_model_error,
     )
 
-    return router, executor_mcp_toolset
+    managed_toolsets = tuple(
+        toolset
+        for toolset in (executor_mcp_toolset, report_assistant_mcp_toolset)
+        if toolset is not None
+    )
+    return router, (ManagedMcpToolsets(managed_toolsets) if managed_toolsets else None)
 
 
 __all__ = [

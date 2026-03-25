@@ -5137,77 +5137,48 @@ server.registerTool(
     const isExactNctQuery = /^NCT\d{8}$/i.test(normalizeWhitespace(query || ""));
     const minimumLimit = isExactNctQuery ? 1 : 5;
     const boundedLimit = limit ? Math.max(minimumLimit, Math.min(200, Math.round(limit))) : 50;
-    const boundedPages = Math.ceil(boundedLimit / 100);
-    const studies = [];
-    let resultCount = 0;
-    let hasMorePages = false;
-    let nextPageToken = "";
 
     try {
-      for (let page = 0; page < boundedPages && studies.length < boundedLimit; page++) {
-        const pageSize = Math.min(100, boundedLimit - studies.length);
-        const params = new URLSearchParams({
-          "query.term": query,
-          pageSize: String(pageSize),
-          format: "json",
-        });
-
-        if (normalizedStatus) {
-          params.append("filter.overallStatus", normalizedStatus);
-        }
-        if (nextPageToken) {
-          params.append("pageToken", nextPageToken);
-        }
-
-        const url = `${CLINICAL_TRIALS_API}/studies?${params.toString()}`;
-        const data = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 15000, maxBackoffMs: 3500 });
-        const pageStudies = data?.studies ?? [];
-        if (Number.isFinite(data?.totalCount)) {
-          resultCount = data.totalCount;
-        }
-        studies.push(...pageStudies);
-        nextPageToken = data?.nextPageToken || "";
-        if (!nextPageToken || pageStudies.length === 0) break;
-      }
+      const collected = await collectClinicalTrialStudies({
+        query,
+        normalizedStatus,
+        maxStudies: boundedLimit,
+        maxPagesPerVariant: Math.max(2, Math.ceil(boundedLimit / 50) + 1),
+        fetchOptions: { retries: 2, timeoutMs: 15000, maxBackoffMs: 3500 },
+      });
+      const studies = collected.studies;
+      const resultCount = Number.isFinite(collected.totalCount) ? collected.totalCount : 0;
+      const hasMorePages = Boolean(collected.hasMorePages);
       studies.sort((left, right) => scoreClinicalTrialStudy(right, query) - scoreClinicalTrialStudy(left, query));
-      hasMorePages = Boolean(nextPageToken);
       // Do NOT set resultCount = studies.length when API did not provide totalCount —
       // that would imply "Showing 100 of 100 total" when there may be many more.
-    } catch (error) {
       if (studies.length === 0) {
         return {
-          content: [{ type: "text", text: `Error searching clinical trials: ${error.message}. Try again or use different search terms.` }],
+          content: [
+            {
+              type: "text",
+              text: `No clinical trials found for: "${query}"${normalizedStatus ? ` with status ${normalizedStatus}` : ""}`,
+            },
+          ],
         };
       }
-    }
 
-    if (studies.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `No clinical trials found for: "${query}"${normalizedStatus ? ` with status ${normalizedStatus}` : ""}`,
-          },
-        ],
-      };
-    }
+      const formatted = studies.map((study, i) => {
+        const protocol = study.protocolSection;
+        const id = protocol?.identificationModule;
+        const status = protocol?.statusModule;
+        const design = protocol?.designModule;
+        const conditions = protocol?.conditionsModule?.conditions?.slice(0, 3).join(", ") || "Not specified";
+        const interventions = protocol?.armsInterventionsModule?.interventions
+          ?.slice(0, 2)
+          .map((int) => `${int.name} (${int.type})`)
+          .join(", ") || "Not specified";
+        const sponsor = protocol?.sponsorCollaboratorsModule?.leadSponsor?.name || "Unknown";
 
-    const formatted = studies.map((study, i) => {
-      const protocol = study.protocolSection;
-      const id = protocol?.identificationModule;
-      const status = protocol?.statusModule;
-      const design = protocol?.designModule;
-      const conditions = protocol?.conditionsModule?.conditions?.slice(0, 3).join(", ") || "Not specified";
-      const interventions = protocol?.armsInterventionsModule?.interventions
-        ?.slice(0, 2)
-        .map((int) => `${int.name} (${int.type})`)
-        .join(", ") || "Not specified";
-      const sponsor = protocol?.sponsorCollaboratorsModule?.leadSponsor?.name || "Unknown";
+        const phase = design?.phases?.join(", ") || "Not specified";
+        const enrollment = design?.enrollmentInfo?.count || "Unknown";
 
-      const phase = design?.phases?.join(", ") || "Not specified";
-      const enrollment = design?.enrollmentInfo?.count || "Unknown";
-
-      return `${i + 1}. ${id?.briefTitle || "Untitled"}
+        return `${i + 1}. ${id?.briefTitle || "Untitled"}
    NCT ID: ${id?.nctId || "Unknown"}
    Status: ${status?.overallStatus || "Unknown"}
    Phase: ${phase}
@@ -5215,19 +5186,27 @@ server.registerTool(
    Interventions: ${interventions}
    Enrollment: ${enrollment} participants
    Sponsor: ${sponsor}`;
-    }).join("\n\n");
+      }).join("\n\n");
 
-    const countLine = resultCount
-      ? `Showing ${studies.length} of ${resultCount} total trials`
-      : `${studies.length} trials returned (total in registry not provided by API; more may exist — increase limit to fetch more)`;
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Clinical trials for "${query}":\n${countLine}${hasMorePages ? " (additional pages available)" : ""}${normalizedStatus ? `\nStatus filter: ${normalizedStatus}` : ""}\n\n${formatted}\n\nUse get_clinical_trial with the NCT ID for full details including results.`,
-        },
-      ],
-    };
+      const countLine = resultCount
+        ? `Showing ${studies.length} of ${resultCount} total trials`
+        : `${studies.length} trials returned (total in registry not provided by API; more may exist — increase limit to fetch more)`;
+      const fallbackNote = collected.usedFallbackVariant
+        ? "\nQuery normalization fallback also checked a punctuation-normalized variant of the same search to recover additional registry matches."
+        : "";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Clinical trials for "${query}":\n${countLine}${hasMorePages ? " (additional pages may be available)" : ""}${normalizedStatus ? `\nStatus filter: ${normalizedStatus}` : ""}${fallbackNote}\n\n${formatted}\n\nUse get_clinical_trial with the NCT ID for full details including results.`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error searching clinical trials: ${error.message}. Try again or use different search terms.` }],
+      };
+    }
   }
 );
 
@@ -5717,6 +5696,134 @@ function scoreClinicalTrialStudy(study, query) {
     if (sponsor.includes(token)) score += 1;
   }
   return score;
+}
+
+function buildClinicalTrialQueryVariants(query) {
+  const normalized = normalizeWhitespace(query || "");
+  if (!normalized) return [];
+  const variants = [];
+  const seen = new Set();
+  const pushVariant = (value) => {
+    const candidate = normalizeWhitespace(value || "");
+    if (!candidate) return;
+    const key = candidate.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    variants.push(candidate);
+  };
+  pushVariant(normalized);
+  pushVariant(
+    normalized
+      .replace(/\b([A-Za-z]+)'s\b/g, "$1")
+      .replace(/'/g, "")
+  );
+  return variants;
+}
+
+function getClinicalTrialStudyKey(study) {
+  const protocol = study?.protocolSection || {};
+  const identification = protocol?.identificationModule || {};
+  const nctId = normalizeWhitespace(identification?.nctId || "").toUpperCase();
+  if (nctId) return nctId;
+  const orgId = normalizeWhitespace(identification?.orgStudyIdInfo?.id || "").toUpperCase();
+  if (orgId) return `ORG:${orgId}`;
+  const title = normalizeWhitespace(identification?.briefTitle || "").toUpperCase();
+  return title || JSON.stringify(study || {});
+}
+
+async function collectClinicalTrialStudies({
+  query,
+  normalizedStatus = "",
+  maxStudies = 50,
+  maxPagesPerVariant = 3,
+  fetchOptions = { retries: 2, timeoutMs: 15000, maxBackoffMs: 3500 },
+}) {
+  const boundedStudies = Math.max(1, Math.min(200, Math.round(Number(maxStudies) || 50)));
+  const boundedPagesPerVariant = Math.max(1, Math.min(8, Math.round(Number(maxPagesPerVariant) || 3)));
+  const queryVariants = buildClinicalTrialQueryVariants(query);
+  const studies = [];
+  const sources = [];
+  const seenStudyKeys = new Set();
+  let totalCount = null;
+  let hasMorePages = false;
+  let usedFallbackVariant = false;
+  const usedQueryVariants = [];
+
+  for (let variantIndex = 0; variantIndex < queryVariants.length && studies.length < boundedStudies; variantIndex++) {
+    const queryVariant = queryVariants[variantIndex];
+    usedQueryVariants.push(queryVariant);
+    let nextPageToken = "";
+
+    for (let page = 0; page < boundedPagesPerVariant && studies.length < boundedStudies; page++) {
+      const pageSize = Math.min(50, boundedStudies - studies.length);
+      if (pageSize <= 0) break;
+
+      const params = new URLSearchParams({
+        "query.term": queryVariant,
+        pageSize: String(pageSize),
+        format: "json",
+      });
+      if (normalizedStatus) {
+        params.append("filter.overallStatus", normalizedStatus);
+      }
+      if (nextPageToken) {
+        params.append("pageToken", nextPageToken);
+      }
+
+      const url = `${CLINICAL_TRIALS_API}/studies?${params.toString()}`;
+      sources.push(url);
+      const data = await fetchJsonWithRetry(url, fetchOptions);
+      const pageStudies = Array.isArray(data?.studies) ? data.studies : [];
+
+      if (Number.isFinite(data?.totalCount) && usedQueryVariants.length === 1) {
+        totalCount = data.totalCount;
+      }
+
+      let uniqueAddedThisPage = 0;
+      for (const study of pageStudies) {
+        const studyKey = getClinicalTrialStudyKey(study);
+        if (seenStudyKeys.has(studyKey)) continue;
+        seenStudyKeys.add(studyKey);
+        studies.push(study);
+        uniqueAddedThisPage += 1;
+        if (studies.length >= boundedStudies) break;
+      }
+
+      const returnedNextPageToken = data?.nextPageToken || "";
+      if (returnedNextPageToken) {
+        hasMorePages = true;
+      }
+      if (variantIndex > 0 && uniqueAddedThisPage > 0) {
+        usedFallbackVariant = true;
+      }
+
+      const shouldContinue =
+        Boolean(returnedNextPageToken)
+        && pageStudies.length > 0
+        && studies.length < boundedStudies
+        && page < boundedPagesPerVariant - 1;
+      if (!shouldContinue && returnedNextPageToken) {
+        hasMorePages = true;
+      }
+      nextPageToken = shouldContinue ? returnedNextPageToken : "";
+      if (!shouldContinue) {
+        break;
+      }
+    }
+  }
+
+  if (usedQueryVariants.length > 1) {
+    totalCount = null;
+  }
+
+  return {
+    studies,
+    sources,
+    totalCount,
+    hasMorePages,
+    usedFallbackVariant,
+    usedQueryVariants,
+  };
 }
 
 function normalizeGeoIdentifier(value) {
@@ -9396,38 +9503,16 @@ server.registerTool(
       const normalizedStatus = normalizeClinicalTrialStatus(status);
       const boundedStudies = Math.max(10, Math.min(200, Math.round(maxStudies)));
       const boundedPages = Math.max(1, Math.min(8, Math.round(maxPages)));
-      const studies = [];
-      const sources = [];
-      let totalCount = null;
-      let nextPageToken = "";
-
-      for (let page = 0; page < boundedPages && studies.length < boundedStudies; page++) {
-        const pageSize = Math.min(100, boundedStudies - studies.length);
-        const params = new URLSearchParams({
-          "query.term": query,
-          pageSize: String(pageSize),
-          format: "json",
-        });
-        if (normalizedStatus) {
-          params.append("filter.overallStatus", normalizedStatus);
-        }
-        if (nextPageToken) {
-          params.append("pageToken", nextPageToken);
-        }
-
-        const url = `${CLINICAL_TRIALS_API}/studies?${params.toString()}`;
-        sources.push(url);
-        const data = await fetchJsonWithRetry(url);
-        const pageStudies = data?.studies ?? [];
-        if (Number.isFinite(data?.totalCount)) {
-          totalCount = data.totalCount;
-        }
-        studies.push(...pageStudies);
-        nextPageToken = data?.nextPageToken || "";
-        if (!nextPageToken || pageStudies.length === 0) {
-          break;
-        }
-      }
+      const collected = await collectClinicalTrialStudies({
+        query,
+        normalizedStatus,
+        maxStudies: boundedStudies,
+        maxPagesPerVariant: boundedPages,
+        fetchOptions: { retries: 2, timeoutMs: 15000, maxBackoffMs: 3500 },
+      });
+      const studies = collected.studies;
+      const sources = collected.sources;
+      const totalCount = collected.totalCount;
 
       if (studies.length === 0) {
         return {
@@ -9516,7 +9601,7 @@ server.registerTool(
       const conditionSummary = summarizeTopCounts(conditionCounts, 6);
       const reasonSummary = summarizeTopCounts(terminationReasonCounts, 5);
       const analyzed = studies.length;
-      const hasMore = Boolean(nextPageToken);
+      const hasMore = Boolean(collected.hasMorePages);
 
       const countQualifier = Number.isFinite(totalCount)
         ? ` (reported total in registry: ${totalCount})`
@@ -9540,6 +9625,9 @@ server.registerTool(
       if (hasMore) {
         keyFields.push("Additional studies remain beyond current page/study limits.");
       }
+      if (collected.usedFallbackVariant) {
+        keyFields.push("Query normalization fallback recovered additional matches from a punctuation-normalized variant of the same search.");
+      }
       const clinicalLandscapePayload = buildClinicalTrialsLandscapePayload({
         resultStatus: "ok",
         query,
@@ -9558,6 +9646,9 @@ server.registerTool(
         exampleTerminatedNctIds: terminatedNctIds,
         notes: [
           "Counts are aggregated from scanned ClinicalTrials.gov studies.",
+          ...(collected.usedFallbackVariant
+            ? ["A punctuation-normalized query variant was also scanned to recover additional semantically equivalent matches."]
+            : []),
           hasMore ? "Additional studies remain outside scanned pages." : "All fetched pages were processed within limits.",
         ],
       });
