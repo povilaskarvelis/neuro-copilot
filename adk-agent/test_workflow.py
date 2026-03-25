@@ -2240,6 +2240,22 @@ def test_reference_section_keeps_papers_but_links_trials_inline(monkeypatch):
     assert "[NCT03710707](https://clinicaltrials.gov/study/NCT03710707)" in linked
 
 
+def test_hyperlink_inline_ids_links_common_database_and_ontology_ids():
+    text = (
+        "These include Entrez Gene ID: 120892, Ensembl ID: ENSG00000188906, and "
+        "UniProt ID: Q5S007. LRRK2 (HGNC:18618) is linked to Parkinson's disease "
+        "(MONDO:0005180)."
+    )
+
+    linked = workflow._hyperlink_inline_ids(text, ref_map={})
+
+    assert "[Entrez Gene ID: 120892](https://www.ncbi.nlm.nih.gov/gene/120892)" in linked
+    assert "[Ensembl ID: ENSG00000188906](https://www.ensembl.org/id/ENSG00000188906)" in linked
+    assert "[UniProt ID: Q5S007](https://www.uniprot.org/uniprotkb/Q5S007)" in linked
+    assert "[HGNC:18618](https://www.genenames.org/data/gene-symbol-report/#!/hgnc_id/HGNC:18618)" in linked
+    assert "[MONDO:0005180](https://monarchinitiative.org/disease/MONDO:0005180)" in linked
+
+
 def test_apa_intext_citation_uses_author_year_when_metadata_available(monkeypatch):
     monkeypatch.setattr(
         workflow,
@@ -2248,6 +2264,21 @@ def test_apa_intext_citation_uses_author_year_when_metadata_available(monkeypatc
     )
 
     assert workflow._format_apa_intext_citation(3, "PMID:12345678") == "[Ng & Cao, 2024](#ref-3)"
+
+
+def test_hyperlink_author_year_citations_links_plain_author_year_mentions(monkeypatch):
+    monkeypatch.setattr(
+        workflow,
+        "_fetch_reference_meta",
+        lambda eid: {"authors": ["Ng X. Y.", "Cao M."], "year": "2024", "title": "Example paper"},
+    )
+
+    linked = workflow._hyperlink_author_year_citations(
+        "Key publications include Ng & Cao, 2024 in the evidence base.\n\n## References\n\n1. Example",
+        ["PMID:12345678"],
+    )
+
+    assert "[Ng & Cao, 2024](#ref-1)" in linked
 
 
 def test_extract_evidence_ids_from_text_deduplication():
@@ -2327,6 +2358,30 @@ def test_format_reference_apa_falls_back_to_europe_pmc_when_pubmed_meta_is_unava
     assert "Fallback LRRK2 paper" in citation
     assert "Example Journal" in citation
     assert "PMID: [12345678]" in citation
+
+
+def test_render_final_synthesis_markdown_recovers_references_from_model_reference_section(monkeypatch):
+    monkeypatch.setattr(
+        workflow,
+        "_fetch_reference_meta",
+        lambda eid: {"authors": ["Ng X. Y.", "Cao M."], "year": "2024", "title": "Example paper"},
+    )
+
+    task_state = {"objective": "Assess LRRK2 evidence", "steps": []}
+    synthesis = {
+        "answer": "Evidence is supported by Ng & Cao, 2024.",
+        "model_findings_text": "Detailed findings cite Ng & Cao, 2024 for context.",
+        "model_references_text": "1. Example paper. PMID:12345678",
+        "claim_synthesis_summary": {},
+        "limitations": [],
+        "next_actions": [],
+    }
+
+    rendered = workflow._render_final_synthesis_markdown(task_state, synthesis)
+
+    assert "[Ng & Cao, 2024](#ref-1)" in rendered
+    assert "## References" in rendered
+    assert "PMID: [12345678]" in rendered
 
 
 def test_report_assistant_before_model_callback_includes_legacy_lookup_provenance_for_expansion_requests():

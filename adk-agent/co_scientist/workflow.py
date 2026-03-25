@@ -5274,7 +5274,14 @@ _INLINE_ID_RE = re.compile(
     r"|\b(?P<nct>NCT\d{8})\b"
     r"|\bOpenAlex\s*:?\s*(?P<openalex>W\d+)\b"
     r"|\b(?P<pmc>PMC\d+)\b"
-    r"|\bUniProt\s*:\s*(?P<uniprot>[A-Z][A-Z0-9]{2,9})\b"
+    r"|\bUniProt(?:\s+(?:ID|Accession))?\s*:?\s*(?P<uniprot>[A-Z][A-Z0-9]{2,9})\b"
+    r"|\b(?:Ensembl(?:\s+(?:Gene|Transcript|Protein))?\s+ID\s*:?\s*)?(?P<ensembl>ENS[A-Z0-9]{3,}\d{6,})\b"
+    r"|\b(?:Entrez(?:\s+Gene)?\s+ID|NCBI\s+Gene\s+ID)\s*:?\s*(?P<entrez>\d+)\b"
+    r"|\b(?P<hgnc>HGNC:\d+)\b"
+    r"|\b(?P<mondo>MONDO[_:]\d+)\b"
+    r"|\b(?P<efo>EFO[_:]\d+)\b"
+    r"|\b(?P<hp>HP:\d+)\b"
+    r"|\b(?P<go>GO:\d+)\b"
     r"|\bPubChem\s*:\s*(?P<pubchem>\d+)\b"
     r"|\bPDB\s*:\s*(?P<pdb>[A-Za-z0-9]{4})\b"
     r"|\b(?P<rsid>rs\d{3,})\b"
@@ -5306,6 +5313,30 @@ def _evidence_id_to_url(eid: str) -> str | None:
     m = re.fullmatch(r"(?i)UniProt:([A-Z][A-Z0-9]{2,9})", raw)
     if m:
         return f"https://www.uniprot.org/uniprotkb/{m.group(1)}"
+    m = re.fullmatch(r"(?i)(?:Ensembl:)?(ENS[A-Z0-9]{3,}\d{6,})", raw)
+    if m:
+        return f"https://www.ensembl.org/id/{m.group(1)}"
+    m = re.fullmatch(r"(?i)(?:Entrez|NCBIGene|GeneID):(\d+)", raw)
+    if m:
+        return f"https://www.ncbi.nlm.nih.gov/gene/{m.group(1)}"
+    m = re.fullmatch(r"(?i)(HGNC:\d+)", raw)
+    if m:
+        hgnc_id = m.group(1).upper()
+        return f"https://www.genenames.org/data/gene-symbol-report/#!/hgnc_id/{hgnc_id}"
+    m = re.fullmatch(r"(?i)(MONDO[:_]\d+)", raw)
+    if m:
+        mondo_id = m.group(1).upper().replace("_", ":")
+        return f"https://monarchinitiative.org/disease/{mondo_id}"
+    m = re.fullmatch(r"(?i)(EFO[:_]\d+)", raw)
+    if m:
+        efo_id = m.group(1).upper().replace(":", "_")
+        return f"https://www.ebi.ac.uk/ols4/ontologies/efo/terms?short_form={efo_id}"
+    m = re.fullmatch(r"(?i)(HP:\d+)", raw)
+    if m:
+        return f"https://hpo.jax.org/app/browse/term/{m.group(1).upper()}"
+    m = re.fullmatch(r"(?i)(GO:\d+)", raw)
+    if m:
+        return f"https://amigo.geneontology.org/amigo/term/{m.group(1).upper()}"
     m = re.fullmatch(r"(?i)PubChem:(\d+)", raw)
     if m:
         return f"https://pubchem.ncbi.nlm.nih.gov/compound/{m.group(1)}"
@@ -5344,6 +5375,20 @@ def _extract_inline_ids_from_text(text: str) -> list[str]:
             normalized = m.group("pmc").upper()
         elif m.group("uniprot"):
             normalized = f"UniProt:{m.group('uniprot').upper()}"
+        elif m.group("ensembl"):
+            normalized = f"Ensembl:{m.group('ensembl').upper()}"
+        elif m.group("entrez"):
+            normalized = f"Entrez:{m.group('entrez')}"
+        elif m.group("hgnc"):
+            normalized = m.group("hgnc").upper()
+        elif m.group("mondo"):
+            normalized = m.group("mondo").upper().replace("_", ":")
+        elif m.group("efo"):
+            normalized = m.group("efo").upper().replace(":", "_")
+        elif m.group("hp"):
+            normalized = m.group("hp").upper()
+        elif m.group("go"):
+            normalized = m.group("go").upper()
         elif m.group("pubchem"):
             normalized = f"PubChem:{m.group('pubchem')}"
         elif m.group("pdb"):
@@ -5679,6 +5724,31 @@ def _format_apa_intext_author(names: list[str]) -> str:
     return f"{families[0]} et al."
 
 
+def _build_apa_intext_label(eid: str) -> str:
+    """Return the plain APA-style in-text citation label for one reference ID."""
+    meta = _fetch_reference_meta(eid)
+    citation_label = ""
+    if meta:
+        author_part = _format_apa_intext_author(meta.get("authors") or [])
+        year = str(meta.get("year") or "n.d.").strip() or "n.d."
+        if author_part:
+            citation_label = f"{author_part}, {year}"
+        else:
+            title = str(meta.get("title") or "").strip()
+            if title:
+                citation_label = f"{title[:40].rstrip('.')}..., {year}"
+
+    if citation_label:
+        return citation_label
+
+    raw = re.sub(r"\s*:\s*", ":", eid.strip())
+    if raw.lower().startswith("openalex:"):
+        return f"{raw.replace(':', ': ', 1)}, n.d."
+    if raw.upper().startswith("PMC"):
+        return f"{raw.upper()}, n.d."
+    return raw
+
+
 def _fetch_reference_meta(eid: str) -> dict | None:
     """Fetch citation metadata for a reference-style identifier when available."""
     raw = re.sub(r"\s*:\s*", ":", eid.strip())
@@ -5705,28 +5775,7 @@ def _fetch_reference_meta(eid: str) -> dict | None:
 
 def _format_apa_intext_citation(ref_number: int, eid: str) -> str:
     """Return a linked APA-style in-text citation when metadata is available."""
-    meta = _fetch_reference_meta(eid)
-    citation_label = ""
-    if meta:
-        author_part = _format_apa_intext_author(meta.get("authors") or [])
-        year = str(meta.get("year") or "n.d.").strip() or "n.d."
-        if author_part:
-            citation_label = f"{author_part}, {year}"
-        else:
-            title = str(meta.get("title") or "").strip()
-            if title:
-                citation_label = f"{title[:40].rstrip('.')}..., {year}"
-
-    if not citation_label:
-        raw = re.sub(r"\s*:\s*", ":", eid.strip())
-        if raw.lower().startswith("openalex:"):
-            citation_label = f"{raw.replace(':', ': ', 1)}, n.d."
-        elif raw.upper().startswith("PMC"):
-            citation_label = f"{raw.upper()}, n.d."
-        else:
-            citation_label = raw
-
-    return f"[{citation_label}](#ref-{ref_number})"
+    return f"[{_build_apa_intext_label(eid)}](#ref-{ref_number})"
 
 
 def _format_reference_apa(i: int, eid: str) -> str:
@@ -5819,6 +5868,68 @@ _PROTECT_RE = re.compile(
 )
 
 
+def _dedupe_preserve_order(items: list[str], limit: int | None = None) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in items:
+        normalized = re.sub(r"\s*:\s*", ":", str(item or "").strip())
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+        if limit and len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _collect_claim_summary_literature_ids(claim_summary: dict[str, Any], limit: int = 20) -> list[str]:
+    ids: list[str] = []
+
+    for claim in list(claim_summary.get("top_supported_claims", []) or [])[:8]:
+        ids.extend(str(eid).strip() for eid in list(claim.get("supporting_ids", []) or [])[:8])
+
+    for cluster in list(claim_summary.get("mixed_evidence_claims", []) or [])[:5]:
+        for claim in list(cluster.get("claims", []) or [])[:4]:
+            ids.extend(str(eid).strip() for eid in list(claim.get("supporting_ids", []) or [])[:8])
+
+    return [
+        eid for eid in _dedupe_preserve_order(ids, limit=limit)
+        if _is_literature_id(eid)
+    ]
+
+
+def _collect_final_report_literature_ids(
+    task_state: dict[str, Any],
+    synthesis: dict[str, Any],
+    rendered_text: str,
+    *,
+    limit: int = 25,
+) -> list[str]:
+    candidates: list[str] = []
+    candidates.extend(_extract_inline_ids_from_text(rendered_text))
+
+    model_references_text = str(synthesis.get("model_references_text", "") or "").strip()
+    if model_references_text:
+        candidates.extend(_extract_inline_ids_from_text(model_references_text))
+
+    literature_ids = [eid for eid in _dedupe_preserve_order(candidates, limit=limit) if _is_literature_id(eid)]
+    if literature_ids:
+        return literature_ids
+
+    claim_summary = dict(synthesis.get("claim_synthesis_summary", {}) or {})
+    literature_ids = _collect_claim_summary_literature_ids(claim_summary, limit=limit)
+    if literature_ids:
+        return literature_ids
+
+    return [
+        eid for eid in _dedupe_preserve_order(_collect_all_evidence_ids(task_state), limit=limit)
+        if _is_literature_id(eid)
+    ]
+
+
 def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> str:
     """Replace bare inline ID mentions with links in the body text.
 
@@ -5844,42 +5955,45 @@ def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> s
     protected = _PROTECT_RE.sub(_protect, body)
 
     def _replace_id(m: re.Match) -> str:  # type: ignore[type-arg]
+        display = m.group(0)
         if m.group("pmid"):
             normalized = f"PMID:{m.group('pmid')}"
-            display = f"PMID: {m.group('pmid')}"
         elif m.group("doi"):
             normalized = f"DOI:{m.group('doi')}"
-            display = f"DOI: {m.group('doi')}"
         elif m.group("nct"):
             normalized = m.group("nct").upper()
-            display = normalized
         elif m.group("openalex"):
             normalized = f"OpenAlex:{m.group('openalex')}"
-            display = f"OpenAlex: {m.group('openalex')}"
         elif m.group("pmc"):
             normalized = m.group("pmc").upper()
-            display = normalized
         elif m.group("uniprot"):
             normalized = f"UniProt:{m.group('uniprot').upper()}"
-            display = f"UniProt: {m.group('uniprot').upper()}"
+        elif m.group("ensembl"):
+            normalized = f"Ensembl:{m.group('ensembl').upper()}"
+        elif m.group("entrez"):
+            normalized = f"Entrez:{m.group('entrez')}"
+        elif m.group("hgnc"):
+            normalized = m.group("hgnc").upper()
+        elif m.group("mondo"):
+            normalized = m.group("mondo").upper().replace("_", ":")
+        elif m.group("efo"):
+            normalized = m.group("efo").upper().replace(":", "_")
+        elif m.group("hp"):
+            normalized = m.group("hp").upper()
+        elif m.group("go"):
+            normalized = m.group("go").upper()
         elif m.group("pubchem"):
             normalized = f"PubChem:{m.group('pubchem')}"
-            display = f"PubChem: {m.group('pubchem')}"
         elif m.group("pdb"):
             normalized = f"PDB:{m.group('pdb').upper()}"
-            display = f"PDB: {m.group('pdb').upper()}"
         elif m.group("rsid"):
             normalized = m.group("rsid").lower()
-            display = normalized
         elif m.group("chembl"):
             normalized = m.group("chembl").upper()
-            display = normalized
         elif m.group("reactome"):
             normalized = f"Reactome:{m.group('reactome').upper()}"
-            display = m.group("reactome").upper()
         elif m.group("gcst"):
             normalized = m.group("gcst").upper()
-            display = normalized
         else:
             return m.group(0)
         ref_key = re.sub(r"\s*:\s*", ":", normalized).lower()
@@ -5898,6 +6012,41 @@ def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> s
         linked = linked.replace(f"\x00P{idx}\x00", original)
 
     return linked + refs_tail
+
+
+def _hyperlink_author_year_citations(text: str, lit_ids: list[str]) -> str:
+    """Link plain author-year citations in the body to the final References section."""
+    if not text or not lit_ids:
+        return text
+
+    refs_split = re.split(r"(?m)^#{2,3} References\b", text, maxsplit=1)
+    body = refs_split[0]
+    refs_tail = ("\n## References" + refs_split[1]) if len(refs_split) > 1 else ""
+
+    placeholders: list[str] = []
+
+    def _protect(m: re.Match) -> str:  # type: ignore[type-arg]
+        idx = len(placeholders)
+        placeholders.append(m.group(0))
+        return f"\x00P{idx}\x00"
+
+    protected = _PROTECT_RE.sub(_protect, body)
+
+    citation_pairs: list[tuple[str, str]] = []
+    for ref_number, eid in enumerate(lit_ids, start=1):
+        label = _build_apa_intext_label(eid)
+        if not label or label == re.sub(r"\s*:\s*", ":", eid.strip()):
+            continue
+        citation_pairs.append((label, f"[{label}](#ref-{ref_number})"))
+
+    for label, replacement in sorted(citation_pairs, key=lambda item: len(item[0]), reverse=True):
+        pattern = re.compile(rf"(?<![\w>]){re.escape(label)}(?![\w<])")
+        protected = pattern.sub(replacement, protected)
+
+    for idx, original in enumerate(placeholders):
+        protected = protected.replace(f"\x00P{idx}\x00", original)
+
+    return protected + refs_tail
 
 
 def _expand_reference_only_body_lines(text: str, lit_ids: list[str]) -> str:
@@ -7016,6 +7165,7 @@ def _build_structured_final_synthesis(task_state: dict[str, Any], raw_markdown: 
             model_answer=model_answer_text,
         ),
         "model_findings_text": model_findings_text.strip(),
+        "model_references_text": str(sections.get("references", "") or "").strip(),
         "limitations": _build_structured_limitations(
             task_state,
             claim_summary,
@@ -7121,8 +7271,7 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
 
     # References (last section)
     current_text = "\n".join(lines)
-    inline_ids = _extract_inline_ids_from_text(current_text)
-    lit_ids = [eid for eid in inline_ids if _is_literature_id(eid)]
+    lit_ids = _collect_final_report_literature_ids(task_state, synthesis, current_text)
     ref_map = _build_ref_map(lit_ids)
     refs = _build_references_section(lit_ids)
     if refs:
@@ -7131,6 +7280,7 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
 
     body_so_far = "\n".join(lines)
     body_so_far = _hyperlink_inline_ids(body_so_far, ref_map)
+    body_so_far = _hyperlink_author_year_citations(body_so_far, lit_ids)
     body_so_far = _expand_reference_only_body_lines(body_so_far, lit_ids)
     lines = body_so_far.split("\n")
 
