@@ -1,6 +1,6 @@
 # AI Co-Scientist
 
-AI Co-Scientist is a human-in-the-loop biomedical research assistant built on Google ADK. It plans an investigation, waits for approval, gathers evidence across live APIs and BigQuery public datasets, and produces cited reports for pre-clinical research decisions.
+AI Co-Scientist is a biomedical research assistant built on Google ADK. It plans an investigation, waits for approval, gathers evidence across live APIs and BigQuery public datasets, and produces cited reports for pre-clinical research decisions.
 
 ![AI Co-Scientist interface](interface.png)
 
