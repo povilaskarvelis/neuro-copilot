@@ -165,6 +165,18 @@ function markdownToHtml(markdown) {
     cells.push(current.trim());
     return cells;
   };
+  const startsStructuralBlock = (value, nextValue = "") => {
+    const text = String(value || "").trim();
+    if (!text) return true;
+    if (/^<a\s+id="[^"]+">\s*<\/a>/.test(text)) return true;
+    if (text.startsWith("```")) return true;
+    if (/^(?:---+|\*\*\*+|___+)$/.test(text)) return true;
+    if (/^#{1,3}\s+/.test(text)) return true;
+    if (/^>\s?/.test(text)) return true;
+    if (/^(\s*)([-*]|\d+\.)\s+/.test(String(value || ""))) return true;
+    if (looksLikeTableRow(text) && isTableSeparator(nextValue)) return true;
+    return false;
+  };
 
   for (let idx = 0; idx < lines.length; idx += 1) {
     const rawLine = lines[idx];
@@ -299,7 +311,17 @@ function markdownToHtml(markdown) {
     }
 
     closeLists();
-    html.push(`${anchorHtml}<p>${inlineMarkdown(trimmed)}</p>`);
+    const paragraphParts = [trimmed];
+    while (idx + 1 < lines.length) {
+      const candidateRaw = String(lines[idx + 1] || "");
+      const candidateTrimmed = candidateRaw.trim();
+      const candidateNext = idx + 2 < lines.length ? String(lines[idx + 2] || "") : "";
+      if (!candidateTrimmed) break;
+      if (startsStructuralBlock(candidateRaw, candidateNext)) break;
+      paragraphParts.push(candidateTrimmed);
+      idx += 1;
+    }
+    html.push(`${anchorHtml}<p>${inlineMarkdown(paragraphParts.join(" "))}</p>`);
   }
 
   closeBlockquote();

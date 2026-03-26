@@ -41,7 +41,6 @@ from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import ToolPredicate
 from google.adk.tools.mcp_tool.mcp_toolset import StdioConnectionParams
 from google.adk.tools.tool_context import ToolContext
-from google import genai as _genai_module
 from google.genai import types
 from mcp.client.stdio import StdioServerParameters
 
@@ -553,6 +552,7 @@ Available agents:
    commands and plan management.
    Examples: "Evaluate LRRK2 as a therapeutic target for Parkinson disease",
    "Compare the safety profiles of SGLT2 inhibitors vs DPP-4 inhibitors",
+   "Why is KRAS G12C monotherapy more effective in NSCLC than colorectal cancer, and which combination strategies have the best biological and clinical support in colorectal cancer?",
    any command (approve, continue, finalize, revise:, history, rollback, switch)
 
 4. **report_assistant** — Interacts with an existing research report: answers questions about findings,
@@ -848,6 +848,66 @@ def _is_lookup_expansion_request(user_text: str) -> bool:
             "continue",
         )
     )
+
+
+def _is_obvious_research_workflow_query(user_text: str) -> bool:
+    """Return True for clearly evidence-driven research asks that should bypass general QA."""
+    normalized = f" {_normalize_user_text(user_text)} "
+    if len(normalized.strip()) < 40:
+        return False
+
+    explicit_research_phrases = (
+        " best biological and clinical support ",
+        " best clinical and biological support ",
+        " combination strategies ",
+        " combination strategy ",
+        " therapeutic target ",
+        " trial landscape ",
+        " safety profile ",
+        " safety profiles ",
+        " mechanistic studies ",
+        " preclinical findings ",
+    )
+    comparison_phrases = (
+        " more effective ",
+        " less effective ",
+        " compared with ",
+        " compared to ",
+        " versus ",
+        " vs ",
+    )
+    evidence_terms = (
+        " clinical support ",
+        " biological support ",
+        " evidence ",
+        " literature ",
+        " mechanistic ",
+        " preclinical ",
+        " trial ",
+        " trials ",
+        " combination ",
+        " monotherapy ",
+    )
+
+    if any(phrase in normalized for phrase in explicit_research_phrases):
+        return True
+
+    if (
+        normalized.strip().startswith(("why is ", "why are ", "which ", "what explains ", "how does "))
+        and any(phrase in normalized for phrase in comparison_phrases)
+        and sum(1 for term in evidence_terms if term in normalized) >= 2
+    ):
+        return True
+
+    if (
+        (" which " in normalized or normalized.strip().startswith("which "))
+        and " support " in normalized
+        and " clinical " in normalized
+        and " biological " in normalized
+    ):
+        return True
+
+    return False
 
 
 def _render_lookup_provenance_scope(entry: Mapping[str, Any]) -> str:
@@ -1300,12 +1360,6 @@ def _llm_response_has_function_call(llm_response: LlmResponse) -> bool:
         return False
     return any(getattr(part, "function_call", None) is not None for part in parts)
 
-
-def _extract_function_call_names(llm_response: LlmResponse) -> list[str]:
-    """Extract the names of all function calls from a model response."""
-    return [fc["name"] for fc in _extract_function_calls(llm_response)]
-
-
 def _extract_function_calls(llm_response: LlmResponse) -> list[dict[str, Any]]:
     """Extract name + args for each function call in the response."""
     content = getattr(llm_response, "content", None)
@@ -1525,6 +1579,41 @@ def _describe_tool_result(name: str, response: Any) -> str:
     if summary:
         return summary
     return f"{source} returned results"
+
+
+def _extract_tool_result_evidence_text(name: str, response: Any, *, max_chars: int = 6000) -> str:
+    """Extract a compact evidence-preserving text payload from a tool response."""
+    if not isinstance(response, dict):
+        try:
+            response = dict(response) if response else {}
+        except Exception:  # noqa: BLE001
+            response = {}
+
+    chunks: list[str] = []
+
+    mcp_text = _extract_mcp_text(response)
+    if mcp_text:
+        chunks.append(mcp_text)
+
+    structured = response.get("structuredContent")
+    if isinstance(structured, dict):
+        for key in ("text", "summary"):
+            value = str(structured.get(key, "") or "").strip()
+            if value:
+                chunks.append(value)
+
+    for key in ("summary", "text"):
+        value = str(response.get(key, "") or "").strip()
+        if value:
+            chunks.append(value)
+
+    if not chunks:
+        return ""
+
+    combined = "\n\n".join(chunk for chunk in chunks if chunk).strip()
+    if len(combined) <= max_chars:
+        return combined
+    return combined[: max_chars - 1].rstrip() + "…"
 
 
 _MCP_SECTION_LABELS = {"summary:", "key fields:", "sources:", "limitations:", "notes:"}
@@ -1949,15 +2038,6 @@ def _set_tool_log(callback_context: CallbackContext, log: list[dict[str, Any]]) 
                     s["tool_log"] = log
                     break
 
-
-def _set_temp_state(callback_context: CallbackContext, key: str, value: Any) -> None:
-    callback_context.state[key] = value
-
-
-def _get_temp_state(callback_context: CallbackContext, key: str, default: Any = None) -> Any:
-    return callback_context.state.get(key, default)
-
-
 def _clear_turn_temp_state(callback_context: CallbackContext) -> None:
     # Cleanup legacy app-scoped workflow state that caused cross-session bleed.
     if STATE_WORKFLOW_TASK_LEGACY_APP in callback_context.state:
@@ -2160,119 +2240,6 @@ def _consume_buffered_json_object(
     return None, last_error
 
 
-# ---------------------------------------------------------------------------
-# Post-hoc structure extraction from prose (primary extraction path)
-# ---------------------------------------------------------------------------
-
-_EXTRACTION_CLIENT: _genai_module.Client | None = None
-EXTRACTION_MODEL = os.getenv("ADK_EXTRACTION_MODEL", "gemini-2.0-flash")
-EXTRACTION_FALLBACK_MODEL = os.getenv("ADK_EXTRACTION_FALLBACK_MODEL", "gemini-2.5-flash-lite")
-
-_EXTRACTION_PROMPT_TEMPLATE = """\
-Extract structured data from the following research step output.
-Focus on identifying substantive scientific claims as structured_observations with proper
-subject/predicate/object triples, and collecting all evidence identifiers.
-
-Step {step_id} output:
----
-{prose}
----
-
-Return a JSON object with these fields:
-{{
-  "status": "completed" or "blocked",
-  "result_summary": "<concise but thorough findings summary preserving key details, scores, and identifiers>",
-  "evidence_ids": ["PMID:...", "NCT:...", "DOI:...", "UniProt:...", "rs...", "CHEMBL..."],
-  "tools_called": ["tool_name_1"],
-  "data_sources_queried": ["Open Targets Platform", "ClinicalTrials.gov", ...],
-  "open_gaps": ["..."],
-  "suggested_next_searches": ["..."],
-  "structured_observations": [
-    {{
-      "observation_type": "<claim family: e.g. phenotype_association, drug_response, interaction, pathway_involvement>",
-      "subject": {{ "type": "<entity type>", "label": "<name>", "id": "<optional canonical ID>" }},
-      "predicate": "<atomic predicate: e.g. associated_with, sensitive_in, inhibits, involved_in>",
-      "object": {{ "type": "<entity type>", "label": "<name>", "id": "<optional canonical ID>" }},
-      "supporting_ids": ["PMID:...", "CHEMBL..."],
-      "source_tool": "<tool name that produced this finding>",
-      "confidence": "low" | "medium" | "high"
-    }}
-  ]
-}}
-
-Rules:
-- Extract ALL substantive scientific claims as structured_observations (usually 1-12 per step).
-- Each observation must be grounded in the text — do not invent unsupported claims.
-- Include every evidence identifier mentioned in the text in evidence_ids.
-- The result_summary should capture the full richness of findings without padding.
-- If the text indicates the step failed or was blocked, set status to "blocked"."""
-
-
-def _get_extraction_client() -> _genai_module.Client | None:
-    global _EXTRACTION_CLIENT
-    if _EXTRACTION_CLIENT is not None:
-        return _EXTRACTION_CLIENT
-    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    if not api_key:
-        return None
-    try:
-        _EXTRACTION_CLIENT = _genai_module.Client(api_key=api_key)
-    except Exception:  # noqa: BLE001
-        logger.warning("[extract] failed to create genai client")
-        return None
-    return _EXTRACTION_CLIENT
-
-
-def _call_extraction_model(client: _genai_module.Client, model: str, prompt: str, step_id: str) -> dict[str, Any] | None:
-    """Call a single extraction model and return parsed dict or None."""
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.1,
-        ),
-    )
-    text = str(getattr(response, "text", "") or "").strip()
-    if not text:
-        return None
-    parsed = json.loads(text)
-    if not isinstance(parsed, dict):
-        return None
-    parsed["step_id"] = step_id
-    parsed["schema"] = STEP_RESULT_SCHEMA
-    if not parsed.get("step_progress_note"):
-        summary = str(parsed.get("result_summary", "") or "")
-        parsed["step_progress_note"] = summary[:200] if summary else "Step completed."
-    return parsed
-
-
-def _extract_structure_from_prose(prose: str, step_id: str) -> dict[str, Any] | None:
-    """Extract structured step data from prose. Tries primary model, falls back on failure."""
-    client = _get_extraction_client()
-    if client is None:
-        return None
-    prompt = _EXTRACTION_PROMPT_TEMPLATE.format(step_id=step_id, prose=prose[:6000])
-    models_to_try = [EXTRACTION_MODEL]
-    if EXTRACTION_FALLBACK_MODEL and EXTRACTION_FALLBACK_MODEL != EXTRACTION_MODEL:
-        models_to_try.append(EXTRACTION_FALLBACK_MODEL)
-    for model in models_to_try:
-        try:
-            parsed = _call_extraction_model(client, model, prompt, step_id)
-            if parsed is not None:
-                logger.info(
-                    "[extract] %s extracted for %s: %d observations, %d evidence_ids",
-                    model, step_id,
-                    len(parsed.get("structured_observations") or []),
-                    len(parsed.get("evidence_ids") or []),
-                )
-                return parsed
-            logger.warning("[extract] %s returned empty for %s", model, step_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[extract] %s failed for %s: %s", model, step_id, exc)
-    return None
-
-
 _EVIDENCE_ID_PATTERNS = re.compile(
     r"(?:PMID:\d+|DOI:10\.[^\s\]\[);,]+|NCT\d{8,}|PMC\d+|OpenAlex:W\d+"
     r"|UniProt:[A-Z0-9]{4,}|PubChem:\d+|PDB:[A-Z0-9]{4}"
@@ -2285,14 +2252,7 @@ def _extract_evidence_ids_from_text(text: str) -> list[str]:
     """Regex-extract canonical evidence identifiers from prose text."""
     if not text:
         return []
-    seen: set[str] = set()
-    result: list[str] = []
-    for match in _EVIDENCE_ID_PATTERNS.finditer(text):
-        eid = match.group(0)
-        if eid not in seen:
-            seen.add(eid)
-            result.append(eid)
-    return result[:30]
+    return _extract_inline_ids_from_text(text)[:30]
 
 
 _EXECUTOR_SECTION_ALIASES = {
@@ -2445,6 +2405,13 @@ def _clean_executor_summary_text(text: str) -> str:
         line = re.sub(r"^#{1,6}\s*S\d+\s*(?:[·:-]\s*.*)?$", "", line, flags=re.IGNORECASE)
         line = re.sub(r"^(?:REASON|FINDINGS)\s*:\s*", "", line, flags=re.IGNORECASE)
         line = re.sub(r"\bFindings Summary:\s*", "", line, flags=re.IGNORECASE)
+        line = re.sub(
+            r'\{.*"(?:structured_observations|evidence_ids|step_id|result_summary|step_progress_note|schema|suggested_next_searches|open_gaps|tools_called|data_sources_queried)".*\}',
+            "",
+            line,
+            flags=re.IGNORECASE,
+        )
+        line = re.sub(r"\b(?:COMPLETED|BLOCKED|PENDING)\.?\s*$", "", line, flags=re.IGNORECASE).strip()
         if not line:
             continue
         if _normalize_executor_section_title(line) in _EXECUTOR_SECTION_ALIASES:
@@ -2625,6 +2592,36 @@ def _build_tool_log_summary(step: dict[str, Any], tool_log: list[dict[str, Any]]
     return (source_prefix + " ".join(selected)).strip()
 
 
+def _harmonize_blocked_step_summary(summary_text: str, tool_log: list[dict[str, Any]]) -> str:
+    cleaned = _clean_executor_summary_text(summary_text)
+    if not cleaned:
+        cleaned = re.sub(r"\s+", " ", str(summary_text or "").strip())
+
+    lowered = cleaned.lower()
+    if any(marker in lowered for marker in ("blocked", "could not", "unable", "partial result", "remained blocked")):
+        return cleaned
+
+    blocker_phrase = ""
+    for entry in tool_log:
+        phrase = _clean_tool_log_phrase(str(entry.get("result", "") or ""), source=str(entry.get("tool", "") or ""))
+        if not phrase:
+            phrase = _clean_tool_log_phrase(str(entry.get("summary", "") or ""), source=str(entry.get("tool", "") or ""))
+        if not phrase or "error" not in phrase.lower():
+            continue
+        blocker_phrase = _first_sentence(_sanitize_internal_report_text(phrase), max_chars=220).rstrip(".")
+        if blocker_phrase:
+            break
+
+    if blocker_phrase:
+        if cleaned:
+            return f"Partial result: {cleaned.rstrip('.')} However, the step remained blocked: {blocker_phrase}."
+        return f"Step blocked: {blocker_phrase}."
+
+    if cleaned:
+        return f"Partial result: {cleaned.rstrip('.')} However, the step remained blocked before meeting the completion condition."
+    return "Step blocked before meeting the completion condition."
+
+
 def _extract_section_items(text: str, *, limit: int = 10) -> list[str]:
     cleaned = str(text or "").strip()
     if not cleaned:
@@ -2669,6 +2666,7 @@ def _build_deterministic_step_result(
 
     evidence_inputs = [final_text, sections.get("evidence", ""), sections.get("summary", "")]
     for entry in tool_log:
+        evidence_inputs.append(str(entry.get("evidence_text", "") or ""))
         evidence_inputs.append(str(entry.get("result", "") or ""))
         evidence_inputs.append(str(entry.get("summary", "") or ""))
     evidence_ids = _dedupe_str_list(
@@ -2733,6 +2731,9 @@ def _build_deterministic_step_result(
 
     if result["status"] not in {"completed", "blocked"}:
         result["status"] = "completed"
+    if result["status"] == "blocked":
+        result["result_summary"] = _harmonize_blocked_step_summary(result["result_summary"], tool_log)
+        result["step_progress_note"] = _first_sentence(result["result_summary"], max_chars=200) or "Step blocked."
     return result
 
 
@@ -5043,51 +5044,6 @@ def _render_plan_markdown(task_state: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-def _render_executor_progress_markdown(task_state: dict[str, Any], step_result: dict[str, Any]) -> str:
-    step_id = str(step_result.get("step_id", "")).strip()
-    _, step = _find_step(task_state, step_id)
-    status = str(step.get("status", "")).strip()
-    lines = [f"## Step {step_id}", ""]
-    lines.append(f"**Goal:** {step.get('goal', '').strip()}")
-    lines.append(f"**Status:** `{status}`")
-    progress_note = str(step.get("step_progress_note", "")).strip()
-    if progress_note:
-        lines.append("")
-        lines.append(progress_note)
-    result_summary = str(step.get("result_summary", "")).strip()
-    if result_summary:
-        lines.append("")
-        lines.append("**Key Findings**")
-        lines.append(result_summary)
-    evidence_ids = [str(x).strip() for x in step.get("evidence_ids", []) if str(x).strip()]
-    if evidence_ids:
-        lines.append("")
-        lines.append("**Evidence IDs**")
-        lines.extend(f"- `{eid}`" for eid in evidence_ids[:20])
-    open_gaps = [str(x).strip() for x in step.get("open_gaps", []) if str(x).strip()]
-    if open_gaps:
-        lines.append("")
-        lines.append("**Open Gaps / Uncertainty**")
-        lines.extend(f"- {gap}" for gap in open_gaps[:10])
-    next_searches = [str(x).strip() for x in step.get("suggested_next_searches", []) if str(x).strip()]
-    if next_searches:
-        lines.append("")
-        lines.append("**Suggested Next Searches / Tool Calls**")
-        lines.extend(f"- {item}" for item in next_searches[:10])
-
-    completed = _completed_step_count(task_state)
-    total = _total_step_count(task_state)
-    next_step_id = task_state.get("current_step_id")
-    footer = f"Completed {completed}/{total} steps"
-    if next_step_id:
-        footer += f"; next: {next_step_id}"
-    elif str(task_state.get("plan_status", "")) == "completed":
-        footer += "; all planned steps complete — reply `finalize` for a final summary"
-    lines.append("")
-    lines.append(f"_Progress: {footer}_")
-    return "\n".join(lines).strip()
-
-
 
 _REACT_PHASE_LABELS = ("REASON", "ACT", "OBSERVE", "CONCLUDE")
 _REACT_PHASE_RE = re.compile(
@@ -5239,29 +5195,6 @@ def _render_react_step_progress(
 
     lines.append("---")
     return "\n".join(lines).strip()
-
-
-_STEP_PROSE_NOISE_PATTERNS = [
-    re.compile(r"^#+\s*S\d+\s*[·\-].*$", re.MULTILINE),
-    re.compile(r"^\*\*Goal:\*\*.*$", re.MULTILINE),
-    re.compile(r"^\*\*(?:Key |Detailed )?Findings\*\*\s*$", re.MULTILINE),
-    re.compile(r"^\*\*(?:Evidence|Evidence IDs|Structured Claims|Claims|Open Gaps|Tool Activity|Sources queried|ReAct Trace|Tool Trace)\*\*.*$", re.MULTILINE),
-    re.compile(r"^_Progress:.*_\s*$", re.MULTILINE),
-    re.compile(r"^\s*(?:COMPLETED|BLOCKED)\s*$", re.MULTILINE | re.IGNORECASE),
-    re.compile(r"^-{3,}\s*$", re.MULTILINE),
-    re.compile(r"^This step is (?:COMPLETED|BLOCKED)\.?\s*$", re.MULTILINE | re.IGNORECASE),
-    re.compile(r"^ACT:\s+Called\s+.+$", re.MULTILINE),
-    re.compile(r"^OBSERVE:\s+.+$", re.MULTILINE),
-]
-
-
-def _clean_step_prose(text: str) -> str:
-    """Remove redundant headings, status lines, and progress lines from model prose."""
-    cleaned = text
-    for pattern in _STEP_PROSE_NOISE_PATTERNS:
-        cleaned = pattern.sub("", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -5915,17 +5848,12 @@ def _collect_final_report_literature_ids(
     if model_references_text:
         candidates.extend(_extract_inline_ids_from_text(model_references_text))
 
-    literature_ids = [eid for eid in _dedupe_preserve_order(candidates, limit=limit) if _is_literature_id(eid)]
-    if literature_ids:
-        return literature_ids
-
     claim_summary = dict(synthesis.get("claim_synthesis_summary", {}) or {})
-    literature_ids = _collect_claim_summary_literature_ids(claim_summary, limit=limit)
-    if literature_ids:
-        return literature_ids
+    candidates.extend(_collect_claim_summary_literature_ids(claim_summary, limit=limit))
+    candidates.extend(_collect_all_evidence_ids(task_state))
 
     return [
-        eid for eid in _dedupe_preserve_order(_collect_all_evidence_ids(task_state), limit=limit)
+        eid for eid in _dedupe_preserve_order(candidates, limit=limit)
         if _is_literature_id(eid)
     ]
 
@@ -6049,6 +5977,41 @@ def _hyperlink_author_year_citations(text: str, lit_ids: list[str]) -> str:
     return protected + refs_tail
 
 
+def _inject_key_literature_fallback(text: str, lit_ids: list[str], *, max_refs: int = 3) -> str:
+    """Insert a small cited literature block when references exist but the body has none."""
+    if not text or not lit_ids:
+        return text
+
+    refs_split = re.split(r"(?m)^#{2,3} References\b", text, maxsplit=1)
+    body = refs_split[0]
+    refs_tail = ("\n## References" + refs_split[1]) if len(refs_split) > 1 else ""
+
+    if re.search(r"\]\(#ref-\d+\)", body):
+        return text
+
+    citation_snippets = [
+        _format_apa_intext_citation(ref_number, eid)
+        for ref_number, eid in enumerate(lit_ids[:max_refs], start=1)
+    ]
+    citation_snippets = [snippet for snippet in citation_snippets if snippet]
+    if not citation_snippets:
+        return text
+
+    fallback_block = (
+        "### Key Literature\n\n"
+        f"Supporting literature includes {_human_join(citation_snippets)}.\n\n"
+    )
+
+    next_steps_match = re.search(r"(?m)^### Recommended Next Steps\b", body)
+    if next_steps_match:
+        insert_at = next_steps_match.start()
+        body = body[:insert_at].rstrip() + "\n\n" + fallback_block + body[insert_at:].lstrip()
+    else:
+        body = body.rstrip() + "\n\n" + fallback_block
+
+    return body + refs_tail
+
+
 def _expand_reference_only_body_lines(text: str, lit_ids: list[str]) -> str:
     if not text or not lit_ids:
         return text
@@ -6088,128 +6051,6 @@ def _expand_reference_only_body_lines(text: str, lit_ids: list[str]) -> str:
         expanded_lines.append(f"{match.group(1) or '- '}{citation_text}")
 
     return "\n".join(expanded_lines) + refs_tail
-
-
-# ---------------------------------------------------------------------------
-# Evidence & Methodology helpers (used by _render_final_synthesis_markdown)
-# ---------------------------------------------------------------------------
-
-
-def _build_methodology_overview(task_state: dict[str, Any], completed: int, total: int, failed: int) -> str:
-    """Build the one-paragraph overview for the Evidence and Methodology section."""
-    step_summaries: list[str] = []
-    for step in task_state.get("steps", []):
-        goal = str(step.get("goal", "")).strip()
-        status = str(step.get("status", "")).strip()
-        source = _format_step_source_display(step)
-        source_note = f" via {source}" if source else ""
-        if status == "completed":
-            step_summaries.append(f"{goal}{source_note}")
-        elif status == "blocked":
-            step_summaries.append(f"{goal} (failed)")
-        else:
-            step_summaries.append(f"{goal} (not executed)")
-
-    overview_parts = [f"This investigation comprised {total} planned steps"]
-    if step_summaries:
-        overview_parts.append(": " + "; ".join(step_summaries) + ".")
-    else:
-        overview_parts.append(".")
-
-    if failed:
-        overview_parts.append(
-            f" {completed} of {total} steps completed successfully; {failed} could not be executed."
-        )
-    elif completed < total:
-        pending = total - completed
-        overview_parts.append(
-            f" {completed} of {total} steps completed; {pending} remaining when the summary was requested."
-        )
-    else:
-        overview_parts.append(f" All {total} planned steps completed successfully.")
-
-    evidence_summary = _summarize_evidence_store(task_state.get("evidence_store", {}))
-    if evidence_summary.get("evidence_count") or evidence_summary.get("claim_count"):
-        source_count = len(evidence_summary.get("sources", []) or [])
-        overview_parts.append(
-            " The workflow normalized "
-            f"{evidence_summary.get('entity_count', 0)} entities, "
-            f"{evidence_summary.get('claim_count', 0)} claims, and "
-            f"{evidence_summary.get('evidence_count', 0)} evidence records"
-            + (f" across {source_count} source(s)." if source_count else ".")
-        )
-    claim_summary = _build_claim_synthesis_summary(
-        task_state.get("evidence_store", {}),
-        str(task_state.get("objective", "")).strip(),
-    )
-    if claim_summary.get("mixed_evidence_count"):
-        overview_parts.append(
-            f" Claim adjudication flagged {claim_summary.get('mixed_evidence_count', 0)} mixed-evidence finding(s) that require cautious interpretation."
-        )
-    top_claims = claim_summary.get("top_supported_claims", []) or []
-    if top_claims:
-        lead_claim = top_claims[0]
-        overview_parts.append(
-            " The strongest adjudicated claim was "
-            f"'{lead_claim.get('statement', '')}' "
-            f"({lead_claim.get('source_count', 0)} source(s))."
-        )
-
-    return "".join(overview_parts)
-
-
-def _render_step_subsection(step: dict[str, Any]) -> list[str]:
-    """Render a ### subsection for one step in the Evidence and Methodology section."""
-    step_id = str(step.get("id", "")).strip()
-    goal = str(step.get("goal", "")).strip()
-    status = str(step.get("status", "")).strip()
-    summary = str(step.get("result_summary", "")).strip()
-    source = _format_step_source_display(step)
-    evidence_ids = [str(x).strip() for x in (step.get("evidence_ids") or []) if str(x).strip()]
-    open_gaps = [str(x).strip() for x in (step.get("open_gaps") or []) if str(x).strip()]
-
-    if status == "completed":
-        status_tag = "COMPLETED"
-    elif status == "blocked":
-        status_tag = "FAILED"
-    else:
-        status_tag = (status.upper() if status else "PENDING")
-    heading = f"### {step_id}: {goal} — {status_tag}" if step_id else f"### {goal} — {status_tag}"
-    lines = [heading, ""]
-
-    if source:
-        source_label = "Sources" if "; " in source else "Source"
-        lines.append(f"**{source_label}:** {source}")
-        lines.append("")
-
-    if status == "blocked":
-        lines.append("*This step could not be completed.*")
-        if summary:
-            lines.append(f" {summary}")
-        lines.append("")
-        return lines
-
-    if status != "completed":
-        lines.append(f"*Status: {status}*")
-        lines.append("")
-        return lines
-
-    if summary:
-        lines.append(summary)
-        lines.append("")
-
-    if evidence_ids:
-        lines.append("**Key identifiers:** " + ", ".join(evidence_ids[:10]))
-        lines.append("")
-
-    if open_gaps:
-        lines.append("**Open gaps:** " + "; ".join(open_gaps[:5]))
-        lines.append("")
-
-    return lines
-
-
-# ---------------------------------------------------------------------------
 
 
 def _normalize_top_level_heading_key(heading: str) -> str:
@@ -6255,172 +6096,6 @@ def _extract_top_level_markdown_sections(markdown: str) -> dict[str, str]:
         if body:
             sections[heading_key] = body
     return sections
-
-
-STEP_SECTION_HEADING_RE = re.compile(
-    r"^(?:###\s*)?(Step\s+\d+:\s+.+?)(?:\s*[—-]\s*(COMPLETED|FAILED|PENDING|BLOCKED))?\s*$",
-    flags=re.IGNORECASE,
-)
-STEP_FIELD_LABEL_PATTERN = r"(?:Data Source|Data source|Key Findings|Key findings|Significance|Limitations|Limiatations)"
-
-
-def _clean_step_field_text(text: str) -> str:
-    cleaned = str(text or "").strip()
-    if not cleaned:
-        return ""
-    cleaned = cleaned.replace("**", "")
-    cleaned = re.sub(r"^\*+\s*", "", cleaned)
-    cleaned = re.sub(r"^\-\s*", "", cleaned)
-    cleaned = re.sub(r"\s+\*\s+", " ", cleaned)
-    cleaned = re.sub(r"\s*\*+$", "", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if not re.search(r"[A-Za-z0-9]", cleaned):
-        return ""
-    return cleaned
-
-
-def _normalize_evidence_step_block(lines: list[str]) -> str:
-    if not lines:
-        return ""
-    heading_match = STEP_SECTION_HEADING_RE.match(str(lines[0] or "").strip())
-    if not heading_match:
-        return "\n".join(line.rstrip() for line in lines).strip()
-
-    heading = heading_match.group(1).strip()
-    status = str(heading_match.group(2) or "").strip().upper()
-    rendered: list[str] = [f"### {heading}{f' — {status}' if status else ''}", ""]
-
-    field_map = {
-        "data source": "data_source",
-        "key findings": "key_findings",
-        "significance": "significance",
-        "limitations": "limitations",
-        "limiatations": "limitations",
-    }
-    fields: dict[str, list[str]] = {
-        "data_source": [],
-        "key_findings": [],
-        "significance": [],
-        "limitations": [],
-    }
-    preamble: list[str] = []
-    active_field = ""
-
-    body_text = "\n".join(str(line or "").rstrip() for line in lines[1:])
-    body_text = re.sub(
-        rf"\*+\s*({STEP_FIELD_LABEL_PATTERN})\s*:\s*\*+",
-        r"\1:",
-        body_text,
-        flags=re.IGNORECASE,
-    )
-    body_text = re.sub(
-        rf"\*+\s*({STEP_FIELD_LABEL_PATTERN})\s*:",
-        r"\1:",
-        body_text,
-        flags=re.IGNORECASE,
-    )
-    body_text = re.sub(
-        rf"({STEP_FIELD_LABEL_PATTERN})\s*:\s*\*+",
-        r"\1:",
-        body_text,
-        flags=re.IGNORECASE,
-    )
-    body_text = re.sub(
-        rf"(?<!\n)(?=(?:{STEP_FIELD_LABEL_PATTERN}):)",
-        "\n",
-        body_text,
-        flags=re.IGNORECASE,
-    )
-
-    for raw_line in body_text.splitlines():
-        stripped = str(raw_line or "").strip()
-        if not stripped:
-            continue
-        field_match = re.match(r"^([A-Za-z ]+):\s*(.*)$", stripped)
-        if field_match:
-            label_key = field_map.get(field_match.group(1).strip().lower())
-            if label_key:
-                active_field = label_key
-                value = _clean_step_field_text(field_match.group(2))
-                if value:
-                    fields[label_key].append(value)
-                continue
-        if active_field:
-            cleaned_value = _clean_step_field_text(stripped)
-            if cleaned_value:
-                fields[active_field].append(cleaned_value)
-        else:
-            cleaned_value = _clean_step_field_text(stripped)
-            if cleaned_value:
-                preamble.append(cleaned_value)
-
-    if preamble:
-        rendered.append(" ".join(preamble))
-        rendered.append("")
-
-    data_source = " ".join(fields["data_source"]).strip()
-    if data_source:
-        rendered.append(f"**Data Source:** {data_source}")
-        rendered.append("")
-
-    key_findings = [item for item in fields["key_findings"] if item]
-    if key_findings:
-        rendered.append("**Key Findings:**")
-        for item in key_findings:
-            rendered.append(f"- {item}")
-        rendered.append("")
-
-    significance = " ".join(fields["significance"]).strip()
-    if significance:
-        rendered.append(f"**Significance:** {significance}")
-        rendered.append("")
-
-    limitations = " ".join(fields["limitations"]).strip()
-    if limitations:
-        rendered.append(f"**Limitations:** {limitations}")
-        rendered.append("")
-
-    return "\n".join(rendered).strip()
-
-
-def _normalize_evidence_section_markdown(markdown: str) -> str:
-    text = str(markdown or "").strip()
-    if not text:
-        return ""
-
-    lines = text.splitlines()
-    first_step_idx = -1
-    for idx, raw_line in enumerate(lines):
-        if STEP_SECTION_HEADING_RE.match(str(raw_line or "").strip()):
-            first_step_idx = idx
-            break
-    if first_step_idx < 0:
-        return text
-
-    preamble = "\n".join(line.rstrip() for line in lines[:first_step_idx]).strip()
-    blocks: list[list[str]] = []
-    current: list[str] = []
-    for raw_line in lines[first_step_idx:]:
-        stripped = str(raw_line or "").strip()
-        if STEP_SECTION_HEADING_RE.match(stripped):
-            if current:
-                blocks.append(current)
-            current = [raw_line]
-        else:
-            current.append(raw_line)
-    if current:
-        blocks.append(current)
-
-    rendered: list[str] = []
-    if preamble:
-        rendered.append(preamble)
-        rendered.append("")
-    for block in blocks:
-        normalized = _normalize_evidence_step_block(block)
-        if normalized:
-            rendered.append(normalized)
-            rendered.append("")
-    return "\n".join(rendered).strip()
 
 
 def _extract_markdown_list_items(markdown: str) -> list[str]:
@@ -6542,72 +6217,6 @@ def _answer_confidence_framing(
     if high_count == 1:
         return "Evidence supports that"
     return "Preliminary data indicate that"
-
-
-def _format_markdown_table_cell(value: Any) -> str:
-    if value is None:
-        return "-"
-    text = re.sub(r"\s+", " ", str(value).strip())
-    if not text:
-        return "-"
-    return text.replace("|", "\\|")
-
-
-def _render_markdown_table(headers: list[str], rows: list[list[Any]]) -> str:
-    if not headers or not rows:
-        return ""
-    cleaned_headers = [_format_markdown_table_cell(header) for header in headers]
-    lines = [
-        "| " + " | ".join(cleaned_headers) + " |",
-        "| " + " | ".join("---" for _ in cleaned_headers) + " |",
-    ]
-    for row in rows:
-        cells = [_format_markdown_table_cell(value) for value in row[: len(cleaned_headers)]]
-        if len(cells) < len(cleaned_headers):
-            cells.extend("-" for _ in range(len(cleaned_headers) - len(cells)))
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
-
-def _build_top_supported_claims_markdown(claim_summary: dict[str, Any]) -> str:
-    lines: list[str] = []
-    for claim in list(claim_summary.get("top_supported_claims", []) or [])[:5]:
-        source_text = ", ".join(list(claim.get("primary_sources", []) or [])[:3]) or "not specified"
-        suffix = "; mixed evidence" if claim.get("mixed_evidence") else ""
-        lines.append(f"- {claim.get('statement', '')} (sources: {source_text}{suffix})")
-    return "\n".join(lines)
-
-
-def _build_mixed_evidence_claims_table(claim_summary: dict[str, Any]) -> str:
-    rows: list[list[Any]] = []
-    for conflict in list(claim_summary.get("mixed_evidence_claims", []) or [])[:5]:
-        focus = " and ".join(
-            part
-            for part in [
-                str(conflict.get("subject", "")).strip(),
-                str(conflict.get("object", "")).strip(),
-            ]
-            if part
-        ) or "Claim"
-        source_fragments: list[str] = []
-        for claim in list(conflict.get("claims", []) or [])[:2]:
-            sources = ", ".join(list(claim.get("primary_sources", []) or [])[:2])
-            if sources:
-                source_fragments.append(
-                    f"{_humanize_claim_predicate(str(claim.get('predicate', '')).strip())}: {sources}"
-                )
-        rows.append(
-            [
-                focus,
-                str(conflict.get("assessment", "")).replace("_", " "),
-                conflict.get("preferred_interpretation", "") or "No clear lean",
-                "; ".join(source_fragments) or "-",
-            ]
-        )
-    return _render_markdown_table(
-        ["Claim focus", "Assessment", "Current lean", "Leading sources"],
-        rows,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -6886,126 +6495,6 @@ def _aggregate_cluster_confidence(claims: list[dict[str, Any]]) -> str:
     return "low"
 
 
-def _format_qualifier_context(qualifiers: dict[str, Any]) -> str:
-    """Render non-empty qualifiers as a compact context string."""
-    parts: list[str] = []
-    for key in ["tissue", "disease", "species", "assay", "phase", "evidence"]:
-        val = str(qualifiers.get(key, "") or "").strip()
-        if val:
-            parts.append(f"{key}: {val}")
-    return "; ".join(parts)
-
-
-def _render_finding_cluster(cluster: dict[str, Any]) -> list[str]:
-    """Render a single thematic finding cluster with adaptive presentation."""
-    variant = cluster.get("variant", "verdict")
-    title = cluster.get("title", "Finding")
-    confidence = cluster.get("confidence", "moderate")
-    claims = cluster.get("claims", [])
-    lines: list[str] = [f"### {title}", ""]
-
-    if not claims:
-        step_summary = cluster.get("step_summary", "")
-        source = cluster.get("step_source", "")
-        if step_summary:
-            source_suffix = f" (source: {source})" if source else ""
-            lines.append(f"{step_summary}{source_suffix}")
-            lines.append("")
-        return lines
-
-    source_count = len({s for c in claims for s in (c.get("primary_sources") or [])})
-    evidence_count = sum(int(c.get("evidence_count", 0) or 0) for c in claims)
-    evidence_meta: list[str] = []
-    if source_count > 0:
-        evidence_meta.append(f"{source_count} source{'s' if source_count != 1 else ''}")
-    if evidence_count > 0:
-        evidence_meta.append(f"{evidence_count} evidence record{'s' if evidence_count != 1 else ''}")
-    confidence_labels = {"high": "Strong", "moderate": "Moderate", "low": "Limited", "mixed": "Mixed"}
-    conf_label = confidence_labels.get(confidence, confidence.title())
-    meta_suffix = f" ({', '.join(evidence_meta)})" if evidence_meta else ""
-    lines.append(f"**Evidence strength:** {conf_label}{meta_suffix}")
-    lines.append("")
-
-    if variant == "tabular":
-        lines.extend(_render_finding_tabular(claims))
-    elif variant == "narrative":
-        lines.extend(_render_finding_narrative(claims))
-    else:
-        lines.extend(_render_finding_verdict(claims))
-
-    lines.append("")
-    return lines
-
-
-def _render_finding_verdict(claims: list[dict[str, Any]]) -> list[str]:
-    supporting = [c for c in claims if not c.get("mixed_evidence")]
-    conflicting = [c for c in claims if c.get("mixed_evidence")]
-    lines: list[str] = []
-    if supporting:
-        lines.append("**Supporting evidence:**")
-        for claim in supporting:
-            lines.append(_format_claim_evidence_line(claim))
-    if conflicting:
-        lines.append("")
-        lines.append("**Conflicting evidence:**")
-        for claim in conflicting:
-            source_text = ", ".join(list(claim.get("primary_sources", []) or [])[:3]) or "not specified"
-            lines.append(f"- {claim.get('statement', '')} — {source_text} (mixed evidence)")
-    return lines
-
-
-def _format_claim_evidence_line(claim: dict[str, Any]) -> str:
-    """Format a single claim as a rich evidence bullet with provenance."""
-    source_text = ", ".join(list(claim.get("primary_sources", []) or [])[:3]) or "not specified"
-    ids_text = ", ".join(list(claim.get("supporting_ids", []) or [])[:4])
-    id_suffix = f" ({ids_text})" if ids_text else ""
-    strength = str(claim.get("support_strength", "")).strip()
-    strength_suffix = f" | strength: {strength}" if strength else ""
-    qualifier_ctx = _format_qualifier_context(claim.get("qualifiers") or {})
-    qualifier_suffix = f" [{qualifier_ctx}]" if qualifier_ctx else ""
-    return f"- {claim.get('statement', '')} — {source_text}{id_suffix}{strength_suffix}{qualifier_suffix}"
-
-
-def _render_finding_tabular(claims: list[dict[str, Any]]) -> list[str]:
-    rows: list[list[Any]] = []
-    for claim in claims:
-        source_text = ", ".join(list(claim.get("primary_sources", []) or [])[:2]) or "-"
-        ids_text = ", ".join(list(claim.get("supporting_ids", []) or [])[:3]) or "-"
-        strength = str(claim.get("support_strength", "")).strip() or "-"
-        mixed = " (mixed)" if claim.get("mixed_evidence") else ""
-        qualifier_ctx = _format_qualifier_context(claim.get("qualifiers") or {})
-        subject_type = _ENTITY_TYPE_LABELS.get(str(claim.get("subject_type", "")).strip(), "")
-        subject_label = claim.get("subject", "-")
-        if subject_type and subject_type not in subject_label:
-            subject_label = f"{subject_label} ({subject_type})"
-        rows.append([
-            subject_label,
-            _humanize_claim_predicate(str(claim.get("predicate", "")).strip()),
-            claim.get("object", "-"),
-            source_text,
-            ids_text,
-            f"{strength}{mixed}",
-            qualifier_ctx or "-",
-        ])
-    table = _render_markdown_table(
-        ["Subject", "Relationship", "Object", "Source", "Identifiers", "Strength", "Context"],
-        rows,
-    )
-    return [table] if table else []
-
-
-def _render_finding_narrative(claims: list[dict[str, Any]]) -> list[str]:
-    lines: list[str] = []
-    for claim in claims:
-        source_text = ", ".join(list(claim.get("primary_sources", []) or [])[:3]) or "not specified"
-        ids_text = ", ".join(list(claim.get("supporting_ids", []) or [])[:4])
-        id_suffix = f" ({ids_text})" if ids_text else ""
-        qualifier_ctx = _format_qualifier_context(claim.get("qualifiers") or {})
-        qualifier_suffix = f" [{qualifier_ctx}]" if qualifier_ctx else ""
-        lines.append(f"{claim.get('statement', '')} ({source_text}{id_suffix}){qualifier_suffix}.")
-    return [" ".join(lines)]
-
-
 def _render_conflicting_evidence_section(claim_summary: dict[str, Any]) -> list[str]:
     """Render the Conflicting & Uncertain Evidence section."""
     conflicts = list(claim_summary.get("mixed_evidence_claims", []) or [])
@@ -7036,41 +6525,6 @@ def _render_conflicting_evidence_section(claim_summary: dict[str, Any]) -> list[
         else:
             lines.append(f"- **Current lean:** No clear preferred interpretation ({assessment})")
         lines.append(f"- **To resolve:** Validate with an orthogonal source or confirmatory experiment for {focus}.")
-        lines.append("")
-    return lines
-
-
-def _render_sources_consulted(task_state: dict[str, Any]) -> list[str]:
-    """Build Sources Consulted section from step metadata."""
-    seen: dict[str, dict[str, Any]] = {}
-    for step in task_state.get("steps", []):
-        sources = _derive_step_data_sources(step)
-        status = str(step.get("status", "")).strip()
-        goal = str(step.get("goal", "")).strip()
-        for source_name in sources:
-            if source_name in seen:
-                seen[source_name]["steps"].append(goal)
-                if status == "completed":
-                    seen[source_name]["completed"] = True
-            else:
-                seen[source_name] = {
-                    "source": source_name,
-                    "steps": [goal],
-                    "completed": status == "completed",
-                }
-    if not seen:
-        return []
-    rows: list[list[Any]] = []
-    for entry in seen.values():
-        status_text = "Queried" if entry["completed"] else "Attempted"
-        contribution = "; ".join(entry["steps"][:2])
-        if len(entry["steps"]) > 2:
-            contribution += f" (+{len(entry['steps']) - 2} more)"
-        rows.append([entry["source"], status_text, contribution])
-    lines = ["## Sources Consulted", ""]
-    table = _render_markdown_table(["Source", "Status", "Contribution"], rows)
-    if table:
-        lines.append(table)
         lines.append("")
     return lines
 
@@ -7281,6 +6735,7 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
     body_so_far = "\n".join(lines)
     body_so_far = _hyperlink_inline_ids(body_so_far, ref_map)
     body_so_far = _hyperlink_author_year_citations(body_so_far, lit_ids)
+    body_so_far = _inject_key_literature_fallback(body_so_far, lit_ids)
     body_so_far = _expand_reference_only_body_lines(body_so_far, lit_ids)
     lines = body_so_far.split("\n")
 
@@ -7693,27 +7148,6 @@ def _apply_step_execution_result_to_task_state(
     return validated
 
 
-
-def _validate_final_synthesis(raw: dict[str, Any]) -> dict[str, Any]:
-    if str(raw.get("schema", "")).strip() != FINAL_SYNTHESIS_SCHEMA:
-        raise ValueError(f"schema must be {FINAL_SYNTHESIS_SCHEMA}")
-    mode = str(raw.get("mode", "")).strip().lower()
-    if mode != "final":
-        raise ValueError("mode must be `final`")
-    coverage_status = str(raw.get("coverage_status", "")).strip().lower()
-    if coverage_status not in {"complete_plan", "partial_plan"}:
-        raise ValueError("coverage_status must be `complete_plan` or `partial_plan`")
-    return {
-        "schema": FINAL_SYNTHESIS_SCHEMA,
-        "mode": "final",
-        "coverage_status": coverage_status,
-        "direct_answer": _as_nonempty_str(raw.get("direct_answer"), "direct_answer"),
-        "supporting_evidence": _as_string_list(raw.get("supporting_evidence"), "supporting_evidence", limit=30),
-        "limitations": _as_string_list(raw.get("limitations"), "limitations", limit=20),
-        "next_actions": _as_string_list(raw.get("next_actions"), "next_actions", limit=20),
-    }
-
-
 def _make_planner_before_model_callback(*, require_approval: bool, model_name: str = PLANNER_MODEL):
     """Factory: returns a planner before-model callback.
 
@@ -8101,15 +7535,20 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
                     continue
                 tool_name = str(getattr(fr, "name", "") or "").strip()
                 result_desc = _describe_tool_result(tool_name, getattr(fr, "response", None))
+                evidence_text = _extract_tool_result_evidence_text(tool_name, getattr(fr, "response", None))
                 for entry in tool_log:
                     if entry.get("status") == "called" and entry.get("raw_tool") == tool_name:
                         entry["status"] = "done"
                         entry["result"] = result_desc
+                        if evidence_text:
+                            entry["evidence_text"] = evidence_text
                         break
                 else:
                     source = tool_registry.TOOL_SOURCE_NAMES.get(tool_name, tool_name)
-                    tool_log.append({"tool": source, "raw_tool": tool_name, "status": "done",
-                                     "summary": result_desc})
+                    entry = {"tool": source, "raw_tool": tool_name, "status": "done", "summary": result_desc}
+                    if evidence_text:
+                        entry["evidence_text"] = evidence_text
+                    tool_log.append(entry)
             break
         _set_tool_log(callback_context, tool_log)
         obs = _summarize_latest_tool_results(llm_request)
@@ -8769,6 +8208,7 @@ def _router_before_model_callback(
     the user is mid-workflow (e.g. approving a plan, continuing execution).
     """
     _clear_turn_temp_state(callback_context)
+    user_turn = _extract_user_turn_text(callback_context)
 
     task_state = _get_task_state(callback_context)
     plan_pending = bool(
@@ -8795,6 +8235,19 @@ def _router_before_model_callback(
 
     # In-workflow: bypass router LLM entirely — transfer straight to research_workflow
     if plan_pending or plan_status in ("ready", "blocked", "in_progress") or has_pending_steps:
+        transfer_part = types.Part(
+            function_call=types.FunctionCall(
+                name="transfer_to_agent",
+                args={"agent_name": "research_workflow"},
+            )
+        )
+        return LlmResponse(
+            content=types.Content(role="model", parts=[transfer_part]),
+            partial=False,
+            turn_complete=False,
+        )
+
+    if not has_report and _is_obvious_research_workflow_query(user_turn):
         transfer_part = types.Part(
             function_call=types.FunctionCall(
                 name="transfer_to_agent",

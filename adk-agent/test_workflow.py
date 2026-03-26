@@ -2313,6 +2313,21 @@ def test_clean_executor_summary_text_preserves_curie_colons_in_query_lines():
     assert "for 0005180 as the disease entity" not in cleaned
 
 
+def test_clean_executor_summary_text_strips_embedded_executor_json_fragments():
+    raw = (
+        "The gene symbol PARK8 has been resolved to its canonical identifier, LRRK2. "
+        '{"structured_observations": [{"observation_type": "gene_identifier_resolution", '
+        '"subject": {"type": "gene", "label": "PARK8"}, '
+        '"predicate": "is_alias_of", "object": {"type": "gene", "label": "LRRK2", "id": "Entrez:120892"}}]} '
+        "COMPLETED."
+    )
+    cleaned = workflow._clean_executor_summary_text(raw)
+    assert "structured_observations" not in cleaned
+    assert '{"' not in cleaned
+    assert "COMPLETED" not in cleaned
+    assert "canonical identifier, LRRK2." in cleaned
+
+
 def test_validate_structured_observations_normalizes_biolink_predicate():
     observations = workflow._validate_structured_observations([
         {
@@ -2384,6 +2399,118 @@ def test_render_final_synthesis_markdown_recovers_references_from_model_referenc
     assert "PMID: [12345678]" in rendered
 
 
+def test_collect_final_report_literature_ids_merges_rendered_model_and_task_state_sources():
+    task_state = {
+        "steps": [
+            {"evidence_ids": ["PMID:22222222", "NCT01234567"]},
+            {"evidence_ids": ["PMID:33333333"]},
+        ]
+    }
+    synthesis = {
+        "model_references_text": "1. Example. PMID:11111111",
+        "claim_synthesis_summary": {
+            "top_supported_claims": [{"supporting_ids": ["PMID:44444444"]}],
+            "mixed_evidence_claims": [],
+        },
+    }
+
+    ids = workflow._collect_final_report_literature_ids(
+        task_state,
+        synthesis,
+        "Body mentions PMID:55555555.",
+    )
+
+    assert ids == [
+        "PMID:55555555",
+        "PMID:11111111",
+        "PMID:44444444",
+        "PMID:22222222",
+        "PMID:33333333",
+    ]
+
+
+def test_build_deterministic_step_result_extracts_pmids_from_tool_log_evidence_text():
+    result = workflow._build_deterministic_step_result(
+        step={"goal": "Search PubMed for LRRK2 evidence", "tool_hint": "search_pubmed"},
+        step_id="S4",
+        final_text="Completed literature search.",
+        tool_log=[
+            {
+                "tool": "PubMed",
+                "raw_tool": "search_pubmed",
+                "status": "done",
+                "summary": "returned 10 articles (source reported 520 total matches)",
+                "evidence_text": (
+                    'PubMed search for "LRRK2 Parkinson disease":\n'
+                    "1. Example paper A\n   PMID: 12849510 | Journal A (2003)\n"
+                    "2. Example paper B\n   PMID: 34626793 | Journal B (2021)\n"
+                ),
+            }
+        ],
+    )
+
+    assert "PMID:12849510" in result["evidence_ids"]
+    assert "PMID:34626793" in result["evidence_ids"]
+
+
+def test_build_deterministic_step_result_marks_blocked_steps_as_partial_when_success_summary_is_misleading():
+    result = workflow._build_deterministic_step_result(
+        step={"goal": "Compare KRAS dependency across NSCLC and CRC cell lines", "tool_hint": "get_depmap_gene_dependency"},
+        step_id="S2",
+        final_text="This step is blocked.",
+        tool_log=[
+            {
+                "tool": "DepMap",
+                "raw_tool": "get_depmap_gene_dependency",
+                "status": "done",
+                "result": "KRAS: DepMap CRISPR dependency in 52.2% of profiled cell lines and strong selectivity.",
+            },
+            {
+                "tool": "BigQuery",
+                "raw_tool": "run_bigquery_select_query",
+                "status": "done",
+                "result": "Error in run_bigquery_select_query: Cannot access field screens on a value with type ARRAY<STRUCT<...>>",
+            },
+        ],
+        base_result={
+            "status": "blocked",
+            "result_summary": (
+                "The DepMap gene dependency for KRAS has been retrieved, showing it is a CRISPR-dependent gene "
+                "in 52.2% of profiled cell lines."
+            ),
+        },
+    )
+
+    assert result["status"] == "blocked"
+    assert result["result_summary"].startswith("Partial result:")
+    assert "remained blocked" in result["result_summary"]
+    assert "Error in run_bigquery_select_query" in result["result_summary"]
+
+
+def test_render_final_synthesis_markdown_injects_key_literature_when_body_has_no_citations(monkeypatch):
+    monkeypatch.setattr(
+        workflow,
+        "_fetch_reference_meta",
+        lambda eid: {"authors": ["Ng X. Y.", "Cao M."], "year": "2024", "title": "Example paper"},
+    )
+
+    task_state = {"objective": "Assess LRRK2 evidence", "steps": [{"evidence_ids": ["PMID:12345678"]}]}
+    synthesis = {
+        "answer": "LRRK2 is supported by the available literature.",
+        "model_findings_text": "Mechanistic and preclinical evidence support target relevance.",
+        "model_references_text": "",
+        "claim_synthesis_summary": {},
+        "limitations": [],
+        "next_actions": [],
+    }
+
+    rendered = workflow._render_final_synthesis_markdown(task_state, synthesis)
+
+    assert "### Key Literature" in rendered
+    assert "[Ng & Cao, 2024](#ref-1)" in rendered
+    assert "## References" in rendered
+
+
 def test_report_assistant_before_model_callback_includes_legacy_lookup_provenance_for_expansion_requests():
     class DummyCallbackContext:
         def __init__(self) -> None:
@@ -2425,6 +2552,55 @@ def test_report_assistant_before_model_callback_includes_legacy_lookup_provenanc
     assert "Prior lookup provenance from this report session" in instruction_text
     assert 'query="LRRK2 Parkinson\'s disease"' in instruction_text
     assert "Reuse the exact prior query string and filters" in instruction_text
+
+
+def test_router_before_model_callback_forces_research_workflow_for_complex_comparative_query():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {}
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(
+                    text=(
+                        "Why is KRAS G12C monotherapy more effective in NSCLC than colorectal cancer, "
+                        "and which combination strategies have the best biological and clinical support "
+                        "in colorectal cancer?"
+                    )
+                )],
+            )
+
+    callback_context = DummyCallbackContext()
+    llm_request = LlmRequest()
+
+    response = workflow._router_before_model_callback(
+        callback_context=callback_context,
+        llm_request=llm_request,
+    )
+
+    assert response is not None
+    call = workflow._extract_function_calls(response)[0]
+    assert call["name"] == "transfer_to_agent"
+    assert call["args"]["agent_name"] == "research_workflow"
+
+
+def test_router_before_model_callback_leaves_simple_knowledge_question_to_router_model():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {}
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="What is CRISPR?")],
+            )
+
+    callback_context = DummyCallbackContext()
+    llm_request = LlmRequest()
+
+    response = workflow._router_before_model_callback(
+        callback_context=callback_context,
+        llm_request=llm_request,
+    )
+
+    assert response is None
 
 
 def test_react_after_model_callback_stores_compact_tool_args_for_lookup_provenance():
