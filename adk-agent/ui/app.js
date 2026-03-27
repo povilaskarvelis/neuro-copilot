@@ -17,11 +17,18 @@ const state = {
   reportStatusTaskId: null,
   reportStatusText: "",
   reportStatusError: false,
+  reportPanelMode: "report",
   renderedReportTaskId: "",
   renderedReportTitle: "",
   renderedReportMarkdown: "",
   debugOpen: false,
   debugByTaskId: {},
+  graphByTaskId: {},
+  graphSearchByTaskId: {},
+  graphSelectionByTaskId: {},
+  graphCy: null,
+  graphRenderedTaskId: "",
+  graphRenderedPayload: null,
   activityExpandedByTask: {},
   handlingTerminalRunIds: new Set(),
   startingTaskIds: new Set(),
@@ -40,12 +47,46 @@ const el = {
   reportPanel: document.getElementById("reportPanel"),
   reportTitle: document.getElementById("reportTitle"),
   reportStatus: document.getElementById("reportStatus"),
+  evidenceGraphBtn: document.getElementById("evidenceGraphBtn"),
   reportContent: document.getElementById("reportContent"),
+  graphPanel: document.getElementById("graphPanel"),
+  graphSearchInput: document.getElementById("graphSearchInput"),
+  graphFitBtn: document.getElementById("graphFitBtn"),
+  graphResetBtn: document.getElementById("graphResetBtn"),
+  graphLegend: document.getElementById("graphLegend"),
+  graphCanvas: document.getElementById("graphCanvas"),
+  graphInspector: document.getElementById("graphInspector"),
   debugToggleBtn: document.getElementById("debugToggleBtn"),
   debugPanel: document.getElementById("debugPanel"),
   debugSummary: document.getElementById("debugSummary"),
   debugJson: document.getElementById("debugJson"),
   exportPdfBtn: document.getElementById("exportPdfBtn"),
+};
+
+const GRAPH_NODE_TYPE_COLORS = {
+  objective: "#ffd166",
+  source: "#8ec5ff",
+  query_focus: "#ffcf70",
+  support_cluster: "#4f627c",
+  compound: "#7dd8ff",
+  gene: "#6fb7ff",
+  protein: "#8a93ff",
+  disease: "#ff8b82",
+  phenotype: "#ffb062",
+  pathway: "#6be6be",
+  trial: "#f7d96b",
+  paper: "#d6a8ff",
+  dataset: "#8ce085",
+  tissue: "#59d8c8",
+  cell_line: "#f5a7b8",
+  study: "#c5d06f",
+  literal: "#9ea7b3",
+  record: "#9ea7b3",
+};
+
+const GRAPH_EDGE_COLORS = {
+  default: "#8da2b8",
+  mixed: "#f3b46f",
 };
 
 function formatDate(iso) {
@@ -1182,10 +1223,31 @@ function currentDebugTaskId() {
   return String(iteration?.task?.task_id || "").trim();
 }
 
+function currentGraphTaskId() {
+  return currentDebugTaskId();
+}
+
+function destroyGraphInstance() {
+  if (state.graphCy && typeof state.graphCy.destroy === "function") {
+    state.graphCy.destroy();
+  }
+  state.graphCy = null;
+  state.graphRenderedTaskId = "";
+  state.graphRenderedPayload = null;
+  if (el.graphCanvas) {
+    el.graphCanvas.innerHTML = "";
+    el.graphCanvas.className = "graph-canvas";
+  }
+  if (el.graphInspector) {
+    el.graphInspector.innerHTML = "";
+  }
+}
+
 function clearRenderedReportPanel() {
   state.renderedReportTaskId = "";
   state.renderedReportTitle = "";
   state.renderedReportMarkdown = "";
+  destroyGraphInstance();
   el.reportTitle.textContent = "Research Report";
   el.reportContent.innerHTML = "";
 }
@@ -1254,6 +1316,880 @@ function countCollectionItems(value) {
 
 function escapePreformattedJson(value) {
   return escapeHtml(JSON.stringify(value || {}, null, 2));
+}
+
+function graphTypeColor(type) {
+  return GRAPH_NODE_TYPE_COLORS[String(type || "").trim()] || GRAPH_NODE_TYPE_COLORS.record;
+}
+
+function graphEdgeColor(mixed = false) {
+  return mixed ? GRAPH_EDGE_COLORS.mixed : GRAPH_EDGE_COLORS.default;
+}
+
+function graphLegendHtml(payload = null) {
+  const nodes = Array.isArray(payload?.elements?.nodes) ? payload.elements.nodes : [];
+  const hiddenNodeTypes = new Set(["query_focus", "objective", "source", "support_cluster"]);
+  const orderedVisibleTypes = [
+    "compound",
+    "gene",
+    "protein",
+    "disease",
+    "phenotype",
+    "trial",
+    "paper",
+    "dataset",
+    "pathway",
+    "tissue",
+    "cell_line",
+    "study",
+    "literal",
+    "record",
+  ];
+  const presentTypes = [...new Set(
+    nodes
+      .map((node) => String(node?.data?.type || "").trim())
+      .filter((type) => type && !hiddenNodeTypes.has(type))
+  )];
+  const nodeTypes = presentTypes.length
+    ? [
+      ...orderedVisibleTypes.filter((type) => presentTypes.includes(type)),
+      ...presentTypes.filter((type) => !orderedVisibleTypes.includes(type)).sort(),
+    ]
+    : ["compound", "gene", "disease", "trial", "paper", "dataset"];
+  return [
+    ...nodeTypes.map((type) => `
+      <span class="graph-legend-item">
+        <span class="graph-legend-swatch" style="background:${graphTypeColor(type)}"></span>
+        ${escapeHtml(type.replaceAll("_", " "))}
+      </span>
+    `),
+  ].join("");
+}
+
+function renderGraphCanvasState(kind, title, copy) {
+  if (!el.graphCanvas) return;
+  el.graphCanvas.className = `graph-canvas is-${kind}`;
+  el.graphCanvas.innerHTML = `
+    <div class="graph-empty-state">
+      <h4 class="graph-empty-title">${escapeHtml(title)}</h4>
+      <p class="graph-empty-copy">${escapeHtml(copy)}</p>
+    </div>
+  `;
+}
+
+function graphEmptyStateContent(payload) {
+  const mode = String(payload?.mode || "semantic").trim();
+  if (mode === "support_topology") {
+    return {
+      title: "No evidence topology yet",
+      copy: "This session has not captured graphable evidence yet.",
+    };
+  }
+  return {
+    title: "No semantic claims yet",
+    copy: "This session does not currently contain graphable semantic claims.",
+  };
+}
+
+function summarizeGraphWarnings(warnings = []) {
+  const lines = (Array.isArray(warnings) ? warnings : []).map((item) => String(item || "").trim()).filter(Boolean);
+  if (!lines.length) return "";
+  return `
+    <div class="graph-inspector-section">
+      <h4>Notes</h4>
+      <div class="graph-chip-list">
+        ${lines.map((line) => `<span class="graph-chip is-warn">${escapeHtml(line)}</span>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function graphSummaryMetrics(payload) {
+  const summary = payload?.summary && typeof payload.summary === "object" ? payload.summary : {};
+  const elements = payload?.elements && typeof payload.elements === "object" ? payload.elements : {};
+  const nodes = Array.isArray(elements.nodes) ? elements.nodes : [];
+  const edges = Array.isArray(elements.edges) ? elements.edges : [];
+  const mode = String(payload?.mode || "semantic").trim();
+  const nodeCount = Number(summary.node_count || nodes.length || 0);
+  const edgeCount = Number(summary.edge_count || edges.length || 0);
+  if (mode === "support_topology") {
+    return [
+      { label: "Nodes", value: String(nodeCount) },
+      { label: "Links", value: String(edgeCount) },
+    ];
+  }
+  return [
+    { label: "Nodes", value: String(nodeCount) },
+    { label: "Claims", value: String(edgeCount) },
+  ];
+}
+
+function graphSummaryInspectorHtml(payload) {
+  const summary = payload?.summary && typeof payload.summary === "object" ? payload.summary : {};
+  const warnings = Array.isArray(payload?.warnings) ? payload.warnings : [];
+  const mode = String(payload?.mode || "semantic").trim();
+  const metrics = graphSummaryMetrics(payload);
+  const description = mode === "support_topology"
+    ? "This report did not capture structured semantic claims, so the graph is showing support topology for any captured evidence in the session."
+    : "Select a node or edge to inspect the underlying evidence. This view hides workflow scaffolding and focuses on semantic claims.";
+  return `
+    <div class="graph-inspector-card">
+      <div>
+        <div class="graph-inspector-kicker">Evidence Graph</div>
+        <h4 class="graph-inspector-title">Session overview</h4>
+      </div>
+      <p class="graph-inspector-copy">${escapeHtml(description)}</p>
+      <div class="graph-inspector-grid">
+        ${metrics.map((item) => `
+          <div class="graph-inspector-metric">
+            <span class="graph-inspector-label">${escapeHtml(item.label)}</span>
+            <span class="graph-inspector-value">${escapeHtml(item.value)}</span>
+          </div>
+        `).join("")}
+      </div>
+      ${summarizeGraphWarnings(warnings)}
+    </div>
+  `;
+}
+
+function graphMetricHtml(items = []) {
+  const metrics = (Array.isArray(items) ? items : []).filter((item) => item && String(item.value || "").trim() !== "");
+  if (!metrics.length) return "";
+  return `
+    <div class="graph-inspector-grid">
+      ${metrics.map((item) => `
+        <div class="graph-inspector-metric">
+          <span class="graph-inspector-label">${escapeHtml(item.label)}</span>
+          <span class="graph-inspector-value">${escapeHtml(item.value)}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function graphChipListHtml(items = [], { warn = false } = {}) {
+  const lines = (Array.isArray(items) ? items : []).map((item) => String(item || "").trim()).filter(Boolean);
+  if (!lines.length) return "";
+  return `
+    <div class="graph-chip-list">
+      ${lines.map((line) => `<span class="graph-chip ${warn ? "is-warn" : ""}">${escapeHtml(line)}</span>`).join("")}
+    </div>
+  `;
+}
+
+function graphAttrsToLines(attrs) {
+  const payload = attrs && typeof attrs === "object" ? attrs : {};
+  return Object.entries(payload)
+    .map(([key, value]) => {
+      if (value == null || value === "" || (Array.isArray(value) && !value.length)) return "";
+      const rendered = Array.isArray(value) ? value.join(", ") : (typeof value === "object" ? JSON.stringify(value) : String(value));
+      return `${key.replaceAll("_", " ")}: ${rendered}`;
+    })
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function graphSelectionForTask(taskId) {
+  return state.graphSelectionByTaskId[String(taskId || "").trim()] || null;
+}
+
+function setGraphSelection(taskId, selection) {
+  const normalizedTaskId = String(taskId || "").trim();
+  if (!normalizedTaskId) return;
+  if (selection) state.graphSelectionByTaskId[normalizedTaskId] = selection;
+  else delete state.graphSelectionByTaskId[normalizedTaskId];
+}
+
+function graphNeighborItems(cy, nodeId) {
+  if (!cy || !nodeId) return [];
+  return cy.getElementById(nodeId)
+    .connectedEdges()
+    .map((edge) => edge.data())
+    .sort((left, right) => (
+      Number(right.evidence_count || 0) - Number(left.evidence_count || 0)
+      || ((right.primary_sources?.length || 0) - (left.primary_sources?.length || 0))
+      || String(left.statement || left.label || "").localeCompare(String(right.statement || right.label || ""))
+    ))
+    .slice(0, 8)
+    .map((data) => ({
+      title: data.statement || data.label || "Connected claim",
+      body: [
+        `${Number(data.evidence_count || 0)} record${Number(data.evidence_count || 0) === 1 ? "" : "s"}`,
+        data.primary_sources?.length ? data.primary_sources.slice(0, 2).join(", ") : "",
+      ].filter(Boolean).join(" | "),
+    }));
+}
+
+function graphNodeInspectorHtml(taskId, nodeData) {
+  const aliases = Array.isArray(nodeData?.aliases) ? nodeData.aliases : [];
+  const attrLines = graphAttrsToLines(nodeData?.attrs);
+  const neighborLines = graphNeighborItems(state.graphCy, nodeData?.id);
+  return `
+    <div class="graph-inspector-card">
+      <div>
+        <div class="graph-inspector-kicker">Node</div>
+        <h4 class="graph-inspector-title">${escapeHtml(String(nodeData?.full_label || nodeData?.label || "Node"))}</h4>
+      </div>
+      ${graphMetricHtml([
+        { label: "Type", value: String(nodeData?.type || "record").replaceAll("_", " ") },
+        { label: "Neighbors", value: String(nodeData?.degree || 0) },
+        { label: "Connections", value: String(nodeData?.connected_claim_count || 0) },
+      ])}
+      ${aliases.length ? `
+        <div class="graph-inspector-section">
+          <h4>Aliases</h4>
+          ${graphChipListHtml(aliases)}
+        </div>
+      ` : ""}
+      ${attrLines.length ? `
+        <div class="graph-inspector-section">
+          <h4>Attributes</h4>
+          ${graphChipListHtml(attrLines)}
+        </div>
+      ` : ""}
+      ${neighborLines.length ? `
+        <div class="graph-inspector-section">
+          <h4>Connected relationships</h4>
+          <div class="graph-inspector-list">
+            ${neighborLines.map((item) => `
+              <div class="graph-inspector-list-item">
+                <p><strong>${escapeHtml(item.title)}</strong></p>
+                <p>${escapeHtml(item.body)}</p>
+              </div>
+            `).join("")}
+          </div>
+        </div>
+      ` : ""}
+      ${summarizeGraphWarnings([])}
+    </div>
+  `;
+}
+
+function graphEdgeInspectorHtml(edgeData) {
+  const sources = Array.isArray(edgeData?.primary_sources) ? edgeData.primary_sources : [];
+  const ids = Array.isArray(edgeData?.supporting_ids) ? edgeData.supporting_ids : [];
+  const qualifiers = Array.isArray(edgeData?.qualifiers) ? edgeData.qualifiers : [];
+  return `
+    <div class="graph-inspector-card">
+      <div>
+        <div class="graph-inspector-kicker">Relationship</div>
+        <h4 class="graph-inspector-title">${escapeHtml(String(edgeData?.statement || edgeData?.label || "Relationship"))}</h4>
+      </div>
+      <p class="graph-inspector-copy">Predicate: ${escapeHtml(String(edgeData?.predicate || edgeData?.label || "related_to").replaceAll("_", " "))}</p>
+      ${graphMetricHtml([
+        { label: "Confidence", value: String(edgeData?.confidence || "unknown") },
+        { label: "Records", value: String(edgeData?.evidence_count || 0) },
+        { label: "Sources", value: String((Array.isArray(edgeData?.primary_sources) ? edgeData.primary_sources.length : 0)) },
+      ])}
+      ${sources.length ? `
+        <div class="graph-inspector-section">
+          <h4>Primary sources</h4>
+          ${graphChipListHtml(sources)}
+        </div>
+      ` : ""}
+      ${ids.length ? `
+        <div class="graph-inspector-section">
+          <h4>Supporting identifiers</h4>
+          ${graphChipListHtml(ids)}
+        </div>
+      ` : ""}
+      ${qualifiers.length ? `
+        <div class="graph-inspector-section">
+          <h4>Qualifiers</h4>
+          ${graphChipListHtml(qualifiers)}
+        </div>
+      ` : ""}
+      ${edgeData?.mixed_evidence ? `
+        <div class="graph-inspector-section">
+          <h4>Mixed evidence</h4>
+          ${graphChipListHtml(["Conflicting evidence exists for this relationship."], { warn: true })}
+        </div>
+      ` : ""}
+    </div>
+  `;
+}
+
+function updateGraphInspector(taskId) {
+  if (!el.graphInspector) return;
+  const taskGraph = state.graphByTaskId[String(taskId || "").trim()]?.data || null;
+  const selection = graphSelectionForTask(taskId);
+  if (!selection || !taskGraph) {
+    el.graphInspector.innerHTML = graphSummaryInspectorHtml(taskGraph || {});
+    return;
+  }
+  if (selection.kind === "node") {
+    el.graphInspector.innerHTML = graphNodeInspectorHtml(taskId, selection.data || {});
+    return;
+  }
+  if (selection.kind === "edge") {
+    el.graphInspector.innerHTML = graphEdgeInspectorHtml(selection.data || {});
+    return;
+  }
+  el.graphInspector.innerHTML = graphSummaryInspectorHtml(taskGraph || {});
+}
+
+function buildGraphElements(payload) {
+  const elements = payload?.elements && typeof payload.elements === "object" ? payload.elements : {};
+  const nodes = (Array.isArray(elements.nodes) ? elements.nodes : []).map((node) => {
+    const data = node?.data && typeof node.data === "object" ? { ...node.data } : {};
+    const degree = Number(data.degree || 0);
+    const connectedClaims = Number(data.connected_claim_count || 0);
+    data.is_focus = Number(data.is_focus || 0) > 0 ? 1 : 0;
+    data.focus_rank = Number(data.focus_rank || 0);
+    data.focus_score = Number(data.focus_score || 0);
+    data.support_weight = Number(data.support_weight || 0);
+    data.color = graphTypeColor(data.type);
+    data.size = Math.max(20, Math.min(44, 20 + (degree * 2.2) + (connectedClaims * 1.1) + (data.is_focus ? 6 : 0)));
+    return { data };
+  });
+  const edges = (Array.isArray(elements.edges) ? elements.edges : []).map((edge) => {
+    const data = edge?.data && typeof edge.data === "object" ? { ...edge.data } : {};
+    const evidenceCount = Number(data.evidence_count || 0);
+    const sourceCount = Array.isArray(data.primary_sources) ? data.primary_sources.length : 0;
+    data.color = graphEdgeColor(data.mixed_evidence);
+    data.width = Math.max(2.4, Math.min(6.8, 2.4 + (evidenceCount * 0.5) + (sourceCount * 0.2)));
+    data.is_mixed = data.mixed_evidence ? 1 : 0;
+    return { data };
+  });
+  return { nodes, edges };
+}
+
+function graphFocusNodeIds(payload, graphElements) {
+  const summary = payload?.summary && typeof payload.summary === "object" ? payload.summary : {};
+  const fromSummary = Array.isArray(summary.focus_node_ids) ? summary.focus_node_ids : [];
+  const normalized = fromSummary.map((value) => String(value || "").trim()).filter(Boolean);
+  if (normalized.length) return normalized;
+  return (Array.isArray(graphElements?.nodes) ? graphElements.nodes : [])
+    .map((node) => node?.data && typeof node.data === "object" ? node.data : null)
+    .filter((data) => data && Number(data.is_focus || 0) > 0)
+    .map((data) => String(data.id || "").trim())
+    .filter(Boolean);
+}
+
+function computeGraphFocusDistances(cy, focusIds) {
+  const distances = {};
+  const queue = [];
+  const seen = new Set();
+  for (const rawId of focusIds) {
+    const nodeId = String(rawId || "").trim();
+    if (!nodeId || seen.has(nodeId)) continue;
+    const node = cy.getElementById(nodeId);
+    if (!node || node.empty() || !node.isNode()) continue;
+    distances[nodeId] = 0;
+    queue.push(nodeId);
+    seen.add(nodeId);
+  }
+  while (queue.length) {
+    const currentId = queue.shift();
+    const currentNode = cy.getElementById(currentId);
+    const currentDistance = Number(distances[currentId] || 0);
+    currentNode.connectedEdges().forEach((edge) => {
+      edge.connectedNodes().forEach((neighbor) => {
+        const neighborId = String(neighbor.id() || "").trim();
+        if (!neighborId || seen.has(neighborId)) return;
+        seen.add(neighborId);
+        distances[neighborId] = currentDistance + 1;
+        queue.push(neighborId);
+      });
+    });
+  }
+  return distances;
+}
+
+function assignGraphFocusGroups(cy, focusIds) {
+  const focusSet = new Set(focusIds.map((value) => String(value || "").trim()).filter(Boolean));
+  const groups = {};
+  const queue = [];
+  for (const focusId of focusSet) {
+    const node = cy.getElementById(focusId);
+    if (!node || node.empty() || !node.isNode()) continue;
+    groups[focusId] = focusId;
+    queue.push(focusId);
+  }
+  while (queue.length) {
+    const currentId = queue.shift();
+    const currentNode = cy.getElementById(currentId);
+    const groupId = groups[currentId];
+    currentNode.connectedEdges().forEach((edge) => {
+      edge.connectedNodes().forEach((neighbor) => {
+        const neighborId = String(neighbor.id() || "").trim();
+        if (!neighborId || Object.prototype.hasOwnProperty.call(groups, neighborId)) return;
+        groups[neighborId] = groupId;
+        queue.push(neighborId);
+      });
+    });
+  }
+  return groups;
+}
+
+function polarToPosition(radius, angle) {
+  return {
+    x: Math.cos(angle) * radius,
+    y: Math.sin(angle) * radius,
+  };
+}
+
+function applyFocusAnchoredPositions(cy, payload, graphElements) {
+  const focusIds = graphFocusNodeIds(payload, graphElements);
+  if (!focusIds.length) return false;
+
+  const distances = computeGraphFocusDistances(cy, focusIds);
+  const groups = assignGraphFocusGroups(cy, focusIds);
+  const focusCount = focusIds.length;
+  const focusRadius = focusCount > 1 ? Math.max(92, 42 * focusCount) : 0;
+  const baseRingRadius = focusCount > 1 ? focusRadius + 148 : 220;
+  const ringGap = 156;
+  const positions = {};
+
+  focusIds.forEach((focusId, index) => {
+    const node = cy.getElementById(focusId);
+    if (!node || node.empty() || !node.isNode()) return;
+    if (focusCount === 1) {
+      positions[focusId] = { x: 0, y: 0 };
+      return;
+    }
+    const angle = (-Math.PI / 2) + ((Math.PI * 2 * index) / focusCount);
+    positions[focusId] = polarToPosition(focusRadius, angle);
+  });
+
+  const groupedLayers = new Map();
+  cy.nodes().forEach((node) => {
+    const nodeId = String(node.id() || "").trim();
+    if (!nodeId || focusIds.includes(nodeId)) return;
+    const distance = Object.prototype.hasOwnProperty.call(distances, nodeId)
+      ? Math.max(1, Number(distances[nodeId] || 1))
+      : 4;
+    const groupId = String(groups[nodeId] || focusIds[0] || "ungrouped");
+    const key = `${groupId}::${distance}`;
+    if (!groupedLayers.has(key)) groupedLayers.set(key, []);
+    groupedLayers.get(key).push(node);
+  });
+
+  const focusOrder = new Map(focusIds.map((nodeId, index) => [nodeId, index]));
+  const layerEntries = Array.from(groupedLayers.entries()).sort((left, right) => {
+    const [leftGroup, leftDistance] = left[0].split("::");
+    const [rightGroup, rightDistance] = right[0].split("::");
+    return (
+      (Number(focusOrder.get(leftGroup) ?? 0) - Number(focusOrder.get(rightGroup) ?? 0))
+      || (Number(leftDistance) - Number(rightDistance))
+    );
+  });
+
+  for (const [key, nodes] of layerEntries) {
+    const [groupId, rawDistance] = key.split("::");
+    const distance = Math.max(1, Number(rawDistance || 1));
+    const groupIndex = Number(focusOrder.get(groupId) ?? 0);
+    const centerAngle = (-Math.PI / 2) + ((Math.PI * 2 * groupIndex) / Math.max(1, focusCount));
+    const wedge = focusCount > 1 ? Math.min((Math.PI * 1.45) / focusCount, Math.PI / 1.8) : Math.PI * 1.65;
+    const radius = baseRingRadius + ((distance - 1) * ringGap);
+    const sortedNodes = [...nodes].sort((left, right) => {
+      const leftWeight = Number(left.data("support_weight") || 0) + Number(left.data("connected_claim_count") || 0);
+      const rightWeight = Number(right.data("support_weight") || 0) + Number(right.data("connected_claim_count") || 0);
+      return rightWeight - leftWeight;
+    });
+    const step = sortedNodes.length > 1 ? wedge / (sortedNodes.length - 1) : 0;
+    sortedNodes.forEach((node, index) => {
+      const angle = sortedNodes.length === 1
+        ? centerAngle
+        : centerAngle - (wedge / 2) + (step * index);
+      positions[node.id()] = polarToPosition(radius, angle);
+    });
+  }
+
+  cy.layout({
+    name: "preset",
+    fit: true,
+    padding: 82,
+    positions: (node) => positions[node.id()] || { x: 0, y: 0 },
+    animate: "end",
+    animationDuration: 420,
+  }).run();
+  return true;
+}
+
+function runEvidenceGraphLayout(cy, payload, graphElements) {
+  if (!cy) return;
+  if (!cy.nodes().length) return;
+  if (!cy.edges().length) {
+    cy.layout({
+      name: "circle",
+      animate: "end",
+      animationDuration: 280,
+      fit: true,
+      padding: 78,
+      avoidOverlap: true,
+      spacingFactor: 1.38,
+    }).run();
+    return;
+  }
+
+  const focusIds = graphFocusNodeIds(payload, graphElements);
+  if (!focusIds.length) {
+    cy.layout({
+      name: "cose",
+      animate: "end",
+      animationDuration: 380,
+      fit: true,
+      padding: 76,
+      nodeRepulsion: 13600,
+      idealEdgeLength: 172,
+      edgeElasticity: 96,
+      gravity: 0.42,
+      numIter: 1200,
+    }).run();
+    return;
+  }
+  if (applyFocusAnchoredPositions(cy, payload, graphElements)) return;
+
+  cy.layout({
+    name: "cose",
+    animate: "end",
+    animationDuration: 380,
+    fit: true,
+    padding: 76,
+    nodeRepulsion: 13600,
+    idealEdgeLength: 172,
+    edgeElasticity: 96,
+    gravity: 0.42,
+    numIter: 1200,
+  }).run();
+}
+
+function clearGraphClasses(cy) {
+  if (!cy) return;
+  cy.elements().removeClass("is-dimmed is-highlighted is-search-match is-selected is-selected-neighbor is-selected-connection");
+}
+
+function applyGraphNeighborhoodFocus(cy, focused) {
+  if (!cy) return;
+  clearGraphClasses(cy);
+  if (!focused || focused.empty()) return;
+  cy.elements().addClass("is-dimmed");
+  focused.removeClass("is-dimmed").addClass("is-highlighted");
+  if (typeof focused.neighborhood === "function") {
+    focused.neighborhood().removeClass("is-dimmed").addClass("is-highlighted");
+  }
+}
+
+function applyGraphSelectionHighlight(cy, selection) {
+  if (!cy) return;
+  cy.elements().removeClass("is-selected is-selected-neighbor is-selected-connection");
+  if (!selection || !selection.kind) return;
+  if (selection.kind === "node") {
+    const nodeId = String(selection?.data?.id || "").trim();
+    const node = nodeId ? cy.getElementById(nodeId) : null;
+    if (!node || node.empty() || !node.isNode()) return;
+    node.addClass("is-selected");
+    node.connectedEdges().addClass("is-selected-connection");
+    node.connectedEdges().connectedNodes().not(node).addClass("is-selected-neighbor");
+    return;
+  }
+  if (selection.kind === "edge") {
+    const edgeId = String(selection?.data?.id || "").trim();
+    const edge = edgeId ? cy.getElementById(edgeId) : null;
+    if (!edge || edge.empty() || !edge.isEdge()) return;
+    edge.addClass("is-selected");
+    edge.connectedNodes().addClass("is-selected-neighbor");
+  }
+}
+
+function applyGraphSearch(taskId, term, { refit = true } = {}) {
+  const cy = state.graphCy;
+  if (!cy || state.graphRenderedTaskId !== String(taskId || "").trim()) return;
+  const normalized = String(term || "").trim().toLowerCase();
+  const selection = graphSelectionForTask(taskId);
+  state.graphSearchByTaskId[String(taskId || "").trim()] = term;
+  cy.elements().removeClass("is-search-match");
+  if (!normalized) {
+    clearGraphClasses(cy);
+    if (selection?.kind === "node") {
+      const nodeId = String(selection?.data?.id || "").trim();
+      const node = nodeId ? cy.getElementById(nodeId) : null;
+      if (node && !node.empty() && node.isNode()) {
+        applyGraphNeighborhoodFocus(cy, node.union(node.connectedEdges()).union(node.connectedEdges().connectedNodes()));
+      }
+    } else if (selection?.kind === "edge") {
+      const edgeId = String(selection?.data?.id || "").trim();
+      const edge = edgeId ? cy.getElementById(edgeId) : null;
+      if (edge && !edge.empty() && edge.isEdge()) {
+        applyGraphNeighborhoodFocus(cy, edge.union(edge.connectedNodes()));
+      }
+    }
+    applyGraphSelectionHighlight(cy, selection);
+    return;
+  }
+  const matches = cy.nodes().filter((node) => {
+    const data = node.data() || {};
+    const aliases = Array.isArray(data.aliases) ? data.aliases.join(" ") : "";
+    return [data.full_label, data.label, aliases]
+      .map((value) => String(value || "").toLowerCase())
+      .some((value) => value.includes(normalized));
+  });
+  if (matches.empty()) {
+    clearGraphClasses(cy);
+    applyGraphSelectionHighlight(cy, selection);
+    return;
+  }
+  cy.elements().addClass("is-dimmed");
+  matches.removeClass("is-dimmed").addClass("is-search-match");
+  matches.connectedEdges().removeClass("is-dimmed").addClass("is-search-match");
+  matches.connectedEdges().connectedNodes().removeClass("is-dimmed").addClass("is-search-match");
+  applyGraphSelectionHighlight(cy, selection);
+  if (refit) {
+    cy.animate({
+      fit: { eles: matches, padding: 90 },
+      duration: 260,
+    });
+  }
+}
+
+function initializeEvidenceGraph(taskId, payload) {
+  if (!el.graphCanvas) return;
+  if (typeof window.cytoscape !== "function") {
+    renderGraphCanvasState("error", "Graph library unavailable", "Cytoscape did not load in the browser.");
+    if (el.graphInspector) {
+      el.graphInspector.innerHTML = graphSummaryInspectorHtml({
+        summary: { node_count: 0, edge_count: 0, evidence_count: 0, mixed_edge_count: 0 },
+        warnings: ["Cytoscape failed to load."],
+      });
+    }
+    return;
+  }
+
+  const normalizedTaskId = String(taskId || "").trim();
+  const graphElements = buildGraphElements(payload);
+  if (!graphElements.nodes.length) {
+    destroyGraphInstance();
+    const emptyState = graphEmptyStateContent(payload);
+    renderGraphCanvasState("empty", emptyState.title, emptyState.copy);
+    updateGraphInspector(normalizedTaskId);
+    return;
+  }
+
+  if (state.graphCy) {
+    state.graphCy.destroy();
+  }
+
+  el.graphCanvas.className = "graph-canvas";
+  el.graphCanvas.innerHTML = "";
+  state.graphCy = window.cytoscape({
+    container: el.graphCanvas,
+    elements: [...graphElements.nodes, ...graphElements.edges],
+    wheelSensitivity: 0.18,
+    style: [
+      {
+        selector: "node",
+        style: {
+          "background-color": "data(color)",
+          width: "data(size)",
+          height: "data(size)",
+          label: "data(label)",
+          color: "#f3f7fd",
+          "font-size": 9.25,
+          "font-weight": 600,
+          "text-valign": "top",
+          "text-halign": "center",
+          "text-margin-y": -8,
+          "text-wrap": "wrap",
+          "text-max-width": 92,
+          "text-outline-color": "#0d1117",
+          "text-outline-width": 3.1,
+          "border-color": "#d8e6ff",
+          "border-width": 0.6,
+          "overlay-opacity": 0,
+        },
+      },
+      {
+        selector: "node[is_focus > 0]",
+        style: {
+          "border-width": 2.6,
+          "border-color": "#ffd98a",
+          "shadow-blur": 24,
+          "shadow-color": "#ffcf70",
+          "shadow-opacity": 0.3,
+          "font-size": 10.2,
+        },
+      },
+      {
+        selector: "node.is-selected",
+        style: {
+          width: "mapData(size, 20, 44, 28, 56)",
+          height: "mapData(size, 20, 44, 28, 56)",
+          "border-width": 4.8,
+          "border-color": "#fff5c2",
+          "shadow-blur": 42,
+          "shadow-color": "#ffe59a",
+          "shadow-opacity": 0.64,
+          "background-blacken": -0.16,
+          "text-outline-width": 4.6,
+          "font-size": 10.8,
+          "z-index": 9999,
+        },
+      },
+      {
+        selector: "node.is-selected-neighbor",
+        style: {
+          "border-width": 2.2,
+          "border-color": "#f0dca4",
+          "shadow-blur": 18,
+          "shadow-color": "#e4c46f",
+          "shadow-opacity": 0.22,
+          opacity: 0.88,
+        },
+      },
+      {
+        selector: "edge",
+        style: {
+          width: "data(width)",
+          "line-color": "data(color)",
+          "target-arrow-color": "data(color)",
+          "target-arrow-shape": "triangle",
+          "arrow-scale": 0.85,
+          "curve-style": "bezier",
+          opacity: 0.92,
+        },
+      },
+      {
+        selector: "edge.is-selected",
+        style: {
+          width: "mapData(width, 2, 7, 4.4, 9.4)",
+          "line-color": "data(color)",
+          "target-arrow-color": "data(color)",
+          "arrow-scale": 1.06,
+          opacity: 1,
+          "z-index": 9999,
+        },
+      },
+      {
+        selector: "edge.is-selected-neighbor",
+        style: {
+          opacity: 0.98,
+        },
+      },
+      {
+        selector: "edge.is-selected-connection",
+        style: {
+          width: "mapData(width, 2, 7, 4.1, 8.8)",
+          "line-color": "data(color)",
+          "target-arrow-color": "data(color)",
+          "arrow-scale": 0.98,
+          opacity: 1,
+          "z-index": 9998,
+        },
+      },
+      {
+        selector: "edge[is_mixed > 0]",
+        style: {
+          "line-style": "dashed",
+        },
+      },
+      {
+        selector: ".is-dimmed",
+        style: {
+          opacity: 0.08,
+        },
+      },
+      {
+        selector: "node.is-dimmed",
+        style: {
+          "background-blacken": 0.52,
+          "border-color": "#465262",
+          "text-opacity": 0.24,
+          "text-outline-opacity": 0.14,
+        },
+      },
+      {
+        selector: "edge.is-dimmed",
+        style: {
+          opacity: 0.06,
+        },
+      },
+      {
+        selector: ".is-highlighted",
+        style: {
+          opacity: 1,
+          "border-width": 2,
+          "border-color": "#ffffff",
+          "shadow-blur": 22,
+          "shadow-color": "#7aa1d8",
+          "shadow-opacity": 0.38,
+        },
+      },
+      {
+        selector: ".is-search-match",
+        style: {
+          opacity: 1,
+          "border-width": 2,
+          "border-color": "#ffe7bc",
+          "shadow-blur": 18,
+          "shadow-color": "#ffca7a",
+          "shadow-opacity": 0.35,
+        },
+      },
+    ],
+    layout: {
+      name: "preset",
+    },
+  });
+
+  state.graphRenderedTaskId = normalizedTaskId;
+  state.graphRenderedPayload = payload;
+  const cy = state.graphCy;
+  runEvidenceGraphLayout(cy, payload, graphElements);
+
+  cy.on("tap", "node", (event) => {
+    const node = event.target;
+    const selection = { kind: "node", data: node.data() };
+    setGraphSelection(normalizedTaskId, selection);
+    applyGraphNeighborhoodFocus(cy, node.union(node.connectedEdges()).union(node.connectedEdges().connectedNodes()));
+    applyGraphSelectionHighlight(cy, selection);
+    updateGraphInspector(normalizedTaskId);
+  });
+
+  cy.on("tap", "edge", (event) => {
+    const edge = event.target;
+    const selection = { kind: "edge", data: edge.data() };
+    setGraphSelection(normalizedTaskId, selection);
+    applyGraphNeighborhoodFocus(cy, edge.union(edge.connectedNodes()));
+    applyGraphSelectionHighlight(cy, selection);
+    updateGraphInspector(normalizedTaskId);
+  });
+
+  cy.on("mouseover", "node, edge", (event) => {
+    if (el.graphCanvas) el.graphCanvas.style.cursor = "pointer";
+    if (graphSelectionForTask(normalizedTaskId)) return;
+    const target = event.target;
+    const focus = target.isNode && target.isNode()
+      ? target.union(target.connectedEdges()).union(target.connectedEdges().connectedNodes())
+      : target.union(target.connectedNodes());
+    applyGraphNeighborhoodFocus(cy, focus);
+  });
+
+  cy.on("mouseout", "node, edge", () => {
+    if (el.graphCanvas) el.graphCanvas.style.cursor = "";
+    if (graphSelectionForTask(normalizedTaskId)) return;
+    const term = String(state.graphSearchByTaskId[normalizedTaskId] || "").trim();
+    if (term) {
+      applyGraphSearch(normalizedTaskId, term, { refit: false });
+      return;
+    }
+    clearGraphClasses(cy);
+  });
+
+  cy.on("tap", (event) => {
+    if (event.target !== cy) return;
+    setGraphSelection(normalizedTaskId, null);
+    const term = String(state.graphSearchByTaskId[normalizedTaskId] || "").trim();
+    if (term) applyGraphSearch(normalizedTaskId, term, { refit: false });
+    else clearGraphClasses(cy);
+    applyGraphSelectionHighlight(cy, null);
+    updateGraphInspector(normalizedTaskId);
+  });
+
+  const existingTerm = String(state.graphSearchByTaskId[normalizedTaskId] || "").trim();
+  if (existingTerm) applyGraphSearch(normalizedTaskId, existingTerm, { refit: false });
+  applyGraphSelectionHighlight(cy, graphSelectionForTask(normalizedTaskId));
+  updateGraphInspector(normalizedTaskId);
 }
 
 function debugSummaryHtml(debugPayload) {
@@ -1349,6 +2285,35 @@ async function refreshCurrentDebugState({ force = false } = {}) {
   renderReportPanel();
 }
 
+async function refreshCurrentEvidenceGraph({ force = false } = {}) {
+  const taskId = currentGraphTaskId();
+  if (!taskId || state.reportPanelMode !== "graph") return;
+  const existing = state.graphByTaskId[taskId];
+  if (existing?.loading) return;
+  if (!force && existing && existing.data) return;
+
+  const hasExistingData = Boolean(existing?.data);
+  state.graphByTaskId[taskId] = hasExistingData
+    ? { loading: true, error: "", data: existing.data }
+    : { loading: true, error: "", data: null };
+  if (!hasExistingData) renderReportPanel();
+
+  try {
+    const payload = await api(`/api/tasks/${encodeURIComponent(taskId)}/evidence-graph`);
+    state.graphByTaskId[taskId] = { loading: false, error: "", data: payload };
+  } catch (err) {
+    state.graphByTaskId[taskId] = hasExistingData
+      ? { loading: false, error: "", data: existing.data }
+      : {
+          loading: false,
+          error: String(err?.message || "Failed to load evidence graph."),
+          data: null,
+        };
+  }
+
+  renderReportPanel();
+}
+
 function renderReportPanel() {
   const iteration = currentReportIteration();
   const showPanel = Boolean(state.selectedConversationId && iteration && iteration?.report?.has_report);
@@ -1356,6 +2321,9 @@ function renderReportPanel() {
   const debugEntry = debugTaskId ? state.debugByTaskId[debugTaskId] : null;
   const showDebugToggle = Boolean(showPanel && debugTaskId);
   const showDebugPanel = Boolean(showPanel && state.debugOpen && debugTaskId);
+  const graphTaskId = currentGraphTaskId();
+  const graphEntry = graphTaskId ? state.graphByTaskId[graphTaskId] : null;
+  const showGraphMode = Boolean(showPanel && state.reportPanelMode === "graph" && graphTaskId);
 
   el.workspace.classList.toggle("report-open", showPanel);
   el.reportPanel.classList.toggle("hidden", !showPanel);
@@ -1363,10 +2331,12 @@ function renderReportPanel() {
   if (!showPanel) {
     clearRenderedReportPanel();
     el.exportPdfBtn.classList.add("hidden");
+    el.evidenceGraphBtn.classList.add("hidden");
     el.debugToggleBtn.classList.add("hidden");
     el.reportStatus.classList.add("hidden");
     el.reportStatus.classList.remove("error");
     el.debugPanel.classList.add("hidden");
+    el.graphPanel.classList.add("hidden");
     setDebugSummaryHtml("", "");
     setDebugJsonText("", "");
     return;
@@ -1380,6 +2350,8 @@ function renderReportPanel() {
   setRenderedReportMarkdown(taskId, reportMarkdown, { preserveScroll: !reportTaskChanged });
   el.exportPdfBtn.classList.toggle("hidden", !taskId);
   el.exportPdfBtn.disabled = state.exportingPdf;
+  el.evidenceGraphBtn.classList.toggle("hidden", !taskId);
+  el.evidenceGraphBtn.textContent = showGraphMode ? "Show Report" : "Evidence Graph";
   el.debugToggleBtn.classList.toggle("hidden", !showDebugToggle);
   el.debugToggleBtn.textContent = state.debugOpen ? "Hide Debug" : "Show Debug";
 
@@ -1388,28 +2360,62 @@ function renderReportPanel() {
   el.reportStatus.classList.toggle("error", shouldShowStatus && state.reportStatusError);
   el.reportStatus.textContent = shouldShowStatus ? state.reportStatusText : "";
 
+  el.reportContent.classList.toggle("hidden", showGraphMode);
+  el.graphPanel.classList.toggle("hidden", !showGraphMode);
+  if (showGraphMode) {
+    el.graphLegend.innerHTML = graphLegendHtml(graphEntry?.data || state.graphRenderedPayload || null);
+    const searchValue = String(state.graphSearchByTaskId[graphTaskId] || "");
+    if (el.graphSearchInput.value !== searchValue) el.graphSearchInput.value = searchValue;
+
+    if (!graphEntry || (graphEntry.loading && !graphEntry.data)) {
+      destroyGraphInstance();
+      renderGraphCanvasState("loading", "Loading graph", "Building the semantic evidence graph for this report.");
+      el.graphInspector.innerHTML = graphSummaryInspectorHtml({
+        summary: { node_count: 0, edge_count: 0, evidence_count: 0, mixed_edge_count: 0 },
+        warnings: [],
+      });
+      refreshCurrentEvidenceGraph().catch((err) => setNotice(`Failed to load evidence graph: ${err.message}`, true));
+    } else if (graphEntry.error && !graphEntry.data) {
+      destroyGraphInstance();
+      renderGraphCanvasState("error", "Graph unavailable", graphEntry.error);
+      el.graphInspector.innerHTML = graphSummaryInspectorHtml({
+        summary: { node_count: 0, edge_count: 0, evidence_count: 0, mixed_edge_count: 0 },
+        warnings: [graphEntry.error],
+      });
+    } else {
+      const graphPayload = graphEntry.data || {};
+      if (state.graphRenderedTaskId !== graphTaskId || state.graphRenderedPayload !== graphPayload) {
+        initializeEvidenceGraph(graphTaskId, graphPayload);
+      } else if (state.graphCy) {
+        state.graphCy.resize();
+      }
+      updateGraphInspector(graphTaskId);
+      const searchTerm = String(state.graphSearchByTaskId[graphTaskId] || "").trim();
+      if (searchTerm) applyGraphSearch(graphTaskId, searchTerm, { refit: false });
+    }
+  }
+
   el.debugPanel.classList.toggle("hidden", !showDebugPanel);
-  if (!showDebugPanel) {
+  if (showDebugPanel) {
+    if (!debugEntry || (debugEntry.loading && !debugEntry.data)) {
+      setDebugSummaryHtml(debugTaskId, '<div class="debug-empty">Loading workflow debug state...</div>');
+      setDebugJsonText(debugTaskId, "");
+      return;
+    }
+
+    if (debugEntry.error && !debugEntry.data) {
+      setDebugSummaryHtml(debugTaskId, `<div class="debug-empty debug-error">${escapeHtml(debugEntry.error)}</div>`);
+      setDebugJsonText(debugTaskId, "");
+      return;
+    }
+
+    const debugPayload = debugEntry.data || {};
+    setDebugSummaryHtml(debugTaskId, debugSummaryHtml(debugPayload));
+    setDebugJsonText(debugTaskId, JSON.stringify(debugPayload.state || {}, null, 2));
+  } else {
     setDebugSummaryHtml("", "");
     setDebugJsonText("", "");
-    return;
   }
-
-  if (!debugEntry || (debugEntry.loading && !debugEntry.data)) {
-    setDebugSummaryHtml(debugTaskId, '<div class="debug-empty">Loading workflow debug state...</div>');
-    setDebugJsonText(debugTaskId, "");
-    return;
-  }
-
-  if (debugEntry.error && !debugEntry.data) {
-    setDebugSummaryHtml(debugTaskId, `<div class="debug-empty debug-error">${escapeHtml(debugEntry.error)}</div>`);
-    setDebugJsonText(debugTaskId, "");
-    return;
-  }
-
-  const debugPayload = debugEntry.data || {};
-  setDebugSummaryHtml(debugTaskId, debugSummaryHtml(debugPayload));
-  setDebugJsonText(debugTaskId, JSON.stringify(debugPayload.state || {}, null, 2));
 }
 
 function renderAll() {
@@ -1774,8 +2780,12 @@ function clearDraft() {
   state.selectedConversationId = null;
   state.selectedConversationDetail = null;
   state.selectedReportTaskId = null;
+  state.reportPanelMode = "report";
   state.debugOpen = false;
   state.debugByTaskId = {};
+  state.graphByTaskId = {};
+  state.graphSearchByTaskId = {};
+  state.graphSelectionByTaskId = {};
   stopRunPolling();
   state.runsByRunId = {};
   state.runsByTaskId = {};
@@ -1915,10 +2925,42 @@ function bindEvents() {
     exportFinalReportPdf(taskId);
   });
 
+  el.evidenceGraphBtn.addEventListener("click", () => {
+    state.reportPanelMode = state.reportPanelMode === "graph" ? "report" : "graph";
+    renderReportPanel();
+    if (state.reportPanelMode === "graph") {
+      refreshCurrentEvidenceGraph().catch((err) => setNotice(`Failed to load evidence graph: ${err.message}`, true));
+    }
+  });
+
   el.debugToggleBtn.addEventListener("click", () => {
     state.debugOpen = !state.debugOpen;
     renderReportPanel();
     refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
+  });
+
+  el.graphSearchInput.addEventListener("input", () => {
+    const taskId = currentGraphTaskId();
+    if (!taskId) return;
+    applyGraphSearch(taskId, el.graphSearchInput.value);
+  });
+
+  el.graphFitBtn.addEventListener("click", () => {
+    if (!state.graphCy) return;
+    state.graphCy.fit(undefined, 72);
+  });
+
+  el.graphResetBtn.addEventListener("click", () => {
+    const taskId = currentGraphTaskId();
+    if (!taskId) return;
+    if (el.graphSearchInput.value) el.graphSearchInput.value = "";
+    state.graphSearchByTaskId[taskId] = "";
+    setGraphSelection(taskId, null);
+    if (state.graphCy) {
+      clearGraphClasses(state.graphCy);
+      state.graphCy.fit(undefined, 72);
+    }
+    updateGraphInspector(taskId);
   });
 
   const exampleContainer = document.getElementById("exampleQueries");

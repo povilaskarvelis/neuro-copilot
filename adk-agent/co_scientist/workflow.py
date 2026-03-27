@@ -331,6 +331,7 @@ def _build_default_tool_hint_by_source_label() -> dict[str, str]:
 
 
 DEFAULT_TOOL_HINT_BY_SOURCE_LABEL = _build_default_tool_hint_by_source_label()
+INTERNAL_SKILL_TOOL_NAMES = {"list_skills", "load_skill", "load_skill_resource"}
 
 
 PLANNER_INSTRUCTION_TEMPLATE = """
@@ -356,6 +357,8 @@ Rules:
 - For archive-style dataset discovery (for example OpenNeuro, NEMAR, DANDI, Brain-CODE, CONP), prefer one archive per step and plan around simple keyword or modality checks rather than compound boolean expressions.
 - When archive metadata is likely sparse, add a fallback browse/inspection step instead of assuming a zero-hit disease keyword search proves absence.
 - Choose the number of steps needed for the objective. Avoid unnecessary fragmentation.
+- Match each step to real tool capability. Do not write completion conditions that require lineage-, mutation-, cell-line-, or cohort-filtered
+  results from a tool that only returns release-level or aggregate summaries.
 - Do not create standalone schema-inspection or table-discovery steps unless the user explicitly asked about schemas
   or the BigQuery lookup is already identifier-ready and schema inspection is unavoidable. In most cases, schema
   inspection should happen inline inside an evidence-gathering step, not as a reportable deliverable.
@@ -421,8 +424,11 @@ Rules:
 - Focus ONLY on the current step provided in the execution context.
 - You MUST call at least one tool before returning a result.
 - Load a relevant specialized skill when the step depends on citation grounding, clinical-trial heuristics, variant interpretation, GEO dataset triage, or oncology target-validation reasoning.
-- If a tool call fails or returns insufficient data, try an alternative tool or query
-  (e.g. search_pubmed <-> search_openalex_works, or fall back to run_bigquery_select_query).
+- If a tool call fails or returns insufficient data, first try an alternative query or another tool in the same evidence family
+  (e.g. search_pubmed <-> search_openalex_works).
+- Switch to generic BigQuery tools only when the current step is explicitly BigQuery-backed or clearly requires structured SQL
+  against a named BigQuery dataset. Do not substitute BigQuery for specialized screening, dependency, or pharmacogenomic tools
+  just because the first query was incomplete.
 - For `query_monarch_associations`, use only the supported association modes from the tool schema, and pass a normalized `entityId` CURIE when you already resolved the gene, disease, or phenotype.
 - For archive/search tools that do literal metadata matching (for example OpenNeuro, DANDI, NEMAR, Brain-CODE, CONP), avoid boolean query strings like `A OR B` unless the tool explicitly supports them; run separate simple searches instead.
 - For dataset archives with sparse disorder labels, a zero-hit disease query is not enough to conclude the archive has no relevant data; retry with modality, task, study name, or archive browsing before blocking the step.
@@ -734,12 +740,18 @@ def _is_lookup_tool_name(name: str) -> bool:
     raw = str(name or "").strip()
     if not raw:
         return False
+    if raw in INTERNAL_SKILL_TOOL_NAMES:
+        return False
     return raw.startswith(("search_", "list_", "summarize_", "query_")) or raw in {
         "run_bigquery_select_query",
         "get_clinical_trial",
         "get_pubmed_abstract",
         "get_paper_fulltext",
     }
+
+
+def _is_internal_skill_tool_name(name: str) -> bool:
+    return str(name or "").strip() in INTERNAL_SKILL_TOOL_NAMES
 
 
 def _compact_tool_args_for_provenance(args: Mapping[str, Any]) -> dict[str, Any]:
@@ -3678,6 +3690,79 @@ SYNTHESIS_META_PREDICATES = {
     "supported_by",
 }
 
+EVIDENCE_GRAPH_HIDDEN_ENTITY_TYPES = {
+    "objective",
+    "step",
+    "source",
+}
+
+EVIDENCE_GRAPH_TARGET_ENTITY_TYPES = {
+    "gene",
+    "protein",
+    "compound",
+    "drug",
+    "query_focus",
+    "target",
+    "receptor",
+    "biological_entity",
+    "protein_family",
+}
+
+EVIDENCE_GRAPH_STRUCTURAL_ENTITY_TYPES = {
+    "attribute",
+    "column",
+    "field",
+    "record",
+    "row",
+    "support_cluster",
+    "table",
+}
+
+EVIDENCE_GRAPH_GENERIC_FOCUS_TERMS = {
+    "across",
+    "analysis",
+    "available",
+    "based",
+    "biomarker",
+    "bridge",
+    "clinicaltrialsgov",
+    "classes",
+    "cns",
+    "clinical",
+    "compare",
+    "determine",
+    "disease",
+    "eeg",
+    "efficacy",
+    "experiment",
+    "expression",
+    "gtex",
+    "genetics",
+    "human",
+    "human protein atlas",
+    "including",
+    "landscape",
+    "liabilities",
+    "main",
+    "meg",
+    "missing",
+    "mri",
+    "name",
+    "programs",
+    "rank",
+    "safety",
+    "selective",
+    "specificity",
+    "still",
+    "target",
+    "targets",
+    "therapeutic",
+    "tissue",
+    "trial",
+    "trials",
+    "which",
+}
+
 TRIVIAL_IDENTIFIER_PREDICATES = {
     "has_ensembl_id",
     "has_mondo_id",
@@ -4390,45 +4475,10 @@ def _detect_claim_conflicts(adjudicated_claims: list[dict[str, Any]]) -> tuple[l
 
 
 def _build_claim_synthesis_summary(store: dict[str, Any], objective_text: str = "") -> dict[str, Any]:
-    claims = list((store or {}).get("claims", {}).values())
-    evidence_records = list((store or {}).get("evidence", []))
-    label_by_entity = {
-        entity_id: str(entity.get("label", entity_id)).strip()
-        for entity_id, entity in ((store or {}).get("entities", {}) or {}).items()
-    }
-    evidence_by_claim: dict[str, list[dict[str, Any]]] = {}
-    for record in evidence_records:
-        claim_id = str(record.get("claim_id", "")).strip()
-        if not claim_id:
-            continue
-        evidence_by_claim.setdefault(claim_id, []).append(record)
-
-    excluded_predicates = SYNTHESIS_META_PREDICATES | TRIVIAL_IDENTIFIER_PREDICATES
-    substantive_claims = [
-        claim
-        for claim in claims
-        if str(claim.get("predicate", "")).strip() not in excluded_predicates
-    ]
-    adjudicated_claims = [
-        _score_adjudicated_claim(claim, evidence_by_claim.get(str(claim.get("id", "")).strip(), []), label_by_entity)
-        for claim in substantive_claims
-    ]
-    conflicts, mixed_claim_ids = _detect_claim_conflicts(adjudicated_claims)
-
-    for claim in adjudicated_claims:
-        claim["mixed_evidence"] = str(claim.get("claim_id", "")).strip() in mixed_claim_ids
-        claim["display_priority_score"] = _claim_display_priority_score(claim, objective_text)
-
-    ranked_claims = sorted(
-        adjudicated_claims,
-        key=lambda claim: (
-            float(claim.get("display_priority_score", 0.0) or 0.0),
-            1 if not claim.get("mixed_evidence") else 0,
-            int(claim.get("source_count", 0) or 0),
-            str(claim.get("statement", "")),
-        ),
-        reverse=True,
-    )
+    context = _adjudicate_substantive_claims(store, objective_text)
+    adjudicated_claims = list(context["adjudicated_claims"])
+    ranked_claims = list(context["ranked_claims"])
+    conflicts = list(context["conflicts"])
 
     source_weight_reference: dict[str, dict[str, Any]] = {}
     for claim in adjudicated_claims:
@@ -4479,6 +4529,761 @@ def _build_claim_synthesis_summary(store: dict[str, Any], objective_text: str = 
             key=lambda item: (float(item.get("weight", 0.0) or 0.0), item.get("source", "")),
             reverse=True,
         )[:10],
+    }
+
+
+def _adjudicate_substantive_claims(store: dict[str, Any], objective_text: str = "") -> dict[str, Any]:
+    claims = list((store or {}).get("claims", {}).values())
+    evidence_records = list((store or {}).get("evidence", []))
+    label_by_entity = {
+        entity_id: str(entity.get("label", entity_id)).strip()
+        for entity_id, entity in ((store or {}).get("entities", {}) or {}).items()
+    }
+    evidence_by_claim: dict[str, list[dict[str, Any]]] = {}
+    for record in evidence_records:
+        claim_id = str(record.get("claim_id", "")).strip()
+        if not claim_id:
+            continue
+        evidence_by_claim.setdefault(claim_id, []).append(record)
+
+    excluded_predicates = SYNTHESIS_META_PREDICATES | TRIVIAL_IDENTIFIER_PREDICATES
+    substantive_claims = [
+        claim
+        for claim in claims
+        if str(claim.get("predicate", "")).strip() not in excluded_predicates
+    ]
+    adjudicated_claims = [
+        _score_adjudicated_claim(claim, evidence_by_claim.get(str(claim.get("id", "")).strip(), []), label_by_entity)
+        for claim in substantive_claims
+    ]
+    conflicts, mixed_claim_ids = _detect_claim_conflicts(adjudicated_claims)
+
+    for claim in adjudicated_claims:
+        claim["mixed_evidence"] = str(claim.get("claim_id", "")).strip() in mixed_claim_ids
+        claim["display_priority_score"] = _claim_display_priority_score(claim, objective_text)
+
+    ranked_claims = sorted(
+        adjudicated_claims,
+        key=lambda claim: (
+            float(claim.get("display_priority_score", 0.0) or 0.0),
+            1 if not claim.get("mixed_evidence") else 0,
+            int(claim.get("source_count", 0) or 0),
+            str(claim.get("statement", "")),
+        ),
+        reverse=True,
+    )
+    return {
+        "claims_by_id": {
+            str(claim.get("id", "")).strip(): claim
+            for claim in substantive_claims
+            if str(claim.get("id", "")).strip()
+        },
+        "evidence_by_claim": evidence_by_claim,
+        "label_by_entity": label_by_entity,
+        "adjudicated_claims": adjudicated_claims,
+        "ranked_claims": ranked_claims,
+        "conflicts": conflicts,
+    }
+
+
+def _truncate_graph_label(text: str, *, max_chars: int = 28) -> str:
+    cleaned = _sanitize_internal_report_text(str(text or "").strip()) or "Unknown"
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return f"{cleaned[: max_chars - 3].rstrip()}..."
+
+
+def _normalize_graph_match_text(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+
+def _graph_focus_type_bonus(entity_type: str) -> float:
+    normalized = str(entity_type or "").strip().lower()
+    if normalized in EVIDENCE_GRAPH_TARGET_ENTITY_TYPES:
+        return 4.0
+    if normalized in {"pathway", "mechanism", "biological_process", "protein_complex"}:
+        return 2.0
+    if normalized in {"disease", "phenotype", "cell_type", "tissue"}:
+        return 0.75
+    if normalized in {"literal", "objective", "source"}:
+        return -1.5
+    return 1.0
+
+
+def _is_informative_focus_label(label: str) -> bool:
+    normalized = _normalize_graph_match_text(label)
+    compact = _normalize_lookup_key(label)
+    if not normalized or not compact:
+        return False
+    if normalized in EVIDENCE_GRAPH_GENERIC_FOCUS_TERMS:
+        return False
+    if normalized.endswith(" table") or normalized.endswith(" column"):
+        return False
+    if compact in {"approvedsymbol", "dbxrefs", "diseaseid", "geneid", "name", "proteinid", "targetid"}:
+        return False
+    if re.fullmatch(r"[a-z]+id", compact):
+        return False
+    return True
+
+
+def _clean_query_focus_fragment(text: str) -> str:
+    value = _sanitize_internal_report_text(str(text or "").strip())
+    value = re.sub(r"^[Tt]he\s+", "", value)
+    value = re.sub(r"^(?:and|or)\s+", "", value, flags=re.I)
+    value = re.sub(r"^(?:approved|publicly available|public|known|standard|canonical|official|top\s+\d+)\s+", "", value, flags=re.I)
+    value = re.sub(r"\s+\(excluding[^)]*\)", "", value, flags=re.I)
+    value = value.strip(" ,.;:()")
+    return value
+
+
+def _extract_query_focus_labels(objective_text: str, *, max_items: int = 6) -> list[str]:
+    text = _sanitize_internal_report_text(str(objective_text or "").strip())
+    if not text:
+        return []
+
+    candidates: list[str] = []
+
+    def _push_many(segment: str) -> None:
+        cleaned = _clean_query_focus_fragment(segment)
+        if not cleaned:
+            return
+        pieces = re.split(r"\s*(?:,| and | or | versus | vs\.? | between )\s*", cleaned, flags=re.I)
+        for piece in pieces:
+            fragment = _clean_query_focus_fragment(piece)
+            if not fragment:
+                continue
+            if fragment.lower() in {"", "and", "or"}:
+                continue
+            if _is_informative_focus_label(fragment):
+                candidates.append(fragment)
+
+    patterns = [
+        r"\b(?:assess|determine|evaluate|investigate)\s+(?:if|whether)\s+(.+?)\s+(?:is|remains|are|looks|look|can|should)\b",
+        r"\b(?:compare|among|between|versus|across)\s+(.+?)(?:\s+(?:to determine|on|for|based on|once|highlighting|focusing|including|considering)\b|[.?!])",
+        r"\b(?:investigate|identify|rank|find)\s+(.+?)(?:\s+(?:to determine|for|by|based on|including|considering|highlighting|focusing)\b|[.?!])",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.I):
+            _push_many(match.group(1))
+
+    for match in re.finditer(r"\b[A-Z][A-Z0-9-]{2,}(?:\s+[A-Z0-9-]{1,})*\b", text):
+        token = _clean_query_focus_fragment(match.group(0))
+        if _is_informative_focus_label(token):
+            candidates.append(token)
+
+    ordered = _dedupe_str_list(candidates, limit=max_items)
+    return [item for item in ordered if _is_informative_focus_label(item)][:max_items]
+
+
+def _match_support_topology_focus_ids(
+    edge_payload: dict[str, Any],
+    *,
+    focus_by_id: dict[str, dict[str, Any]],
+    target_entity: dict[str, Any] | None,
+) -> list[str]:
+    haystacks: list[str] = []
+
+    def _append(value: Any) -> None:
+        cleaned = _normalize_lookup_key(_sanitize_internal_report_text(str(value or "").strip()))
+        if cleaned:
+            haystacks.append(cleaned)
+
+    _append(edge_payload.get("statement", ""))
+    _append(edge_payload.get("target_label", ""))
+    _append(edge_payload.get("_target_literal", ""))
+    for value in list(edge_payload.get("supporting_ids", []) or []):
+        _append(value)
+    for value in list(edge_payload.get("primary_sources", []) or []):
+        _append(value)
+
+    if isinstance(target_entity, dict):
+        _append(target_entity.get("label", ""))
+        for alias in list(target_entity.get("aliases", []) or []):
+            _append(alias)
+        attrs = dict(target_entity.get("attrs", {}) or {})
+        _append(attrs.get("identifier", ""))
+
+    matches: list[str] = []
+    for focus_id, metadata in focus_by_id.items():
+        label = str(metadata.get("label", "") or "").strip()
+        if not label:
+            continue
+        compact = _normalize_lookup_key(label)
+        if not compact:
+            continue
+        if any(compact in haystack or haystack in compact for haystack in haystacks if haystack):
+            matches.append(focus_id)
+    return matches
+
+
+def _build_graph_focus_candidates(node_data: dict[str, Any]) -> list[tuple[str, float]]:
+    candidates: list[tuple[str, float]] = []
+    seen: set[str] = set()
+
+    def _push(value: Any, weight: float) -> None:
+        raw = _sanitize_internal_report_text(str(value or "").strip())
+        normalized = _normalize_graph_match_text(raw)
+        compact = _normalize_lookup_key(raw)
+        if not raw or not normalized or not compact:
+            return
+        if normalized in EVIDENCE_GRAPH_GENERIC_FOCUS_TERMS:
+            return
+        if len(normalized.split()) == 1 and len(compact) < 3:
+            return
+        if compact in seen:
+            return
+        seen.add(compact)
+        candidates.append((raw, weight))
+
+    _push(node_data.get("full_label") or node_data.get("label") or "", 12.0)
+    for alias in list(node_data.get("aliases", []) or []):
+        _push(alias, 9.0)
+    attrs = node_data.get("attrs", {}) if isinstance(node_data.get("attrs", {}), dict) else {}
+    _push(attrs.get("identifier", ""), 7.0)
+    node_id = str(node_data.get("id", "") or "").strip()
+    if node_id:
+        tail = node_id.split(":")[-1].strip()
+        if tail and tail != node_id:
+            _push(tail, 5.0)
+    return candidates
+
+
+def _graph_objective_match_score(node_data: dict[str, Any], objective_text: str) -> tuple[float, list[str]]:
+    objective_phrase = _normalize_graph_match_text(objective_text)
+    objective_compact = _normalize_lookup_key(objective_text)
+    if not objective_phrase or not objective_compact:
+        return 0.0, []
+
+    if str(node_data.get("type", "") or "").strip().lower() == "objective":
+        return 0.0, []
+
+    phrase_haystack = f" {objective_phrase} "
+    best_score = 0.0
+    matched_terms: list[str] = []
+    for raw_term, base_weight in _build_graph_focus_candidates(node_data):
+        normalized = _normalize_graph_match_text(raw_term)
+        compact = _normalize_lookup_key(raw_term)
+        term_score = 0.0
+        matched = False
+        if normalized and f" {normalized} " in phrase_haystack:
+            matched = True
+            term_score = max(term_score, base_weight + (2.5 if len(normalized.split()) > 1 else 1.5))
+        if compact and len(compact) >= 3 and compact in objective_compact:
+            matched = True
+            term_score = max(term_score, base_weight + 1.0)
+        if not matched:
+            continue
+        best_score = max(best_score, term_score)
+        matched_terms.append(raw_term)
+
+    return best_score, _dedupe_str_list(matched_terms, limit=4)
+
+
+def _annotate_evidence_graph_focus(
+    nodes_by_id: dict[str, dict[str, Any]],
+    edges: list[dict[str, Any]],
+    *,
+    objective_text: str,
+    mode: str,
+) -> dict[str, Any]:
+    support_weight_by_node: dict[str, float] = {node_id: 0.0 for node_id in nodes_by_id}
+    for edge in edges:
+        data = edge.get("data", {}) if isinstance(edge, dict) else {}
+        source_id = str(data.get("source", "") or "").strip()
+        target_id = str(data.get("target", "") or "").strip()
+        support_score = float(data.get("support_score", 0.0) or 0.0)
+        if source_id:
+            support_weight_by_node[source_id] = support_weight_by_node.get(source_id, 0.0) + support_score
+        if target_id:
+            support_weight_by_node[target_id] = support_weight_by_node.get(target_id, 0.0) + support_score
+
+    matched_candidates: list[dict[str, Any]] = []
+    fallback_candidates: list[dict[str, Any]] = []
+    for node_id, payload in nodes_by_id.items():
+        data = payload.get("data", {}) if isinstance(payload.get("data", {}), dict) else {}
+        entity_type = str(data.get("type", "") or "").strip().lower()
+        degree = int(data.get("degree", 0) or 0)
+        connected_claim_count = int(data.get("connected_claim_count", 0) or 0)
+        support_weight = round(float(support_weight_by_node.get(node_id, 0.0) or 0.0), 3)
+        data["support_weight"] = support_weight
+        data["is_focus"] = 0
+        data["focus_rank"] = 0
+        data["focus_score"] = 0.0
+        data["focus_terms"] = []
+
+        if entity_type in {"objective", "source", "literal"} | EVIDENCE_GRAPH_STRUCTURAL_ENTITY_TYPES:
+            continue
+
+        mention_score, matched_terms = _graph_objective_match_score(data, objective_text)
+        type_bonus = _graph_focus_type_bonus(entity_type)
+        structure_bonus = min(4.0, support_weight / 4.0) + min(3.0, connected_claim_count / 6.0)
+        score = round(mention_score + type_bonus + structure_bonus, 3)
+        candidate = {
+            "node_id": node_id,
+            "label": str(data.get("full_label", "") or data.get("label", "")).strip() or node_id,
+            "label_key": _normalize_lookup_key(str(data.get("full_label", "") or data.get("label", "")).strip() or node_id),
+            "entity_type": entity_type,
+            "degree": degree,
+            "connected_claim_count": connected_claim_count,
+            "support_weight": support_weight,
+            "focus_score": score,
+            "focus_terms": matched_terms,
+            "mention_score": mention_score,
+        }
+        if not _is_informative_focus_label(str(candidate["label"])):
+            if mention_score <= 0:
+                continue
+        fallback_candidates.append(candidate)
+        if mention_score > 0:
+            matched_candidates.append(candidate)
+
+    selected_candidates: list[dict[str, Any]] = []
+    if matched_candidates:
+        if any(candidate["entity_type"] in EVIDENCE_GRAPH_TARGET_ENTITY_TYPES for candidate in matched_candidates):
+            matched_candidates = [
+                candidate
+                for candidate in matched_candidates
+                if candidate["entity_type"] in EVIDENCE_GRAPH_TARGET_ENTITY_TYPES
+            ]
+        best_by_label: dict[str, dict[str, Any]] = {}
+        for candidate in sorted(
+            matched_candidates,
+            key=lambda item: (
+                float(item.get("focus_score", 0.0) or 0.0),
+                float(item.get("support_weight", 0.0) or 0.0),
+                int(item.get("connected_claim_count", 0) or 0),
+            ),
+            reverse=True,
+        ):
+            key = str(candidate.get("label_key", "") or candidate.get("node_id", "")).strip()
+            if key and key not in best_by_label:
+                best_by_label[key] = candidate
+        selected_candidates = list(best_by_label.values())[:6]
+    elif mode == "semantic":
+        semantic_fallback = [
+            candidate
+            for candidate in fallback_candidates
+            if candidate["entity_type"] not in {"disease", "phenotype"}
+        ]
+        if any(candidate["entity_type"] in EVIDENCE_GRAPH_TARGET_ENTITY_TYPES for candidate in semantic_fallback):
+            semantic_fallback = [
+                candidate
+                for candidate in semantic_fallback
+                if candidate["entity_type"] in EVIDENCE_GRAPH_TARGET_ENTITY_TYPES
+            ]
+        fallback_ordered = sorted(
+            semantic_fallback or fallback_candidates,
+            key=lambda item: (
+                float(item.get("support_weight", 0.0) or 0.0),
+                int(item.get("connected_claim_count", 0) or 0),
+                _graph_focus_type_bonus(str(item.get("entity_type", "") or "")),
+            ),
+            reverse=True,
+        )
+        best_by_label: dict[str, dict[str, Any]] = {}
+        for candidate in fallback_ordered:
+            key = str(candidate.get("label_key", "") or candidate.get("node_id", "")).strip()
+            if key and key not in best_by_label:
+                best_by_label[key] = candidate
+        selected_candidates = list(best_by_label.values())[:3]
+
+    focus_node_ids: list[str] = []
+    focus_labels: list[str] = []
+    for rank, candidate in enumerate(selected_candidates, start=1):
+        node_id = str(candidate.get("node_id", "") or "").strip()
+        if not node_id or node_id not in nodes_by_id:
+            continue
+        data = nodes_by_id[node_id]["data"]
+        data["is_focus"] = 1
+        data["focus_rank"] = rank
+        data["focus_score"] = round(float(candidate.get("focus_score", 0.0) or 0.0), 3)
+        data["focus_terms"] = list(candidate.get("focus_terms", []) or [])[:4]
+        focus_node_ids.append(node_id)
+        focus_labels.append(str(data.get("full_label", "") or data.get("label", "")).strip() or node_id)
+
+    return {
+        "focus_node_ids": focus_node_ids,
+        "focus_labels": _dedupe_str_list(focus_labels, limit=6),
+    }
+
+
+def _build_semantic_evidence_graph(task_state: dict[str, Any]) -> dict[str, Any]:
+    store = task_state.get("evidence_store", {}) if isinstance(task_state, dict) else {}
+    store = store if isinstance(store, dict) else {}
+    objective_text = str((task_state or {}).get("objective", "") or "").strip()
+    context = _adjudicate_substantive_claims(store, objective_text)
+    ranked_claims = list(context.get("ranked_claims", []) or [])
+    claims_by_id = context.get("claims_by_id", {}) if isinstance(context.get("claims_by_id", {}), dict) else {}
+    evidence_by_claim = context.get("evidence_by_claim", {}) if isinstance(context.get("evidence_by_claim", {}), dict) else {}
+    entities_by_id = ((store or {}).get("entities", {}) or {}) if isinstance((store or {}).get("entities", {}), dict) else {}
+
+    warnings = ["Graph shows semantic claims only. Workflow steps and source scaffolding are hidden."]
+    nodes_by_id: dict[str, dict[str, Any]] = {}
+    neighbor_ids: dict[str, set[str]] = {}
+    incident_counts: dict[str, int] = {}
+    edges: list[dict[str, Any]] = []
+    rendered_evidence_ids: set[str] = set()
+    skipped_claims = 0
+    mode = "semantic"
+
+    def _ensure_graph_node(node_id: str, *, label: str, entity_type: str, aliases: list[str] | None = None, attrs: dict[str, Any] | None = None) -> str:
+        if node_id not in nodes_by_id:
+            nodes_by_id[node_id] = {
+                "data": {
+                    "id": node_id,
+                    "label": _truncate_graph_label(label),
+                    "full_label": _sanitize_internal_report_text(label),
+                    "type": str(entity_type or "record").strip() or "record",
+                    "aliases": _dedupe_str_list(list(aliases or []), limit=12),
+                    "attrs": dict(attrs or {}),
+                    "degree": 0,
+                    "connected_claim_count": 0,
+                }
+            }
+            neighbor_ids[node_id] = set()
+            incident_counts[node_id] = 0
+        return node_id
+
+    def _ensure_entity_node(entity_id: str, *, allow_hidden: bool = False) -> str:
+        entity = entities_by_id.get(entity_id)
+        if not isinstance(entity, dict):
+            return ""
+        entity_type = str(entity.get("type", "record") or "record").strip() or "record"
+        if not allow_hidden and entity_type in EVIDENCE_GRAPH_HIDDEN_ENTITY_TYPES:
+            return ""
+        return _ensure_graph_node(
+            str(entity.get("id", entity_id) or entity_id).strip(),
+            label=str(entity.get("label", entity_id) or entity_id).strip(),
+            entity_type=entity_type,
+            aliases=list(entity.get("aliases", []) or []),
+            attrs=dict(entity.get("attrs", {}) or {}),
+        )
+
+    def _ensure_literal_node(object_literal: str) -> str:
+        literal = _sanitize_internal_report_text(str(object_literal or "").strip())
+        literal_id = f"literal:{_slugify_token(literal or 'literal')}"
+        return _ensure_graph_node(
+            literal_id,
+            label=literal or "Literal value",
+            entity_type="literal",
+            aliases=[],
+            attrs={"literal": True},
+        )
+
+    for claim in ranked_claims:
+        claim_id = str(claim.get("claim_id", "")).strip()
+        raw_claim = claims_by_id.get(claim_id, {})
+        if not claim_id or not isinstance(raw_claim, dict):
+            skipped_claims += 1
+            continue
+
+        subject_entity_id = str(raw_claim.get("subject_entity_id", "") or "").strip()
+        object_entity_id = str(raw_claim.get("object_entity_id", "") or "").strip()
+        object_literal = str(raw_claim.get("object_literal", "") or "").strip()
+
+        source_id = _ensure_entity_node(subject_entity_id)
+        if not source_id:
+            skipped_claims += 1
+            continue
+
+        target_id = _ensure_entity_node(object_entity_id) if object_entity_id else ""
+        if not target_id and object_literal:
+            target_id = _ensure_literal_node(object_literal)
+        if not target_id:
+            skipped_claims += 1
+            continue
+
+        records = list(evidence_by_claim.get(claim_id, []) or [])
+        qualifier_lines = _dedupe_str_list(
+            [
+                _format_observation_qualifiers(record.get("qualifiers", {}))
+                for record in records
+                if isinstance(record, dict) and _format_observation_qualifiers(record.get("qualifiers", {}))
+            ],
+            limit=8,
+        )
+
+        edges.append(
+            {
+                "data": {
+                    "id": claim_id,
+                    "source": source_id,
+                    "target": target_id,
+                    "predicate": str(claim.get("predicate", "") or "").strip(),
+                    "label": _humanize_claim_predicate(str(claim.get("predicate", "") or "").strip()),
+                    "statement": str(claim.get("statement", "") or "").strip(),
+                    "confidence": str(claim.get("claim_confidence", "unknown") or "unknown").strip(),
+                    "support_strength": str(claim.get("support_strength", "low") or "low").strip(),
+                    "support_score": round(float(claim.get("support_score", 0.0) or 0.0), 3),
+                    "evidence_count": int(claim.get("evidence_count", 0) or 0),
+                    "primary_sources": list(claim.get("primary_sources", []) or [])[:5],
+                    "supporting_ids": list(claim.get("supporting_ids", []) or [])[:12],
+                    "qualifiers": qualifier_lines,
+                    "mixed_evidence": bool(claim.get("mixed_evidence")),
+                }
+            }
+        )
+
+        neighbor_ids[source_id].add(target_id)
+        neighbor_ids[target_id].add(source_id)
+        incident_counts[source_id] = incident_counts.get(source_id, 0) + 1
+        incident_counts[target_id] = incident_counts.get(target_id, 0) + 1
+        for record in records:
+            record_id = str((record or {}).get("id", "") or "").strip()
+            if record_id:
+                rendered_evidence_ids.add(record_id)
+
+    if not edges:
+        nodes_by_id = {}
+        neighbor_ids = {}
+        incident_counts = {}
+        rendered_evidence_ids = set()
+        warnings = []
+        mode = "support_topology"
+
+        objective_entities = [
+            entity
+            for entity in entities_by_id.values()
+            if isinstance(entity, dict) and str(entity.get("type", "") or "").strip() == "objective"
+        ]
+        objective_entity = objective_entities[0] if objective_entities else None
+        objective_entity_id = str((objective_entity or {}).get("id", "") or "").strip()
+        objective_node_id = objective_entity_id or ""
+
+        support_candidates_by_type: dict[str, list[dict[str, Any]]] = {}
+
+        def _record_summary_payload(
+            records: list[dict[str, Any]],
+            *,
+            confidence: str,
+            statement: str,
+            label: str,
+            predicate: str,
+            mixed: bool = False,
+            source_labels: list[str] | None = None,
+        ) -> dict[str, Any]:
+            supporting_ids = _dedupe_str_list(
+                [
+                    identifier
+                    for record in records
+                    for identifier in list((record or {}).get("evidence_ids", []) or [])
+                ],
+                limit=12,
+            )
+            primary_sources = _dedupe_str_list(
+                [
+                    *[str((record or {}).get("source_label", "") or "").strip() for record in records],
+                    *[str(value or "").strip() for value in list(source_labels or [])],
+                ],
+                limit=5,
+            )
+            qualifier_lines = _dedupe_str_list(
+                [
+                    _format_observation_qualifiers((record or {}).get("qualifiers", {}))
+                    for record in records
+                    if _format_observation_qualifiers((record or {}).get("qualifiers", {}))
+                ],
+                limit=8,
+            )
+            evidence_count = len(records)
+            support_strength = "high" if evidence_count >= 3 or len(supporting_ids) >= 3 else ("medium" if evidence_count >= 1 else "low")
+            support_score = round(
+                min(3.0, (0.32 * evidence_count) + (0.08 * len(primary_sources)) + (0.05 * len(supporting_ids))),
+                3,
+            )
+            for record in records:
+                record_id = str((record or {}).get("id", "") or "").strip()
+                if record_id:
+                    rendered_evidence_ids.add(record_id)
+            return {
+                "label": label,
+                "predicate": predicate,
+                "statement": statement,
+                "confidence": str(confidence or "low").strip() or "low",
+                "support_strength": support_strength,
+                "support_score": support_score,
+                "evidence_count": evidence_count,
+                "primary_sources": primary_sources,
+                "supporting_ids": supporting_ids,
+                "qualifiers": qualifier_lines,
+                "mixed_evidence": mixed,
+            }
+
+        for raw_claim in list((store or {}).get("claims", {}).values()):
+            if not isinstance(raw_claim, dict):
+                continue
+            claim_id = str(raw_claim.get("id", "") or "").strip()
+            predicate = str(raw_claim.get("predicate", "") or "").strip()
+            records = list(evidence_by_claim.get(claim_id, []) or [])
+            subject_entity_id = str(raw_claim.get("subject_entity_id", "") or "").strip()
+            object_entity_id = str(raw_claim.get("object_entity_id", "") or "").strip()
+            object_literal = str(raw_claim.get("object_literal", "") or "").strip()
+            if predicate == "queried_source":
+                continue
+
+            if predicate != "supported_by" or subject_entity_id != objective_entity_id:
+                continue
+
+            if not objective_node_id:
+                continue
+
+            target_entity = entities_by_id.get(object_entity_id) if object_entity_id else None
+            target_type = str((target_entity or {}).get("type", "record") or "record").strip() or "record"
+            if not object_entity_id and object_literal:
+                target_type = "literal"
+            if target_type in {"objective", "step", "source"}:
+                continue
+
+            target_label = str((target_entity or {}).get("label", "") or object_literal or object_entity_id).strip()
+            payload = _record_summary_payload(
+                records,
+                confidence=str(raw_claim.get("confidence", "low") or "low"),
+                statement=f"Session evidence includes {target_label}",
+                label=_humanize_claim_predicate(predicate),
+                predicate=predicate,
+                source_labels=list(raw_claim.get("source_labels", []) or []),
+            )
+            payload["id"] = f"graph:support:{object_entity_id or _slugify_token(object_literal)}"
+            payload["_target_entity_id"] = object_entity_id
+            payload["_target_literal"] = object_literal
+            payload["_allow_hidden_target"] = False
+            payload["target_label"] = target_label
+            support_candidates_by_type.setdefault(target_type, []).append(payload)
+
+        selected_edge_specs: list[dict[str, Any]] = []
+        for target_type, entries in sorted(support_candidates_by_type.items()):
+            ordered = sorted(
+                entries,
+                key=lambda item: (
+                    float(item.get("support_score", 0.0) or 0.0),
+                    int(item.get("evidence_count", 0) or 0),
+                    str(item.get("target_label", "") or ""),
+                ),
+                reverse=True,
+            )
+            selected_edge_specs.extend(ordered)
+
+        nodes_by_id = {}
+        neighbor_ids = {}
+        incident_counts = {}
+        edges = []
+        rendered_evidence_ids = set()
+        objective_node_id = ""
+        inferred_focus_labels = _extract_query_focus_labels(objective_text)
+        focus_node_ids: list[str] = []
+        focus_by_id: dict[str, dict[str, Any]] = {}
+
+        if inferred_focus_labels:
+            for label in inferred_focus_labels:
+                focus_node_id = _ensure_graph_node(
+                    f"graph:focus:{_slugify_token(label)}",
+                    label=label,
+                    entity_type="query_focus",
+                    aliases=[],
+                    attrs={"inferred_from_query": True},
+                )
+                focus_node_ids.append(focus_node_id)
+                focus_by_id[focus_node_id] = {"label": label}
+        if not focus_node_ids and objective_entity_id:
+            objective_node_id = _ensure_entity_node(objective_entity_id, allow_hidden=True)
+
+        for edge in selected_edge_specs:
+            target_entity_id = str(edge.get("_target_entity_id", "") or "").strip()
+            target_literal = str(edge.get("_target_literal", "") or "").strip()
+            allow_hidden_target = bool(edge.get("_allow_hidden_target", False))
+            target_id = _ensure_entity_node(target_entity_id, allow_hidden=allow_hidden_target) if target_entity_id else ""
+            if not target_id and target_literal:
+                target_id = _ensure_literal_node(target_literal)
+            if not target_id:
+                continue
+
+            source_ids: list[str] = []
+            target_entity = entities_by_id.get(target_entity_id) if target_entity_id else None
+            if focus_node_ids:
+                matched_focus_ids = _match_support_topology_focus_ids(
+                    edge,
+                    focus_by_id=focus_by_id,
+                    target_entity=target_entity if isinstance(target_entity, dict) else None,
+                )
+                if len(focus_node_ids) == 1:
+                    source_ids = [focus_node_ids[0]]
+                elif matched_focus_ids:
+                    source_ids = matched_focus_ids
+                else:
+                    source_ids = list(focus_node_ids)
+            elif objective_node_id:
+                source_ids = [objective_node_id]
+
+            edge.pop("_target_entity_id", None)
+            edge.pop("_target_literal", None)
+            edge.pop("_allow_hidden_target", None)
+            edge.pop("target_label", None)
+
+            for source_id in source_ids:
+                source_id = str(source_id or "").strip()
+                target_id = str(target_id or "").strip()
+                if not source_id or not target_id:
+                    continue
+                edge_data = dict(edge)
+                edge_data["id"] = f"{edge_data.get('id', 'graph:edge')}:{_slugify_token(source_id)}"
+                edge_data["source"] = source_id
+                edge_data["target"] = target_id
+                neighbor_ids.setdefault(source_id, set()).add(target_id)
+                neighbor_ids.setdefault(target_id, set()).add(source_id)
+                incident_counts[source_id] = incident_counts.get(source_id, 0) + 1
+                incident_counts[target_id] = incident_counts.get(target_id, 0) + 1
+                edges.append({"data": edge_data})
+
+    if skipped_claims > 0 and mode == "semantic":
+        warnings.append("Some claims were omitted because they did not resolve to graphable nodes.")
+    if not edges:
+        warnings.append("No graphable evidence is available for this session yet.")
+
+    for node_id, payload in nodes_by_id.items():
+        payload["data"]["degree"] = len(neighbor_ids.get(node_id, set()))
+        payload["data"]["connected_claim_count"] = int(incident_counts.get(node_id, 0) or 0)
+
+    focus_summary = _annotate_evidence_graph_focus(
+        nodes_by_id,
+        edges,
+        objective_text=objective_text,
+        mode=mode,
+    )
+
+    sorted_nodes = sorted(
+        nodes_by_id.values(),
+        key=lambda item: (
+            -int(item.get("data", {}).get("is_focus", 0) or 0),
+            int(item.get("data", {}).get("focus_rank", 0) or 0),
+            str(item.get("data", {}).get("type", "") or ""),
+            str(item.get("data", {}).get("full_label", "") or ""),
+        ),
+    )
+    sorted_edges = sorted(
+        edges,
+        key=lambda item: (
+            float(item.get("data", {}).get("support_score", 0.0) or 0.0),
+            str(item.get("data", {}).get("statement", "") or ""),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "mode": mode,
+        "elements": {
+            "nodes": sorted_nodes,
+            "edges": sorted_edges,
+        },
+        "summary": {
+            "node_count": len(sorted_nodes),
+            "edge_count": len(sorted_edges),
+            "evidence_count": len(rendered_evidence_ids),
+            "mixed_edge_count": sum(1 for edge in sorted_edges if edge.get("data", {}).get("mixed_evidence")),
+            "focus_node_count": len(list(focus_summary.get("focus_node_ids", []) or [])),
+            "focus_node_ids": list(focus_summary.get("focus_node_ids", []) or []),
+            "focus_labels": list(focus_summary.get("focus_labels", []) or []),
+        },
+        "warnings": warnings,
     }
 
 
@@ -5977,6 +6782,55 @@ def _hyperlink_author_year_citations(text: str, lit_ids: list[str]) -> str:
     return protected + refs_tail
 
 
+_AUTHOR_YEAR_CITATION_RE = (
+    r"(?:"
+    r"[A-Z][A-Za-z'’.\-]+(?: [A-Z][A-Za-z'’.\-]+)*(?: et al\.)?"
+    r"|"
+    r"[A-Z][A-Za-z'’.\-]+(?: [A-Z][A-Za-z'’.\-]+)* & [A-Z][A-Za-z'’.\-]+(?: [A-Z][A-Za-z'’.\-]+)*"
+    r"), \d{4}[a-z]?"
+)
+
+
+def _collapse_duplicate_citation_mentions(text: str) -> str:
+    """Collapse duplicate adjacent author-year citations in the report body."""
+    if not text:
+        return text
+
+    refs_split = re.split(r"(?m)^#{2,3} References\b", text, maxsplit=1)
+    body = refs_split[0]
+    refs_tail = ("\n## References" + refs_split[1]) if len(refs_split) > 1 else ""
+
+    linked_plain_re = re.compile(
+        rf"\[(?P<label>{_AUTHOR_YEAR_CITATION_RE})\]\(#ref-(?P<ref>\d+)\)"
+        rf"(?P<sep>,\s*|;\s*|\s+and\s+)(?P=label)"
+    )
+    plain_linked_re = re.compile(
+        rf"(?P<label>{_AUTHOR_YEAR_CITATION_RE})"
+        rf"(?P<sep>,\s*|;\s*|\s+and\s+)"
+        rf"\[(?P=label)\]\(#ref-(?P<ref>\d+)\)"
+    )
+    linked_linked_re = re.compile(
+        rf"(?P<citation>\[(?P<label>{_AUTHOR_YEAR_CITATION_RE})\]\(#ref-(?P<ref>\d+)\))"
+        rf"(?P<sep>,\s*|;\s*|\s+and\s+)(?P=citation)"
+    )
+    plain_plain_re = re.compile(
+        rf"(?P<label>{_AUTHOR_YEAR_CITATION_RE})"
+        rf"(?P<sep>,\s*|;\s*|\s+and\s+)(?P=label)"
+    )
+
+    updated = body
+    for _ in range(6):
+        next_text = linked_plain_re.sub(r"[\g<label>](#ref-\g<ref>)", updated)
+        next_text = plain_linked_re.sub(r"[\g<label>](#ref-\g<ref>)", next_text)
+        next_text = linked_linked_re.sub(r"\g<citation>", next_text)
+        next_text = plain_plain_re.sub(r"\g<label>", next_text)
+        if next_text == updated:
+            break
+        updated = next_text
+
+    return updated + refs_tail
+
+
 def _inject_key_literature_fallback(text: str, lit_ids: list[str], *, max_refs: int = 3) -> str:
     """Insert a small cited literature block when references exist but the body has none."""
     if not text or not lit_ids:
@@ -6735,6 +7589,7 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
     body_so_far = "\n".join(lines)
     body_so_far = _hyperlink_inline_ids(body_so_far, ref_map)
     body_so_far = _hyperlink_author_year_citations(body_so_far, lit_ids)
+    body_so_far = _collapse_duplicate_citation_mentions(body_so_far)
     body_so_far = _inject_key_literature_fallback(body_so_far, lit_ids)
     body_so_far = _expand_reference_only_body_lines(body_so_far, lit_ids)
     lines = body_so_far.split("\n")
@@ -6865,6 +7720,8 @@ def _resolve_source_label(tool_hint: str) -> str:
     tool_hint = str(tool_hint or "").strip()
     if not tool_hint:
         return ""
+    if _is_internal_skill_tool_name(tool_hint):
+        return ""
     label = tool_registry.TOOL_SOURCE_NAMES.get(tool_hint)
     if label:
         return label
@@ -6909,6 +7766,8 @@ def _normalize_source_label_candidates(values: list[Any] | None, *, allow_verbat
     for value in values or []:
         raw = str(value or "").strip()
         if not raw:
+            continue
+        if _is_internal_skill_tool_name(raw):
             continue
         if raw == "BigQuery":
             generic.append(raw)
@@ -7534,6 +8393,8 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
                 if fr is None:
                     continue
                 tool_name = str(getattr(fr, "name", "") or "").strip()
+                if _is_internal_skill_tool_name(tool_name):
+                    continue
                 result_desc = _describe_tool_result(tool_name, getattr(fr, "response", None))
                 evidence_text = _extract_tool_result_evidence_text(tool_name, getattr(fr, "response", None))
                 for entry in tool_log:
@@ -7581,13 +8442,14 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
     if _llm_response_has_function_call(llm_response):
         callback_context.state[STATE_EXECUTOR_BUFFER] = ""
         fc_list = _extract_function_calls(llm_response)
-        tool_names = [fc["name"] for fc in fc_list]
+        visible_fc_list = [fc for fc in fc_list if not _is_internal_skill_tool_name(fc["name"])]
+        tool_names = [fc["name"] for fc in visible_fc_list]
         thought_text = _llm_response_thought_text(llm_response).strip()
         text_alongside = _llm_response_text(llm_response).strip()
 
         # Build structured tool_log entries from actual function call data
         tool_log = _get_tool_log(callback_context)
-        for fc in fc_list:
+        for fc in visible_fc_list:
             source = tool_registry.TOOL_SOURCE_NAMES.get(fc["name"], fc["name"])
             description = _describe_tool_call(fc["name"], fc["args"])
             provenance_args = _compact_tool_args_for_provenance(fc["args"])
@@ -7613,8 +8475,11 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
             chunk = "\n".join(trace_parts)
             prev_trace = str(callback_context.state.get(STATE_EXECUTOR_REASONING_TRACE, "") or "")
             callback_context.state[STATE_EXECUTOR_REASONING_TRACE] = (prev_trace + "\n" + chunk).strip()
-        logger.info("[react:after] function_call: %s, tool_log_len=%d",
-                    ", ".join(tool_names), len(tool_log))
+        logger.info(
+            "[react:after] function_call: %s, tool_log_len=%d",
+            ", ".join(tool_names) if tool_names else "(internal skill only)",
+            len(tool_log),
+        )
         if text_alongside:
             return _replace_llm_response_text(llm_response, "")
         return None
@@ -7917,6 +8782,7 @@ def _format_step_routing_guidance(tool_hint: str, available_tools: list[str]) ->
         return ""
 
     preferred_for = str(meta.get("preferred_for", "")).strip()
+    overlap_group = str(meta.get("overlap_group", "")).strip()
     fallback_tools = [
         tool for tool in meta.get("fallback_tools", [])
         if tool in set(available_tools)
@@ -7940,6 +8806,11 @@ def _format_step_routing_guidance(tool_hint: str, available_tools: list[str]) ->
     parts.append(
         "- Do not substitute a nearby overlapping source unless it better matches the step's requested evidence type."
     )
+    if overlap_group == "target_vulnerability":
+        parts.append(
+            "- Keep target-vulnerability work inside specialized screening and dependency tools unless the step explicitly names a "
+            "BigQuery dataset or requires a confirmed structured-data slice."
+        )
     return "\n".join(parts)
 
 

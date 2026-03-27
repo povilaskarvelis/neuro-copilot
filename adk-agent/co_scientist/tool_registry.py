@@ -113,7 +113,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_intact_interactions": "Get curated experimental molecular interactions from IntAct with partners, interaction types, detection methods, and publication support",
     "get_biogrid_interactions": "Get broader BioGRID experimental interaction evidence with physical/genetic classes, throughput tags, partners, and PMIDs",
     "get_human_protein_atlas_gene": "Get Human Protein Atlas summaries for tissue specificity, single-cell specificity, protein class, and subcellular localization",
-    "get_depmap_gene_dependency": "Summarize DepMap gene dependency metrics (CRISPR/RNAi dependency fractions, pan-dependency/selectivity, predictive features)",
+    "get_depmap_gene_dependency": "Summarize release-level DepMap dependency metrics for a named gene (CRISPR/RNAi dependency fractions, pan-dependency/selectivity, predictive features). Does not directly slice by lineage, mutation-defined subsets, or discover co-dependencies across other genes.",
     "get_biogrid_orcs_gene_summary": "Summarize BioGRID ORCS published CRISPR screen evidence for a gene, including hit status, phenotypes, cell lines, and representative screens",
     "get_gdsc_drug_sensitivity": "Summarize GDSC / CancerRxGene compound sensitivity profiles across cell lines and tissues using IC50/AUC pharmacogenomic screens",
     "get_prism_repurposing_response": "Summarize Broad PRISM repurposing primary-screen response using single-dose log2-fold-change viability across pooled cancer cell lines",
@@ -123,6 +123,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_guidetopharmacology_target": "Get curated target-ligand interactions and pharmacology summaries from Guide to Pharmacology",
     "get_dailymed_drug_label": "Summarize key DailyMed SPL label sections such as boxed warnings, indications, contraindications, and warnings",
     "search_variants_by_gene": "Search MyVariant.info for variants in a gene by symbol. Returns HGVS/rsIDs for downstream get_variant_annotations or annotate_variants_vep. Use when only gene is known.",
+    "get_variant_annotations": "Get aggregated MyVariant.info annotations for a specific variant using rsID, genomic HGVS, gene+protein HGVS, or shorthand like KRAS G12C. Returns ClinVar, dbSNP, gnomAD, CADD, COSMIC, and related annotations.",
     "get_clingen_gene_curation": "Summarize ClinGen gene-disease validity and dosage sensitivity curations for a gene",
     "get_alliance_genome_gene_profile": "Summarize Alliance Genome Resources model-organism and translational evidence for a gene, including orthologs, disease/phenotype counts, and disease models",
     "get_chembl_bioactivities": "Get bioactivity data (IC50, Ki, Kd) for a drug from ChEMBL - selectivity profiling",
@@ -242,7 +243,7 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     },
     "get_variant_annotations": {
         "overlap_group": "variant_evidence",
-        "preferred_for": "aggregate variant annotations across ClinVar, dbSNP, gnomAD, CADD, and COSMIC (requires variant ID)",
+        "preferred_for": "aggregate variant annotations across ClinVar, dbSNP, gnomAD, CADD, and COSMIC for a specific rsID, HGVS variant, gene+protein HGVS, or shorthand variant string such as KRAS G12C",
         "fallback_tools": ["annotate_variants_vep", "search_civic_variants", "get_clingen_gene_curation"],
     },
     "annotate_variants_vep": {
@@ -287,7 +288,7 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     },
     "get_depmap_gene_dependency": {
         "overlap_group": "target_vulnerability",
-        "preferred_for": "gene dependency and target vulnerability across cancer cell lines",
+        "preferred_for": "release-level named-gene dependency and selectivity summaries across cancer cell lines, not lineage/mutation-filtered co-dependency discovery",
         "fallback_tools": ["get_biogrid_orcs_gene_summary", "get_gdsc_drug_sensitivity"],
     },
     "get_biogrid_orcs_gene_summary": {

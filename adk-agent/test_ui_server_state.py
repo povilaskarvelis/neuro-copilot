@@ -7,6 +7,7 @@ from google.adk.sessions import InMemorySessionService
 for _env_name in ("AI_CO_SCIENTIST_POSTGRES_DSN", "POSTGRES_DSN", "DATABASE_URL"):
     os.environ.pop(_env_name, None)
 
+import co_scientist.workflow as workflow
 import ui_server
 from co_scientist.workflow import (
     STATE_EXECUTOR_ACTIVE_STEP_ID,
@@ -41,6 +42,54 @@ def runtime(tmp_path, monkeypatch):
     runtime.ready = True
     runtime.ready_error = None
     return runtime
+
+
+def _sample_graph_task_state() -> dict:
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess ataxia rare-disease evidence",
+        "success_criteria": ["Summarize phenotype and disease evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Map phenotype associations",
+                "tool_hint": "query_monarch_associations",
+                "domains": ["genomics"],
+                "completion_condition": "Return phenotype-linked disease associations",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Assess ataxia rare-disease evidence",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected phenotype-linked associations.",
+            "result_summary": "Ataxia maps to established phenotype-driven disease associations.",
+            "evidence_ids": ["HP:0001251", "ORPHA:100"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["query_monarch_associations"],
+            "structured_observations": [
+                {
+                    "observation_type": "phenotype_association",
+                    "subject": {"type": "phenotype", "label": "Ataxia", "id": "HP:0001251"},
+                    "predicate": "associated_with",
+                    "object": {"type": "disease", "label": "Ataxia-telangiectasia", "id": "ORPHA:100"},
+                    "supporting_ids": ["HP:0001251", "ORPHA:100"],
+                    "source_tool": "query_monarch_associations",
+                    "confidence": "medium",
+                    "qualifiers": {"mode": "phenotype_to_disease"},
+                }
+            ],
+        },
+    )
+    return task_state
 
 
 def test_extract_persistable_session_state_filters_transient_keys():
@@ -232,6 +281,56 @@ async def test_save_task_with_progress_persists_live_session_snapshot(runtime):
     assert debug_payload is not None
     assert debug_payload["source"] == "live"
     assert debug_payload["state"][STATE_WORKFLOW_TASK]["objective"] == "Persist me"
+
+
+@pytest.mark.asyncio
+async def test_get_task_evidence_graph_prefers_live_state(runtime):
+    task_state = _sample_graph_task_state()
+
+    async def fake_persistable_state(conversation_id: str) -> dict:
+        assert conversation_id == "conv_graph_live"
+        return {
+            STATE_WORKFLOW_TASK: task_state,
+            STATE_PLAN_PENDING_APPROVAL: False,
+        }
+
+    runtime._read_persistable_session_state = fake_persistable_state  # type: ignore[method-assign]
+    runtime.store.save_workflow_session(
+        "conv_graph_live",
+        task_id="task_graph_live",
+        state={STATE_WORKFLOW_TASK: {"objective": "Persisted placeholder", "steps": []}},
+    )
+    task = ui_server._make_task("task_graph_live", "Assess ataxia rare-disease evidence", "conv_graph_live")
+    runtime.store.save_task(task)
+
+    payload = await runtime.get_task_evidence_graph("task_graph_live")
+
+    assert payload is not None
+    assert payload["source"] == "live"
+    assert payload["mode"] == "semantic"
+    assert payload["summary"]["edge_count"] == 1
+    assert payload["elements"]["edges"][0]["data"]["predicate"] == "associated_with"
+
+
+@pytest.mark.asyncio
+async def test_get_task_evidence_graph_falls_back_to_persisted_state(runtime):
+    task_state = _sample_graph_task_state()
+    task = ui_server._make_task("task_graph_persisted", "Assess ataxia rare-disease evidence", "conv_graph_persisted")
+    runtime.store.save_task(task)
+    runtime.store.save_workflow_session(
+        "conv_graph_persisted",
+        task_id="task_graph_persisted",
+        state={STATE_WORKFLOW_TASK: task_state},
+    )
+
+    payload = await runtime.get_task_evidence_graph("task_graph_persisted")
+
+    assert payload is not None
+    assert payload["source"] == "persisted"
+    assert payload["mode"] == "semantic"
+    assert payload["summary"]["node_count"] == 2
+    assert payload["summary"]["edge_count"] == 1
+    assert payload["elements"]["nodes"][0]["data"]["type"] in {"disease", "phenotype"}
 
 
 def test_json_store_persists_runs_and_interrupts_incomplete_runs(tmp_path):

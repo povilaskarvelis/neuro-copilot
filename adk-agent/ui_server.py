@@ -39,6 +39,7 @@ from co_scientist.workflow import (
     STATE_EXECUTOR_LAST_ERROR,
     STATE_PRIOR_RESEARCH,
     STATE_WORKFLOW_TASK,
+    _build_semantic_evidence_graph,
     _derive_step_data_sources,
     _describe_tool_call,
     STATE_PLAN_PENDING_APPROVAL,
@@ -1755,6 +1756,43 @@ class UiRuntime:
             "persisted_task_id": str((persisted or {}).get("task_id", "") or ""),
         }
 
+    async def get_task_evidence_graph(self, task_id: str) -> dict | None:
+        task = self.store.get_task(task_id)
+        if not task:
+            return None
+        conversation_id = str(task.get("conversation_id", "") or "").strip()
+        live_state = await self._read_persistable_session_state(conversation_id)
+        persisted = self.store.get_workflow_session(conversation_id) if conversation_id else None
+        source = "none"
+        state: dict[str, object] = {}
+        if live_state:
+            source = "live"
+            state = live_state
+        elif isinstance(persisted, dict) and isinstance(persisted.get("state"), dict):
+            source = "persisted"
+            state = copy.deepcopy(persisted["state"])
+
+        task_state = state.get(STATE_WORKFLOW_TASK) if isinstance(state, dict) else None
+        graph_payload = _build_semantic_evidence_graph(task_state if isinstance(task_state, dict) else {})
+        warnings = list(graph_payload.get("warnings", []) or [])
+        if source == "none":
+            warnings = ["No workflow state is available for this task yet."] + warnings
+
+        return {
+            "task_id": task_id,
+            "conversation_id": conversation_id,
+            "source": source,
+            "mode": str(graph_payload.get("mode", "semantic") or "semantic"),
+            "summary": dict(graph_payload.get("summary", {}) or {}),
+            "warnings": warnings,
+            "elements": {
+                "nodes": list(((graph_payload.get("elements", {}) or {}).get("nodes", []) or [])),
+                "edges": list(((graph_payload.get("elements", {}) or {}).get("edges", []) or [])),
+            },
+            "persisted_updated_at": str((persisted or {}).get("updated_at", "") or ""),
+            "persisted_task_id": str((persisted or {}).get("task_id", "") or ""),
+        }
+
     async def get_run(self, run_id: str) -> dict | None:
         async with self.runs_lock:
             run = self.runs.get(run_id)
@@ -1949,6 +1987,15 @@ async def task_detail(task_id: str, request: Request) -> dict:
 async def task_workflow_state_debug(task_id: str, request: Request) -> dict:
     _check_task_ownership(task_id.strip(), request)
     detail = await runtime.get_task_workflow_state_debug(task_id.strip())
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
+    return detail
+
+
+@app.get("/api/tasks/{task_id}/evidence-graph")
+async def task_evidence_graph(task_id: str, request: Request) -> dict:
+    _check_task_ownership(task_id.strip(), request)
+    detail = await runtime.get_task_evidence_graph(task_id.strip())
     if not detail:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
     return detail

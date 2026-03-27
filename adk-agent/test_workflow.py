@@ -182,6 +182,7 @@ def test_planner_instruction_preserves_core_rules_but_trims_large_playbooks():
     assert "comparative-assessment-planning" in instruction
     assert "entity-resolution-planning" in instruction
     assert "safety-risk-interpretation-planning" in instruction
+    assert "Do not write completion conditions that require lineage-, mutation-, cell-line-, or cohort-filtered" in instruction
     assert "Available BigQuery datasets" not in instruction
     assert "open_targets_platform.target" not in instruction
     assert "Avoid boolean strings like `A OR B`" not in instruction
@@ -1033,6 +1034,8 @@ def test_resolve_source_label():
     assert workflow._resolve_source_label("get_pharmacodb_compound_response") == "PharmacoDB"
     assert workflow._resolve_source_label("get_intact_interactions") == "IntAct"
     assert workflow._resolve_source_label("search_cellxgene_datasets") == "CELLxGENE Discover / Census"
+    assert workflow._resolve_source_label("load_skill") == ""
+    assert workflow._resolve_source_label("load_skill_resource") == ""
     assert workflow._resolve_source_label("unknown_tool") == "unknown_tool"
     assert workflow._resolve_source_label("") == ""
     # BigQuery dataset.table format - use dataset's display name
@@ -1060,6 +1063,37 @@ def test_derive_step_data_sources_prefers_specific_bigquery_backing_source():
     }
     assert workflow._derive_step_data_sources(step) == ["Open Targets Platform"]
     assert workflow._preferred_step_source_label(step, "run_bigquery_select_query") == "Open Targets Platform"
+
+
+def test_derive_step_data_sources_ignores_internal_skill_tools():
+    step = {
+        "tool_hint": "get_depmap_gene_dependency",
+        "tools_called": ["load_skill", "get_depmap_gene_dependency"],
+        "data_sources_queried": ["load_skill"],
+        "structured_observations": [],
+    }
+    assert workflow._derive_step_data_sources(step) == ["DepMap"]
+
+
+def test_depmap_tool_metadata_mentions_release_level_limits():
+    desc = tool_registry.TOOL_DESCRIPTIONS["get_depmap_gene_dependency"]
+    assert "release-level" in desc
+    assert "Does not directly slice by lineage" in desc
+    preferred_for = tool_registry.TOOL_ROUTING_METADATA["get_depmap_gene_dependency"]["preferred_for"]
+    assert "not lineage/mutation-filtered co-dependency discovery" in preferred_for
+
+
+def test_variant_annotation_tool_metadata_mentions_protein_hgvs_inputs():
+    desc = tool_registry.TOOL_DESCRIPTIONS["get_variant_annotations"]
+    assert "gene+protein HGVS" in desc
+    assert "KRAS G12C" in desc
+    preferred_for = tool_registry.TOOL_ROUTING_METADATA["get_variant_annotations"]["preferred_for"]
+    assert "KRAS G12C" in preferred_for
+
+
+def test_normalize_source_label_candidates_excludes_internal_skill_tools():
+    assert workflow._normalize_source_label_candidates(["load_skill"], allow_verbatim_labels=True) == []
+    assert workflow._normalize_source_label_candidates(["load_skill_resource"], allow_verbatim_labels=True) == []
 
 
 def test_format_source_precedence_rules_mentions_overlap_groups():
@@ -1192,6 +1226,35 @@ def test_step_executor_instruction_mentions_monarch_entity_id_guidance():
 def test_step_executor_instruction_mentions_representative_compounds_and_trials():
     assert "do not stop at interaction counts" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
     assert "do not stop at study counts" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
+
+
+def test_step_executor_instruction_limits_bigquery_fallbacks_to_explicit_structured_steps():
+    text = workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "first try an alternative query or another tool in the same evidence family" in text
+    assert "Switch to generic BigQuery tools only when the current step is explicitly BigQuery-backed" in text
+    assert "fall back to run_bigquery_select_query" not in text
+
+
+def test_react_step_context_instructions_warn_against_bigquery_detours_for_target_vulnerability():
+    task_state = {
+        "objective": "Identify selective KRAS co-dependencies in lung cancer",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Collect KRAS dependency and selective vulnerability context",
+                "tool_hint": "get_depmap_gene_dependency",
+                "domains": ["genomics"],
+                "completion_condition": "Dependency context is summarized.",
+            }
+        ],
+    }
+    active_step = task_state["steps"][0]
+    instructions = workflow._react_step_context_instructions(task_state, active_step)
+    text = "\n".join(instructions)
+    assert "Routing guidance for this step's tool_hint `get_depmap_gene_dependency`" in text
+    assert "Keep target-vulnerability work inside specialized screening and dependency tools" in text
+    assert "`get_biogrid_orcs_gene_summary` (BioGRID ORCS)" in text
 
 
 def test_react_step_context_instructions_include_translational_routing_guidance():
@@ -1575,6 +1638,348 @@ def test_claim_synthesis_summary_weights_sources_and_flags_mixed_evidence():
     assert claim_summary["top_supported_claims"][0]["primary_sources"][0] == "GDSC / CancerRxGene"
     assert claim_summary["mixed_evidence_claims"][0]["assessment"] == "mixed_lean_supporting"
     assert claim_summary["mixed_evidence_claims"][0]["preferred_interpretation"] == "Paclitaxel is sensitive in A549"
+
+    graph_payload = workflow._build_semantic_evidence_graph(task_state)
+
+    assert graph_payload["summary"]["edge_count"] == 2
+    assert graph_payload["summary"]["mixed_edge_count"] == 2
+    assert all(edge["data"]["mixed_evidence"] for edge in graph_payload["elements"]["edges"])
+    assert {edge["data"]["predicate"] for edge in graph_payload["elements"]["edges"]} == {"sensitive_in", "resistant_in"}
+
+
+def test_semantic_evidence_graph_exposes_only_semantic_entities_and_edges():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess ataxia rare-disease evidence",
+        "success_criteria": ["Summarize phenotype and gene evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Map ataxia phenotype and retrieve rare-disease context",
+                "tool_hint": "query_monarch_associations",
+                "domains": ["genomics"],
+                "completion_condition": "Return phenotype-linked genes and disease context",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Assess ataxia rare-disease evidence",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected phenotype-linked associations.",
+            "result_summary": "Ataxia maps to established phenotype-driven gene associations.",
+            "evidence_ids": ["HP:0001251", "ORPHA:100"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["query_monarch_associations"],
+            "structured_observations": [
+                {
+                    "observation_type": "phenotype_association",
+                    "subject": {"type": "phenotype", "label": "Ataxia", "id": "HP:0001251"},
+                    "predicate": "associated_with",
+                    "object": {"type": "disease", "label": "Ataxia-telangiectasia", "id": "ORPHA:100"},
+                    "supporting_ids": ["HP:0001251", "ORPHA:100"],
+                    "source_tool": "query_monarch_associations",
+                    "confidence": "medium",
+                    "qualifiers": {"mode": "phenotype_to_disease"},
+                }
+            ],
+        },
+    )
+
+    graph_payload = workflow._build_semantic_evidence_graph(task_state)
+
+    assert graph_payload["summary"]["node_count"] == 2
+    assert graph_payload["summary"]["edge_count"] == 1
+    assert graph_payload["summary"]["evidence_count"] == 1
+    assert all(node["data"]["type"] not in {"objective", "step", "source"} for node in graph_payload["elements"]["nodes"])
+    assert graph_payload["elements"]["edges"][0]["data"]["predicate"] == "associated_with"
+    assert graph_payload["elements"]["edges"][0]["data"]["statement"] == "Ataxia is associated with Ataxia-telangiectasia"
+    assert any("semantic claims only" in warning.lower() for warning in graph_payload["warnings"])
+
+
+def test_semantic_evidence_graph_falls_back_to_support_topology_for_meta_only_support():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Review trial landscape",
+        "success_criteria": ["Capture any directly cited trials"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Review trial landscape",
+                "tool_hint": "search_clinical_trials",
+                "domains": ["clinical"],
+                "completion_condition": "Summarize returned studies",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Review trial landscape",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected trial references.",
+            "result_summary": "Two studies were returned for review.",
+            "evidence_ids": ["NCT01234567"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["search_clinical_trials"],
+            "structured_observations": [],
+        },
+    )
+
+    graph_payload = workflow._build_semantic_evidence_graph(task_state)
+
+    assert graph_payload["mode"] == "support_topology"
+    assert graph_payload["summary"]["node_count"] >= 2
+    assert graph_payload["summary"]["edge_count"] >= 1
+    assert all(node["data"]["type"] != "source" for node in graph_payload["elements"]["nodes"])
+    assert all(edge["data"]["predicate"] != "queried_source" for edge in graph_payload["elements"]["edges"])
+    assert any(edge["data"]["predicate"] == "supported_by" for edge in graph_payload["elements"]["edges"])
+    assert not graph_payload["warnings"]
+
+
+def test_support_topology_centers_single_inferred_query_focus():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess if PARK8 is a strong target for Parkinson's disease, including an analysis of the clinical trial landscape.",
+        "success_criteria": ["Capture trial evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Assess PARK8 trial landscape",
+                "tool_hint": "search_clinical_trials",
+                "domains": ["clinical"],
+                "completion_condition": "List relevant trials",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text=plan["objective"],
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected trial references.",
+            "result_summary": "Trials were collected for the target landscape.",
+            "evidence_ids": ["NCT01234567"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["search_clinical_trials"],
+            "structured_observations": [],
+        },
+    )
+
+    graph_payload = workflow._build_semantic_evidence_graph(task_state)
+
+    focus_labels = list(graph_payload["summary"]["focus_labels"])
+    nodes = [node["data"] for node in graph_payload["elements"]["nodes"]]
+    edges = [edge["data"] for edge in graph_payload["elements"]["edges"]]
+
+    assert graph_payload["mode"] == "support_topology"
+    assert "PARK8" in focus_labels
+    assert any(node["type"] == "query_focus" and node["full_label"] == "PARK8" for node in nodes)
+    assert all(node["type"] != "objective" for node in nodes)
+    assert all(node["type"] != "source" for node in nodes)
+    assert any(edge["source"].startswith("graph:focus:park8") for edge in edges)
+
+
+def test_support_topology_builds_multiple_query_focus_nodes_for_comparison_queries():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare IL13, IL31RA, OX40, OX40L, TSLP, and CCR4 to determine which target is most skin-selective for atopic dermatitis.",
+        "success_criteria": ["Capture identifier evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Resolve comparison targets",
+                "tool_hint": "resolve_gene_identifiers",
+                "domains": ["genomics"],
+                "completion_condition": "Resolve target identifiers",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text=plan["objective"],
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Resolved identifier evidence.",
+            "result_summary": "Identifier records were collected for the compared targets.",
+            "evidence_ids": ["ENSG00000169194", "ENSG00000164509"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["resolve_gene_identifiers"],
+            "structured_observations": [],
+        },
+    )
+
+    graph_payload = workflow._build_semantic_evidence_graph(task_state)
+
+    focus_labels = list(graph_payload["summary"]["focus_labels"])
+    nodes = [node["data"] for node in graph_payload["elements"]["nodes"]]
+
+    assert graph_payload["mode"] == "support_topology"
+    assert "IL13" in focus_labels
+    assert "IL31RA" in focus_labels
+    assert "OX40" in focus_labels
+    assert any(node["type"] == "query_focus" for node in nodes)
+    assert all(node["type"] != "support_cluster" for node in nodes)
+    assert all(node["type"] != "objective" for node in nodes)
+    assert all(node["type"] != "source" for node in nodes)
+    record_edges = [
+        edge["data"]
+        for edge in graph_payload["elements"]["edges"]
+        if edge["data"]["target"].startswith("entity:record:")
+    ]
+    assert record_edges
+    assert all(edge["data"]["source"].startswith("graph:focus:") for edge in graph_payload["elements"]["edges"])
+
+
+def test_semantic_evidence_graph_marks_query_target_as_focus_entity():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess if LRRK2 is a strong therapeutic target for Parkinson's disease.",
+        "success_criteria": ["Capture target biology evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Assess LRRK2 target biology",
+                "tool_hint": "search_pubmed",
+                "domains": ["literature"],
+                "completion_condition": "Summarize target evidence",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Assess if LRRK2 is a strong therapeutic target for Parkinson's disease.",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Captured target-linked biology.",
+            "result_summary": "LRRK2 links to disease biology and biomarker feasibility.",
+            "evidence_ids": ["PMID:12345"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["search_pubmed"],
+            "structured_observations": [
+                {
+                    "observation_type": "target_disease_link",
+                    "subject": {"type": "gene", "label": "LRRK2", "id": "NCBI:LRRK2"},
+                    "predicate": "associated_with",
+                    "object": {"type": "disease", "label": "Parkinson's disease", "id": "MONDO:0005180"},
+                    "supporting_ids": ["PMID:12345"],
+                    "source_tool": "search_pubmed",
+                    "confidence": "high",
+                },
+                {
+                    "observation_type": "target_biomarker_link",
+                    "subject": {"type": "gene", "label": "LRRK2", "id": "NCBI:LRRK2"},
+                    "predicate": "has_biomarker",
+                    "object": {"type": "biomarker", "label": "pRab10"},
+                    "supporting_ids": ["PMID:12345"],
+                    "source_tool": "search_pubmed",
+                    "confidence": "medium",
+                },
+            ],
+        },
+    )
+
+    graph_payload = workflow._build_semantic_evidence_graph(task_state)
+
+    focus_labels = list(graph_payload["summary"]["focus_labels"])
+    focus_nodes = [node["data"] for node in graph_payload["elements"]["nodes"] if int(node["data"].get("is_focus", 0) or 0) > 0]
+
+    assert "LRRK2" in focus_labels
+    assert any(node["full_label"] == "LRRK2" and node["type"] == "gene" for node in focus_nodes)
+    assert all(node["type"] != "disease" for node in focus_nodes)
+
+
+def test_semantic_evidence_graph_marks_multiple_compared_targets_as_focus_entities():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare IL13 and IL31RA to determine which target is most skin-selective for atopic dermatitis.",
+        "success_criteria": ["Rank compared targets"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare IL13 and IL31RA",
+                "tool_hint": "query_human_protein_atlas_rna",
+                "domains": ["expression"],
+                "completion_condition": "Summarize tissue specificity",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Compare IL13 and IL31RA to determine which target is most skin-selective for atopic dermatitis.",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Captured expression-linked target evidence.",
+            "result_summary": "IL13 and IL31RA both have skin-relevant evidence.",
+            "evidence_ids": ["HPA:IL13", "HPA:IL31RA"],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["query_human_protein_atlas_rna"],
+            "structured_observations": [
+                {
+                    "observation_type": "target_disease_link",
+                    "subject": {"type": "gene", "label": "IL13", "id": "HGNC:6014"},
+                    "predicate": "associated_with",
+                    "object": {"type": "disease", "label": "atopic dermatitis", "id": "MONDO:0015967"},
+                    "supporting_ids": ["HPA:IL13"],
+                    "source_tool": "query_human_protein_atlas_rna",
+                    "confidence": "medium",
+                },
+                {
+                    "observation_type": "target_disease_link",
+                    "subject": {"type": "gene", "label": "IL31RA", "id": "HGNC:17497"},
+                    "predicate": "associated_with",
+                    "object": {"type": "disease", "label": "atopic dermatitis", "id": "MONDO:0015967"},
+                    "supporting_ids": ["HPA:IL31RA"],
+                    "source_tool": "query_human_protein_atlas_rna",
+                    "confidence": "medium",
+                },
+            ],
+        },
+    )
+
+    graph_payload = workflow._build_semantic_evidence_graph(task_state)
+
+    focus_labels = list(graph_payload["summary"]["focus_labels"])
+
+    assert "IL13" in focus_labels
+    assert "IL31RA" in focus_labels
 
 
 def test_on_model_error_surfaces_vertex_rate_limit_without_hidden_retry(monkeypatch):
@@ -2279,6 +2684,38 @@ def test_hyperlink_author_year_citations_links_plain_author_year_mentions(monkey
     )
 
     assert "[Ng & Cao, 2024](#ref-1)" in linked
+
+
+def test_collapse_duplicate_citation_mentions_removes_linked_plain_duplicates():
+    text = (
+        "Synthetic lethality was observed "
+        "([Hu et al., 2020](#ref-1), Hu et al., 2020).\n\n"
+        "## References\n\n"
+        '<a id="ref-1"></a>1. Example'
+    )
+
+    collapsed = workflow._collapse_duplicate_citation_mentions(text)
+
+    assert "([Hu et al., 2020](#ref-1))" in collapsed
+    assert "([Hu et al., 2020](#ref-1), Hu et al., 2020)" not in collapsed
+
+
+def test_collapse_duplicate_citation_mentions_removes_plain_plain_duplicates():
+    text = "KRAS context remained consistent (Yang et al., 2022, Yang et al., 2022)."
+
+    collapsed = workflow._collapse_duplicate_citation_mentions(text)
+
+    assert "(Yang et al., 2022)." in collapsed
+    assert "Yang et al., 2022, Yang et al., 2022" not in collapsed
+
+
+def test_collapse_duplicate_citation_mentions_prefers_linked_form_when_plain_precedes_link():
+    text = "Model evidence highlighted (Drosten & Barbacid, 2016, [Drosten & Barbacid, 2016](#ref-3))."
+
+    collapsed = workflow._collapse_duplicate_citation_mentions(text)
+
+    assert "([Drosten & Barbacid, 2016](#ref-3))." in collapsed
+    assert "Drosten & Barbacid, 2016, [Drosten & Barbacid, 2016](#ref-3)" not in collapsed
 
 
 def test_extract_evidence_ids_from_text_deduplication():

@@ -1553,6 +1553,10 @@ function buildBigQueryErrorHint(query, errorMessage) {
     hints.push("Re-check exact column names with list_bigquery_tables(dataset=..., table=...).");
   }
 
+  if (/Not found: Job/i.test(normalizedMessage)) {
+    hints.push("Dry-run jobs do not support follow-up metadata/result lookups; use the stats returned by createQueryJob directly. For executed queries, also re-check the configured BigQuery location.");
+  }
+
   if (/Query exceeded limit for bytes billed/i.test(normalizedMessage)) {
     if (/`?bigquery-public-data\.umiami_lincs\.readout`?/i.test(normalizedQuery) || /`?umiami_lincs\.readout`?/i.test(normalizedQuery)) {
       hints.push(
@@ -4613,14 +4617,11 @@ server.registerTool(
 
     try {
       const client = getBigQueryClient();
-      const [job] = await client.createQueryJob(jobOptions);
-      const [metadata] = await job.getMetadata();
-      const stats = metadata?.statistics?.query || {};
-      const totalBytesProcessed = Number(stats?.totalBytesProcessed || 0);
-      const totalBytesBilled = Number(stats?.totalBytesBilled || 0);
-      const cacheHit = Boolean(stats?.cacheHit);
+      const [job, createResponse] = await client.createQueryJob(jobOptions);
+      const initialStats = createResponse?.statistics?.query || job?.metadata?.statistics?.query || {};
 
       if (Boolean(dryRun)) {
+        const totalBytesProcessed = Number(initialStats?.totalBytesProcessed || 0);
         return {
           content: [
             {
@@ -4644,6 +4645,11 @@ server.registerTool(
       }
 
       const [rows] = await job.getQueryResults({ maxResults: boundedRows, autoPaginate: false });
+      const [metadata] = await job.getMetadata();
+      const stats = metadata?.statistics?.query || initialStats;
+      const totalBytesProcessed = Number(stats?.totalBytesProcessed || 0);
+      const totalBytesBilled = Number(stats?.totalBytesBilled || 0);
+      const cacheHit = Boolean(stats?.cacheHit);
       const previewLines = (rows || [])
         .slice(0, boundedRows)
         .map((row, idx) => `${idx + 1}. ${JSON.stringify(row)}`);
@@ -10275,13 +10281,14 @@ server.registerTool(
     description:
       "Get aggregated variant annotations from MyVariant.info, which combines 20+ sources including ClinVar, " +
       "dbSNP, CADD, gnomAD, COSMIC, and more. " +
-      "Accepts rsID (e.g. rs113488022) or HGVS: chr2:g.165310413C>T or NC_000002.12:g.165310413C>T (RefSeq/hg38; auto-converted). " +
+      "Accepts rsID (e.g. rs113488022), genomic HGVS (e.g. chr2:g.165310413C>T or NC_000002.12:g.165310413C>T), " +
+      "gene+protein HGVS such as KRAS:p.Gly12Cys, or shorthand like KRAS G12C. " +
       "Does NOT accept gene symbols. If only a gene is known, use search_variants_by_gene first. " +
       "gnomAD fields: gnomad_exome, gnomad_genome (not gnomad_genomes).",
     inputSchema: {
       variantId: z
         .string()
-        .describe('Variant identifier: rsID (e.g. "rs113488022") or HGVS genomic notation (e.g. "chr7:g.140753336A>T")'),
+        .describe('Variant identifier: rsID, genomic HGVS, gene+protein HGVS, or shorthand like "KRAS G12C" (e.g. "rs113488022", "chr7:g.140753336A>T", "KRAS:p.Gly12Cys")'),
       fields: z
         .string()
         .optional()
@@ -10301,6 +10308,47 @@ server.registerTool(
       requestFields = requestFields.replace(/gnomad_genomes/g, "gnomad_genome");
     }
 
+    const proteinHgvsMatch = normalizedId.match(/^([A-Za-z0-9_-]+)[:\s]+(p\.[A-Za-z][A-Za-z0-9*]+)$/i);
+    const proteinShorthandMatch = normalizedId.match(/^([A-Za-z0-9_-]+)[:\s]+([A-Za-z]\d+[A-Za-z*])$/i);
+    const proteinQueryMeta = proteinHgvsMatch
+      ? { gene: proteinHgvsMatch[1].toUpperCase(), protein: proteinHgvsMatch[2] }
+      : proteinShorthandMatch
+        ? { gene: proteinShorthandMatch[1].toUpperCase(), protein: `p.${proteinShorthandMatch[2]}` }
+        : null;
+
+    const scoreProteinQueryHit = (hit, { gene, protein }) => {
+      const hitGeneValues = asArray(hit?.dbnsfp?.genename).map((value) => normalizeWhitespace(value).toUpperCase()).filter(Boolean);
+      const hitProteinValues = asArray(hit?.dbnsfp?.hgvsp).map((value) => normalizeWhitespace(value)).filter(Boolean);
+      let score = 0;
+      if (hitGeneValues.includes(gene)) score += 6;
+      if (hitProteinValues.includes(protein)) score += 8;
+      if (/^chr[\w]+:g\.\d+[ACGT]>[ACGT]$/i.test(normalizeWhitespace(hit?._id || ""))) score += 2;
+      return score;
+    };
+
+    const fetchProteinHgvsHit = async ({ gene, protein }) => {
+      const searchQueries = [
+        `dbnsfp.genename:${gene} AND dbnsfp.hgvsp:${protein}`,
+        `${gene} ${protein}`,
+      ];
+      for (const queryText of searchQueries) {
+        const params = new URLSearchParams({
+          q: queryText,
+          fields: `_id,${requestFields}`,
+          size: "10",
+        });
+        const queryUrl = `${MYVARIANT_API}/query?${params}`;
+        const queryData = await fetchJsonWithRetry(queryUrl, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+        const queryHits = Array.isArray(queryData?.hits) ? queryData.hits : [];
+        if (queryHits.length === 0) continue;
+        const ranked = [...queryHits].sort(
+          (a, b) => scoreProteinQueryHit(b, { gene, protein }) - scoreProteinQueryHit(a, { gene, protein })
+        );
+        return { hit: ranked[0], url: queryUrl };
+      }
+      return { hit: null, url: `${MYVARIANT_API}/query?q=${encodeURIComponent(`${gene} ${protein}`)}` };
+    };
+
     let resolvedId = normalizedId;
     let useHg38 = false;
     const ncMatch = normalizedId.match(/^NC_0*(\d{2})\.\d+:(.+)$/);
@@ -10315,35 +10363,48 @@ server.registerTool(
     }
 
     const isRsId = /^rs\d+$/i.test(resolvedId);
-    let url;
-    if (isRsId) {
+    let url = "";
+    let hit = null;
+    if (proteinQueryMeta) {
+      const proteinResolution = await fetchProteinHgvsHit(proteinQueryMeta);
+      hit = proteinResolution.hit;
+      url = proteinResolution.url;
+    } else if (isRsId) {
       const params = new URLSearchParams({ q: `dbsnp.rsid:${resolvedId}`, fields: requestFields, size: "1" });
       url = `${MYVARIANT_API}/query?${params}`;
+      const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+      hit = Array.isArray(data?.hits) ? data.hits[0] : null;
     } else {
       const params = new URLSearchParams({ fields: requestFields });
       if (useHg38) params.set("assembly", "hg38");
       url = `${MYVARIANT_API}/variant/${encodeURIComponent(resolvedId)}?${params}`;
-    }
 
-    let data;
-    try {
-      data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
-    } catch (err) {
-      if (useHg38 && /404/.test(String(err?.message || ""))) {
-        const paramsHg19 = new URLSearchParams({ fields: requestFields });
-        const urlHg19 = `${MYVARIANT_API}/variant/${encodeURIComponent(resolvedId)}?${paramsHg19}`;
-        try {
-          data = await fetchJsonWithRetry(urlHg19, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
-          useHg38 = false;
-        } catch {
+      try {
+        hit = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+      } catch (err) {
+        const errorMessage = String(err?.message || "");
+        if (useHg38 && /404/.test(errorMessage)) {
+          const paramsHg19 = new URLSearchParams({ fields: requestFields });
+          const urlHg19 = `${MYVARIANT_API}/variant/${encodeURIComponent(resolvedId)}?${paramsHg19}`;
+          try {
+            hit = await fetchJsonWithRetry(urlHg19, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+            url = urlHg19;
+            useHg38 = false;
+          } catch (fallbackErr) {
+            if (/404/.test(String(fallbackErr?.message || ""))) {
+              hit = null;
+            } else {
+              throw fallbackErr;
+            }
+          }
+        } else if (/404/.test(errorMessage)) {
+          hit = null;
+        } else {
           throw err;
         }
-      } else {
-        throw err;
       }
     }
 
-    const hit = isRsId ? (Array.isArray(data?.hits) ? data.hits[0] : null) : data;
     if (!hit || hit.notfound) {
       // If input looks like a gene symbol, try search_variants_by_gene logic to return useful results
       const firstToken = normalizedId.split(/\s+/)[0] || normalizedId;
@@ -10409,7 +10470,7 @@ server.registerTool(
               keyFields: [`Queried: ${normalizedId}`],
               sources: [url],
               limitations: [
-                'Check variant format. Examples: "rs113488022", "chr7:g.140753336A>T".',
+                'Check variant format. Examples: "rs113488022", "chr7:g.140753336A>T", "KRAS:p.Gly12Cys", "KRAS G12C".',
                 "If this is a gene symbol, use search_variants_by_gene(gene='...') first to discover variants.",
                 "MyVariant.info uses hg19 coordinates by default.",
               ],

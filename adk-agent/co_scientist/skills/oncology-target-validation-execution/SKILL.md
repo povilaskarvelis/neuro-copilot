@@ -10,4 +10,5 @@ Instructions:
 2. Use screening evidence and compound-response evidence as complementary signals, not substitutes.
 3. Prefer disease-, lineage-, or biomarker-specific interpretation over pan-cancer averages when the question is therapeutic relevance.
 4. If a target appears pan-essential, call that out as a liability unless the user explicitly wants broad essential genes.
-5. Load `references/oncology-target-validation-execution.md` before concluding oncology target-validation steps.
+5. Do not present aggregate DepMap release-level results as if they were lineage- or mutation-filtered evidence. If the available tool cannot provide the requested subtype slice, state that limitation explicitly instead of forcing specificity.
+6. Load `references/oncology-target-validation-execution.md` before concluding oncology target-validation steps.
