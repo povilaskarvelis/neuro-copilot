@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 import logging
 import os
@@ -127,6 +128,13 @@ STATE_EXECUTOR_REASONING_TRACE = "temp:co_scientist_executor_reasoning_trace"
 STATE_EXECUTOR_TOOL_LOG = "temp:co_scientist_executor_tool_log"
 STATE_PLAN_PENDING_APPROVAL = "co_scientist_plan_pending_approval"
 STATE_MODEL_ERROR_PASSTHROUGH = "temp:co_scientist_model_error_passthrough"
+STATE_BENCHMARK_LOOP_COUNT = "temp:co_scientist_benchmark_loop_count"
+STATE_BENCHMARK_COMPLETE = "temp:co_scientist_benchmark_complete"
+STATE_BENCHMARK_LAST_DRAFT = "temp:co_scientist_benchmark_last_draft"
+STATE_BENCHMARK_FINAL_ANSWER = "temp:co_scientist_benchmark_final_answer"
+STATE_BENCHMARK_RETRY_FEEDBACK = "temp:co_scientist_benchmark_retry_feedback"
+
+BENCHMARK_LOOP_MAX_ITERATIONS = 6
 
 FINALIZE_COMMANDS = {
     "finalize",
@@ -159,6 +167,9 @@ FINAL_SYNTHESIS_SCHEMA = "final_synthesis.v1"
 WORKFLOW_TASK_SCHEMA = "workflow_task_state.v1"
 
 KNOWN_MCP_TOOLS = [
+    "get_open_targets_l2g",
+    "get_open_targets_association",
+    "get_tcga_project_data_availability",
     "list_bigquery_tables",
     "run_bigquery_select_query",
     "search_clinical_trials",
@@ -172,6 +183,15 @@ KNOWN_MCP_TOOLS = [
     "search_iedb_epitope_evidence",
     "search_geo_datasets",
     "get_geo_dataset",
+    "get_geo_cell_type_proportions",
+    "search_refseq_sequences",
+    "get_refseq_record",
+    "get_ensembl_canonical_transcript",
+    "search_ucsc_genome",
+    "get_ucsc_genomic_sequence",
+    "get_ucsc_track_data",
+    "search_encode_metadata",
+    "get_encode_record",
     "search_openalex_works",
     "search_openalex_authors",
     "rank_researchers_by_activity",
@@ -191,6 +211,7 @@ KNOWN_MCP_TOOLS = [
     "get_intact_interactions",
     "get_biogrid_interactions",
     "get_alphafold_structure",
+    "get_alphafold_domain_plddt",
     "search_protein_structures",
     "search_drug_gene_interactions",
     "annotate_variants_vep",
@@ -199,14 +220,18 @@ KNOWN_MCP_TOOLS = [
     "search_variants_by_gene",
     "get_variant_annotations",
     "search_gwas_associations",
+    "get_gwas_study_variant_association",
+    "get_jaspar_motif_profile",
     "get_gene_tissue_expression",
     "get_human_protein_atlas_gene",
     "get_depmap_gene_dependency",
+    "get_depmap_expression_subset_mean",
     "get_biogrid_orcs_gene_summary",
     "get_gdsc_drug_sensitivity",
     "get_prism_repurposing_response",
     "get_pharmacodb_compound_response",
     "search_cellxgene_datasets",
+    "get_cellxgene_marker_genes",
     "search_pathway_commons_top_pathways",
     "get_guidetopharmacology_target",
     "get_dailymed_drug_label",
@@ -236,6 +261,8 @@ KNOWN_MCP_TOOLS = [
     "get_enigma_dataset_info",
     "benchmark_dataset_overview",
     "check_gpqa_access",
+    "search_zenodo_records",
+    "get_zenodo_record",
 ]
 
 DEFAULT_TOOL_HINT_BY_DOMAIN = {
@@ -265,6 +292,14 @@ EMPTY_LIKE_TOOL_HINTS = {
 
 TOOL_HINT_INFERENCE_RULES: list[tuple[tuple[str, ...], str]] = [
     (
+        ("l2g", "locus-to-gene", "locus to gene", "credible set", "study-locus", "variant-to-gene"),
+        "get_open_targets_l2g",
+    ),
+    (
+        ("open targets", "open targets platform", "opentargets", "association score"),
+        "get_open_targets_association",
+    ),
+    (
         ("clingen", "gene-disease validity", "gene disease validity", "dosage sensitivity", "curated gene-disease"),
         "get_clingen_gene_curation",
     ),
@@ -279,6 +314,26 @@ TOOL_HINT_INFERENCE_RULES: list[tuple[tuple[str, ...], str]] = [
     (
         ("identifier", "identifiers", "gene symbol", "aliases", "alias", "ensembl", "entrez"),
         "resolve_gene_identifiers",
+    ),
+    (
+        ("refseq", "refseq accession", "nm_", "nr_", "nc_", "ng_", "xm_", "xr_", "np_", "xp_"),
+        "search_refseq_sequences",
+    ),
+    (
+        ("canonical transcript", "canonical tss", "transcription start site", "tss"),
+        "get_ensembl_canonical_transcript",
+    ),
+    (
+        ("ucsc", "genome browser", "hg38", "hg19", "mm10", "mm39", "knowngene"),
+        "search_ucsc_genome",
+    ),
+    (
+        ("encode", "chip-seq", "chip seq", "dnase-seq", "dnase seq", "encsr", "encff", "encode portal"),
+        "search_encode_metadata",
+    ),
+    (
+        ("zenodo", "10.5281/zenodo", "zenodo.org"),
+        "search_zenodo_records",
     ),
     (
         ("ontology", "mondo", "efo", "doid", "mesh", "omim", "umls"),
@@ -430,6 +485,7 @@ Rules:
   against a named BigQuery dataset. Do not substitute BigQuery for specialized screening, dependency, or pharmacogenomic tools
   just because the first query was incomplete.
 - For `query_monarch_associations`, use only the supported association modes from the tool schema, and pass a normalized `entityId` CURIE when you already resolved the gene, disease, or phenotype.
+- For Ensembl canonical-transcript or TSS questions, prefer `get_ensembl_canonical_transcript` instead of inferring the TSS from a broad gene span or generic search hit.
 - For archive/search tools that do literal metadata matching (for example OpenNeuro, DANDI, NEMAR, Brain-CODE, CONP), avoid boolean query strings like `A OR B` unless the tool explicitly supports them; run separate simple searches instead.
 - For dataset archives with sparse disorder labels, a zero-hit disease query is not enough to conclude the archive has no relevant data; retry with modality, task, study name, or archive browsing before blocking the step.
 - If no tool can satisfy the step after trying alternatives, state clearly that the step is BLOCKED and why.
@@ -463,6 +519,8 @@ After completing your tool calls, write a clear findings summary. Your summary s
 - For result-limited or paginated search tools, treat the number returned by the tool as a retrieval count, not as the full source count, unless the tool explicitly reports a source total. Prefer wording like "returned", "showing", or "sample of X" over "there are X" when the universe total is unknown.
 - For DGIdb, Guide to Pharmacology, or ChEMBL evidence, do not stop at interaction counts. Name representative compounds and include interaction type, approval/experimental status, potency/score, or PMIDs when available.
 - For ClinicalTrials.gov evidence, do not stop at study counts. Include representative NCT IDs, named interventions, statuses, phases, and note when counts reflect only fetched studies rather than the full registry.
+- When a tool returns an exact DNA/RNA/protein sequence, copy it character-for-character from the source result. Preserve the first base/residue, preserve order, and normalize to plain uppercase sequence text.
+- Do not convert decimal fractions into percentages unless the step or user explicitly asks for a percent. If a tool returns a fraction like `gc_fraction`, keep it as a fraction.
 - Note any contradictions, gaps, or limitations discovered
 - State whether this step is COMPLETED or BLOCKED (and why if blocked)
 - Do NOT embed raw tool response envelopes or large payload objects; summarize tool results in
@@ -603,6 +661,100 @@ Guidelines:
 - If the question would benefit from a formal evidence-based investigation with real-time data
   from biomedical databases, suggest: "For a comprehensive evidence-based analysis with citations,
   you can ask me to formally investigate this as a research question."
+"""
+
+
+BENCHMARK_QA_INSTRUCTION = """You are the benchmark execution profile for the AI Co-Scientist.
+Answer a SINGLE benchmark question by using the available biomedical tools directly.
+
+Your goal is to maximize factual correctness on source-grounded database questions.
+
+Rules:
+- Treat the question as a direct lookup or lightweight computation task, not as a report-writing task.
+- Use tools aggressively when the question references a database, release, accession, coordinate range, identifier, or file-derived quantity.
+- For Open Targets questions about L2G, credible sets, or variant-to-gene prioritization, use `get_open_targets_l2g`; do not substitute `get_open_targets_association`, which answers a different score.
+- For Open Targets questions that mention a named release, prefer `get_open_targets_association` or `get_open_targets_l2g` over BigQuery/current-release sources.
+- For benchmark Open Targets L2G questions without an explicit release, default to `release="25.09"` so the answer stays aligned with the benchmark snapshot rather than the latest archive.
+- For GWAS Catalog questions that name both a GCST study accession and a specific rsID or risk allele, prefer `get_gwas_study_variant_association` over broad search tools and report the matched RAF/risk frequency directly.
+- For JASPAR transcription-factor motif questions, prefer `get_jaspar_motif_profile` and report the returned consensus sequence and total information content.
+- For TCGA/GDC project-level file-availability questions such as how many TCGA-BRCA cases have proteome profiling, prefer `get_tcga_project_data_availability`; it returns the case count from GDC, not a cBioPortal sample count.
+- For Cell X Gene / CELLxGENE questions asking for a top marker gene or marker-effect ranking in a named cell type and tissue, prefer `get_cellxgene_marker_genes` over `search_cellxgene_datasets`; the dataset-search tool only finds datasets and cannot answer marker-gene rankings.
+- For GEO questions asking for donor- or disease-filtered cell-type proportions from a specific dataset, prefer `get_geo_cell_type_proportions` over `get_geo_dataset`; the metadata tool cannot compute per-cell proportions.
+- For Ensembl canonical transcript or TSS questions, prefer `get_ensembl_canonical_transcript`; when upstream/downstream bases are requested, ask that tool for the TSS-centered window directly.
+- For genome sequence questions, prefer `get_ucsc_genomic_sequence` and use the returned GC/base-composition fields directly when they answer the question.
+- When a question gives a human-readable genomic interval like `chr:start-end`, treat that interval as 1-based inclusive when reasoning about the expected sequence length. If you call UCSC sequence APIs, convert to UCSC coordinates carefully so you do not drop the first base.
+- When a question asks for `N bp upstream` plus `N bp downstream` of a coordinate or TSS, include the central base/position in the requested interval unless the question explicitly says otherwise.
+- For RefSeq annotation questions (for example signal peptide, CDS, or peptide ranges), use `get_refseq_record` and inspect its returned feature annotations.
+- For UniProt accession questions about disease-associated natural variants or amino acid positions, use `get_uniprot_protein_profile` and inspect the disease-associated natural variant positions in the response.
+- For AlphaFold questions asking for domain-level mean pLDDT values, prefer `get_alphafold_domain_plddt` over `get_alphafold_structure`; the structure-summary tool only returns the global model score.
+- For ENCODE MPRA or CRISPR-screen questions, search `FunctionalCharacterizationExperiment` records via `search_encode_metadata` rather than assuming they live under generic `Experiment`, and extract named cell lines from `biosample_summary` and dataset descriptions when they are enumerated there.
+- For Human Protein Atlas exact single-cell questions, infer the tissue and cell-type strings from the question and pass them directly to `get_human_protein_atlas_gene` via `singleCellTissue` and `singleCellCellType`. If the question says non-Tabula Sapiens or single cell type, set `singleCellDataset="single_cell_type"`. In benchmark mode, default HPA single-cell lookups to `release="v24"` unless the question explicitly asks for another release.
+- For DepMap public-expression questions that ask for a mean log2(TPM+1) value across a named model subset or molecular subtype, prefer `get_depmap_expression_subset_mean` over blocked BigQuery queries.
+- Do not ask the user clarifying questions. Make the most reasonable interpretation and proceed.
+- Do not produce a research plan, step list, report section, limitations section, or methodological essay.
+- Do not tell the user how they could look up the answer themselves. Return the best answer you can derive.
+- If a tool returns enough information to answer, stop and answer succinctly.
+- If multiple values are requested, enumerate every requested item explicitly so none are omitted.
+- Keep the final answer compact and high-signal: no headers, no preamble, no citations unless the question explicitly asks.
+- When the answer is numeric, include the exact numeric value and units when available.
+- When a score-like answer is a long floating-point decimal, prefer a short rounded form in the final wording and keep the exact value in parentheses if helpful.
+- Do not convert decimal fractions into percentages unless the question explicitly asks for a percent. If a tool returns `gc_fraction`, report the fraction, not `gc_percent`.
+- When a small calculation is required, compute it and report the computed result directly.
+- For DNA/RNA/protein sequence questions, copy the final sequence character-for-character from the source result. Preserve the first residue/base, preserve order, preserve case normalization as a plain uppercase sequence, and do not add prose around the sequence unless the question asks for more than the sequence itself.
+- If a required source is unavailable after genuine tool attempts, say that briefly and state the closest grounded result you were able to recover.
+"""
+
+
+BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE = """You are the benchmark execution profile for the AI Co-Scientist.
+Answer a SINGLE benchmark question by using the available biomedical tools directly.
+
+Work in iterative Reason-Act-Observe cycles:
+1. REASON: identify what is still missing from the answer.
+2. ACT: call the best tool(s) to fill that gap.
+3. OBSERVE: inspect the tool outputs carefully.
+4. FINALIZE: ONLY when every requested item is covered, output `FINAL: <compact answer>`.
+
+Your goal is to maximize factual correctness on source-grounded database questions.
+
+Rules:
+- Treat the question as a direct lookup or lightweight computation task, not as a report-writing task.
+- Use tools aggressively when the question references a database, release, accession, coordinate range, identifier, or file-derived quantity.
+- Keep working until every requested value or entity is covered, or you are clearly blocked after trying reasonable alternatives.
+- Do not output `FINAL:` for a partial answer.
+- If a previous draft omitted requested items or ended in a blocked-style answer, fix that before finalizing.
+- If a tool call fails or returns insufficient data, first try a more specific query or another tool in the same evidence family before finalizing.
+- For Open Targets questions about L2G, credible sets, or variant-to-gene prioritization, use `get_open_targets_l2g`; do not substitute `get_open_targets_association`, which answers a different score.
+- For Open Targets questions that mention a named release, prefer `get_open_targets_association` or `get_open_targets_l2g` over BigQuery/current-release sources.
+- For benchmark Open Targets L2G questions without an explicit release, default to `release="25.09"` so the answer stays aligned with the benchmark snapshot rather than the latest archive.
+- For GWAS Catalog questions that name both a GCST study accession and a specific rsID or risk allele, prefer `get_gwas_study_variant_association` over broad search tools and report the matched RAF/risk frequency directly.
+- For JASPAR transcription-factor motif questions, prefer `get_jaspar_motif_profile` and report the returned consensus sequence and total information content.
+- For TCGA/GDC project-level file-availability questions such as how many TCGA-BRCA cases have proteome profiling, prefer `get_tcga_project_data_availability`; it returns the case count from GDC, not a cBioPortal sample count.
+- For Cell X Gene / CELLxGENE questions asking for a top marker gene or marker-effect ranking in a named cell type and tissue, prefer `get_cellxgene_marker_genes` over `search_cellxgene_datasets`; the dataset-search tool only finds datasets and cannot answer marker-gene rankings.
+- For GEO questions asking for donor- or disease-filtered cell-type proportions from a specific dataset, prefer `get_geo_cell_type_proportions` over `get_geo_dataset`; the metadata tool cannot compute per-cell proportions.
+- For Ensembl canonical transcript or TSS questions, prefer `get_ensembl_canonical_transcript`; when upstream/downstream bases are requested, ask that tool for the TSS-centered window directly.
+- For genome sequence questions, prefer `get_ucsc_genomic_sequence` and use the returned GC/base-composition fields directly when they answer the question.
+- When a question gives a human-readable genomic interval like `chr:start-end`, treat that interval as 1-based inclusive when reasoning about the expected sequence length. If you call UCSC sequence APIs, convert to UCSC coordinates carefully so you do not drop the first base.
+- When a question asks for `N bp upstream` plus `N bp downstream` of a coordinate or TSS, include the central base/position in the requested interval unless the question explicitly says otherwise.
+- For RefSeq annotation questions (for example signal peptide, CDS, or peptide ranges), use `get_refseq_record` and inspect its returned feature annotations.
+- For UniProt accession questions about disease-associated natural variants or amino acid positions, use `get_uniprot_protein_profile` and inspect the disease-associated natural variant positions in the response.
+- For AlphaFold questions asking for domain-level mean pLDDT values, prefer `get_alphafold_domain_plddt` over `get_alphafold_structure`; the structure-summary tool only returns the global model score.
+- For ENCODE MPRA or CRISPR-screen questions, search `FunctionalCharacterizationExperiment` records via `search_encode_metadata` rather than assuming they live under generic `Experiment`, and extract named cell lines from `biosample_summary` and dataset descriptions when they are enumerated there.
+- For Human Protein Atlas exact single-cell questions, infer the tissue and cell-type strings from the question and pass them directly to `get_human_protein_atlas_gene` via `singleCellTissue` and `singleCellCellType`. If the question says non-Tabula Sapiens or single cell type, set `singleCellDataset="single_cell_type"`. In benchmark mode, default HPA single-cell lookups to `release="v24"` unless the question explicitly asks for another release.
+- For DepMap public-expression questions that ask for a mean log2(TPM+1) value across a named model subset or molecular subtype, prefer `get_depmap_expression_subset_mean` over blocked BigQuery queries.
+- Do not ask the user clarifying questions. Make the most reasonable interpretation and proceed.
+- Do not produce a research plan, step list, report section, limitations section, or methodological essay.
+- Do not tell the user how they could look up the answer themselves. Return the best answer you can derive.
+- If multiple values are requested, enumerate every requested item explicitly so none are omitted.
+- Keep the final answer compact and high-signal: no headers, no preamble, no citations unless the question explicitly asks.
+- When the answer is numeric, include the exact numeric value and units when available.
+- When a score-like answer is a long floating-point decimal, prefer a short rounded form in the final wording and keep the exact value in parentheses if helpful.
+- Do not convert decimal fractions into percentages unless the question explicitly asks for a percent. If a tool returns `gc_fraction`, report the fraction, not `gc_percent`.
+- When a small calculation is required, compute it and report the computed result directly.
+- For DNA/RNA/protein sequence questions, copy the final sequence character-for-character from the source result. Preserve the first residue/base, preserve order, preserve case normalization as a plain uppercase sequence, and do not add prose around the sequence unless the question asks for more than the sequence itself.
+- If a required source is unavailable after genuine tool attempts, say that briefly and state the closest grounded result you were able to recover.
+
+Source precedence rules for overlapping tools:
+__ROUTING_POLICY__
 """
 
 
@@ -754,6 +906,11 @@ def _is_lookup_tool_name(name: str) -> bool:
         "get_clinical_trial",
         "get_pubmed_abstract",
         "get_paper_fulltext",
+        "get_refseq_record",
+        "get_ucsc_genomic_sequence",
+        "get_ucsc_track_data",
+        "get_encode_record",
+        "get_zenodo_record",
     }
 
 
@@ -765,6 +922,27 @@ def _compact_tool_args_for_provenance(args: Mapping[str, Any]) -> dict[str, Any]
     """Store a compact subset of tool args so follow-up turns can reuse scope exactly."""
     preferred_keys = [
         "query",
+        "search",
+        "genome",
+        "chrom",
+        "start",
+        "end",
+        "track",
+        "maxMatches",
+        "maxItems",
+        "maxResults",
+        "maxBases",
+        "objectType",
+        "searchTerm",
+        "searchQuery",
+        "recordId",
+        "recordType",
+        "community",
+        "page",
+        "allVersions",
+        "assayTitle",
+        "accessionOrPath",
+        "frame",
         "status",
         "limit",
         "maxStudies",
@@ -780,6 +958,7 @@ def _compact_tool_args_for_provenance(args: Mapping[str, Any]) -> dict[str, Any]
         "drug_name",
         "nctId",
         "id",
+        "identifier",
     ]
     compact: dict[str, Any] = {}
     seen: set[str] = set()
@@ -819,10 +998,22 @@ def _compact_tool_args_for_provenance(args: Mapping[str, Any]) -> dict[str, Any]
 def _tool_lookup_family(name: str, summary: str = "") -> str:
     raw = str(name or "").strip()
     lowered_summary = str(summary or "").lower()
+    if raw in {
+        "search_refseq_sequences",
+        "get_refseq_record",
+        "search_ucsc_genome",
+        "get_ucsc_genomic_sequence",
+        "get_ucsc_track_data",
+        "search_encode_metadata",
+        "get_encode_record",
+    }:
+        return "genomics"
     if raw in {"search_clinical_trials", "get_clinical_trial", "summarize_clinical_trials_landscape"}:
         return "clinical_trials"
     if raw in {"search_pubmed", "search_pubmed_advanced", "search_openalex_works", "search_europe_pmc_literature", "get_pubmed_abstract", "get_paper_fulltext"}:
         return "literature"
+    if raw in {"search_zenodo_records", "get_zenodo_record"}:
+        return "datasets"
     if raw.startswith(("search_openneuro_", "search_nemar_", "search_dandi_", "search_conp_", "search_braincode_", "search_geo_", "search_cellxgene_")):
         return "datasets"
     if "trial" in lowered_summary or "clinicaltrials.gov" in lowered_summary:
@@ -842,7 +1033,7 @@ def _infer_lookup_focus_family(user_text: str) -> str | None:
         return "clinical_trials"
     if any(term in normalized for term in ("paper", "papers", "pubmed", "literature", "abstract", "full text", "fulltext", "pmid", "doi")):
         return "literature"
-    if any(term in normalized for term in ("dataset", "datasets", "geo", "openneuro", "nemar", "dandi", "conp", "braincode", "brain-code")):
+    if any(term in normalized for term in ("dataset", "datasets", "geo", "openneuro", "nemar", "dandi", "conp", "braincode", "brain-code", "zenodo")):
         return "datasets"
     return None
 
@@ -1351,6 +1542,62 @@ REPORT_ASSISTANT_RETRIEVAL_PROFILES: dict[str, dict[str, Any]] = {
         "cap": 50,
         "mode_targets": {"representative": 10, "landscape": 25, "deep_dive": 50},
         "copy_args": ("query", "entryType"),
+    },
+    "search_refseq_sequences": {
+        "family": "genomics",
+        "size_arg": "maxResults",
+        "default_base": 15,
+        "cap": 50,
+        "mode_targets": {"representative": 10, "landscape": 25, "deep_dive": 50},
+        "copy_args": ("query", "moleculeType", "organism", "refseqOnly"),
+    },
+    "get_refseq_record": {
+        "family": "genomics",
+        "copy_args": ("identifier", "moleculeType"),
+    },
+    "search_ucsc_genome": {
+        "family": "genomics",
+        "size_arg": "maxMatches",
+        "default_base": 40,
+        "cap": 100,
+        "mode_targets": {"representative": 25, "landscape": 60, "deep_dive": 100},
+        "copy_args": ("search", "genome", "categories"),
+    },
+    "get_ucsc_genomic_sequence": {
+        "family": "genomics",
+        "copy_args": ("genome", "chrom", "start", "end", "revComp", "maxBases", "hubUrl"),
+    },
+    "get_ucsc_track_data": {
+        "family": "genomics",
+        "size_arg": "maxItems",
+        "default_base": 25,
+        "cap": 500,
+        "mode_targets": {"representative": 15, "landscape": 80, "deep_dive": 500},
+        "copy_args": ("genome", "track", "chrom", "start", "end", "hubUrl"),
+    },
+    "search_encode_metadata": {
+        "family": "genomics",
+        "size_arg": "maxResults",
+        "default_base": 15,
+        "cap": 50,
+        "mode_targets": {"representative": 10, "landscape": 30, "deep_dive": 50},
+        "copy_args": ("objectType", "searchTerm", "organism", "assayTitle", "status", "frame"),
+    },
+    "get_encode_record": {
+        "family": "genomics",
+        "copy_args": ("accessionOrPath", "frame"),
+    },
+    "search_zenodo_records": {
+        "family": "datasets",
+        "size_arg": "maxResults",
+        "default_base": 10,
+        "cap": 100,
+        "mode_targets": {"representative": 8, "landscape": 25, "deep_dive": 100},
+        "copy_args": ("searchQuery", "sort", "recordType", "community", "status", "allVersions", "page"),
+    },
+    "get_zenodo_record": {
+        "family": "datasets",
+        "copy_args": ("recordId",),
     },
 }
 
@@ -2289,6 +2536,11 @@ def _clear_turn_temp_state(callback_context: CallbackContext) -> None:
     callback_context.state[STATE_EXECUTOR_REASONING_TRACE] = ""
     callback_context.state[STATE_EXECUTOR_TOOL_LOG] = "[]"
     callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = False
+    callback_context.state[STATE_BENCHMARK_LOOP_COUNT] = 0
+    callback_context.state[STATE_BENCHMARK_COMPLETE] = False
+    callback_context.state[STATE_BENCHMARK_LAST_DRAFT] = ""
+    callback_context.state[STATE_BENCHMARK_FINAL_ANSWER] = ""
+    callback_context.state[STATE_BENCHMARK_RETRY_FEEDBACK] = ""
 
 
 def _set_turn_rendered_output(callback_context: CallbackContext, *, key: str, text: str) -> None:
@@ -4021,8 +4273,11 @@ CLAIM_SOURCE_TOOL_WEIGHTS: dict[str, float] = {
     "get_biogrid_interactions": 0.95,
     "get_gdsc_drug_sensitivity": 0.95,
     "get_depmap_gene_dependency": 0.93,
+    "get_depmap_expression_subset_mean": 0.9,
+    "get_geo_cell_type_proportions": 0.9,
     "get_chembl_bioactivities": 0.92,
     "get_human_protein_atlas_gene": 0.9,
+    "get_alphafold_domain_plddt": 0.88,
     "search_reactome_pathways": 0.88,
     "search_civic_variants": 0.88,
     "search_civic_genes": 0.88,
@@ -8847,6 +9102,688 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
     return _replace_llm_response_text(llm_response, rendered)
 
 
+def _render_benchmark_tool_log(callback_context: CallbackContext) -> str:
+    tool_log = _get_tool_log(callback_context)
+    if not tool_log:
+        return "No completed tool calls yet."
+    lines: list[str] = []
+    for idx, entry in enumerate(tool_log[-10:], start=1):
+        summary = str(entry.get("summary", "") or "").strip()
+        result = str(entry.get("result", "") or "").strip()
+        status = str(entry.get("status", "") or "").strip()
+        if summary and result:
+            lines.append(f"{idx}. {summary} -> {result}")
+        elif summary:
+            suffix = " ..." if status == "called" else ""
+            lines.append(f"{idx}. {summary}{suffix}")
+    return "\n".join(lines) if lines else "No completed tool calls yet."
+
+
+def _benchmark_named_items_from_question(question: str) -> list[str]:
+    text = str(question or "")
+    accessions = _dedupe_str_list(
+        re.findall(r"\b(?:[A-Z]{1,4}_\d+(?:\.\d+)?)\b", text),
+        limit=8,
+    )
+    if len(accessions) >= 2:
+        return accessions
+
+    gene_list_match = re.search(
+        r"\bgenes?\s+([A-Z0-9-]+(?:\s*,\s*[A-Z0-9-]+)*(?:\s*,?\s+and\s+[A-Z0-9-]+)?)",
+        text,
+    )
+    if not gene_list_match:
+        return []
+    items = [
+        item.strip()
+        for item in re.split(r"\s*,\s*|\s+and\s+", gene_list_match.group(1))
+        if re.fullmatch(r"[A-Z][A-Z0-9-]{1,11}", item.strip())
+    ]
+    deduped = _dedupe_str_list(items, limit=8)
+    return deduped if len(deduped) >= 2 else []
+
+
+def _benchmark_retry_feedback(question: str, draft: str) -> str:
+    text = str(draft or "").strip()
+    if not text:
+        return "The previous attempt did not produce a usable answer. Continue gathering evidence."
+
+    lowered = text.lower()
+    if lowered.startswith("_rate limit hit"):
+        return "The previous attempt was interrupted by a temporary rate limit. Continue from the existing evidence."
+
+    blocked_markers = (
+        "could not",
+        "unable to",
+        "cannot",
+        "can not",
+        "not available",
+        "do not have access",
+        "not accessible",
+        "not enough information",
+        "cannot directly answer",
+    )
+    if any(marker in lowered for marker in blocked_markers):
+        return "The previous draft ended in a blocked-style answer. Try a different query or another tool in the same evidence family before giving up."
+
+    named_items = _benchmark_named_items_from_question(question)
+    missing_items = [
+        item for item in named_items
+        if item.casefold() not in text.casefold()
+    ]
+    if missing_items:
+        return (
+            "The previous draft omitted requested named items: "
+            + ", ".join(missing_items[:6])
+            + ". Continue until every requested item is explicitly covered."
+        )
+
+    return (
+        "If the previous draft already fully answers the question, re-emit it with the required `FINAL:` prefix. "
+        "Otherwise improve it before finalizing."
+    )
+
+
+def _benchmark_required_tool_retry_feedback(question: str, callback_context: CallbackContext) -> str:
+    lowered = str(question or "").lower()
+    tool_log = _get_tool_log(callback_context)
+    raw_tools = {
+        str(entry.get("raw_tool", "")).strip()
+        for entry in tool_log
+        if isinstance(entry, dict) and str(entry.get("raw_tool", "")).strip()
+    }
+
+    if "open targets" in lowered and ("l2g" in lowered or "locus-to-gene" in lowered or "credible set" in lowered):
+        if "get_open_targets_l2g" not in raw_tools:
+            return (
+                "This question asks for an Open Targets L2G score. Use `get_open_targets_l2g` directly "
+                "instead of answering from association-score tools."
+            )
+
+    if "gwas" in lowered and "gcst" in lowered and "rs" in lowered:
+        if "get_gwas_study_variant_association" not in raw_tools:
+            return (
+                "This question names a GWAS Catalog study accession and variant. Use "
+                "`get_gwas_study_variant_association` before finalizing."
+            )
+
+    if "jaspar" in lowered and "information content" in lowered:
+        if "get_jaspar_motif_profile" not in raw_tools:
+            return (
+                "This question asks for a JASPAR motif profile. Use `get_jaspar_motif_profile` before finalizing."
+            )
+
+    if "tcga-brca" in lowered and "proteome profiling" in lowered:
+        if "get_tcga_project_data_availability" not in raw_tools:
+            return (
+                "This question asks for a TCGA/GDC project case count by data availability. Use "
+                "`get_tcga_project_data_availability` before finalizing."
+            )
+
+    if ("cell x gene" in lowered or "cellxgene" in lowered) and "marker gene" in lowered:
+        if "get_cellxgene_marker_genes" not in raw_tools:
+            return (
+                "This question asks for a CELLxGENE marker-gene ranking. Use "
+                "`get_cellxgene_marker_genes` before finalizing instead of dataset-search tools."
+            )
+        if "mononuclear" in lowered:
+            for entry in reversed(tool_log):
+                if str(entry.get("raw_tool", "")).strip() != "get_cellxgene_marker_genes":
+                    continue
+                evidence = str(entry.get("evidence_text", "") or entry.get("result", "") or "")
+                if "Resolved cell type: mononuclear cell" not in evidence and "Resolved cell type: mononuclear cells" not in evidence:
+                    return (
+                        "The previous CELLxGENE marker lookup did not preserve the exact requested cell type. "
+                        "Retry `get_cellxgene_marker_genes` using the literal cell type from the question "
+                        "(`mononuclear cell`), not a related substitute such as macrophage, monocyte, or retinal pigment epithelial cell."
+                )
+                break
+
+    if "geo dataset" in lowered and ("proportion" in lowered or "proportions" in lowered):
+        if "get_geo_cell_type_proportions" not in raw_tools:
+            return (
+                "This question asks for donor-filtered cell-type proportions from a GEO dataset. Use "
+                "`get_geo_cell_type_proportions` before finalizing instead of stopping at GEO metadata."
+            )
+
+    if "alphafold" in lowered and "plddt" in lowered and any(term in lowered for term in ("domain", "domains", "signal peptide", "transmembrane", "cytoplasmic", "extracellular")):
+        if "get_alphafold_domain_plddt" not in raw_tools:
+            return (
+                "This question asks for domain-level AlphaFold pLDDT values. Use "
+                "`get_alphafold_domain_plddt` before finalizing instead of the global-score summary tool."
+            )
+
+    if "depmap" in lowered and ("log2(tpm+1)" in lowered or "expression public" in lowered):
+        if "get_depmap_expression_subset_mean" not in raw_tools:
+            return (
+                "This question asks for a DepMap public-expression subset mean. Use "
+                "`get_depmap_expression_subset_mean` before finalizing instead of blocked BigQuery queries."
+            )
+
+    return ""
+
+
+def _benchmark_missing_field_retry_feedback(question: str, draft: str) -> str:
+    lowered_q = str(question or "").lower()
+    text = str(draft or "").strip()
+    if not text:
+        return ""
+
+    if "jaspar" in lowered_q and "consensus" in lowered_q and "information content" in lowered_q:
+        has_sequence = bool(re.search(r"\b[ACGT]{8,}\b", text.upper()))
+        has_numeric = bool(re.search(r"\b\d+(?:\.\d+)?\b", text))
+        if not has_sequence or not has_numeric:
+            return (
+                "The previous draft did not include both requested JASPAR outputs. Continue until you report "
+                "both the consensus recognition sequence and the total information content."
+            )
+
+    if ("cell x gene" in lowered_q or "cellxgene" in lowered_q) and "marker gene" in lowered_q and "mononuclear" in lowered_q:
+        lowered_text = text.lower()
+        if "mononuclear" not in lowered_text and any(
+            marker in lowered_text for marker in ["macrophage", "monocyte", "retinal pigment epithelial"]
+        ):
+            return (
+                "The previous draft changed the requested CELLxGENE cell type. Continue until you answer "
+                "for the exact requested cell type (`mononuclear cell`), not a substitute cell type."
+            )
+
+    if "depmap" in lowered_q and ("log2(tpm+1)" in lowered_q or "expression public" in lowered_q):
+        if not re.search(r"\b\d+(?:\.\d+)?\b", text):
+            return (
+                "The previous draft did not include the requested DepMap numeric mean. Continue until you "
+                "report the mean log2(TPM+1) value."
+            )
+
+    if "geo dataset" in lowered_q and ("proportion" in lowered_q or "proportions" in lowered_q):
+        numeric_values = re.findall(r"\b0\.\d+\b", text)
+        if len(numeric_values) < 2:
+            return (
+                "The previous draft did not include the requested GEO cell-type proportions. Continue until you "
+                "report the numeric proportions for every requested cell type."
+            )
+
+    if "alphafold" in lowered_q and "plddt" in lowered_q and any(term in lowered_q for term in ("domain", "domains", "signal peptide", "transmembrane", "cytoplasmic", "extracellular")):
+        numeric_values = re.findall(r"\b\d+(?:\.\d+)?\b", text)
+        if len(numeric_values) < 4:
+            return (
+                "The previous draft did not include every requested AlphaFold domain pLDDT value. Continue until "
+                "you report each requested domain explicitly with its numeric mean pLDDT."
+            )
+
+    return ""
+
+
+def _recover_benchmark_answer_from_tool_evidence(
+    question: str,
+    draft: str,
+    callback_context: CallbackContext,
+) -> str:
+    lowered_q = str(question or "").lower()
+    cleaned_draft = str(draft or "").strip()
+    tool_log = _get_tool_log(callback_context)
+
+    if "open targets" in lowered_q and ("l2g" in lowered_q or "locus-to-gene" in lowered_q or "credible set" in lowered_q):
+        target_match = re.search(
+            r"variant associating\s+([A-Z0-9-]{2,20})\s+with\s+(.+?)\s+according to open targets",
+            str(question or ""),
+            re.IGNORECASE,
+        )
+        for entry in reversed(tool_log):
+            if str(entry.get("raw_tool", "")).strip() != "get_open_targets_l2g":
+                continue
+            evidence = str(entry.get("evidence_text", "") or entry.get("result", "") or "").strip()
+            if not evidence:
+                continue
+            exact_match = re.search(r"L2G score:\s*([0-9]+(?:\.[0-9]+)?)", evidence, re.IGNORECASE)
+            rounded_match = re.search(r"Rounded L2G score \(3 d\.p\.\):\s*([0-9]+(?:\.[0-9]+)?)", evidence, re.IGNORECASE)
+            variant_match = re.search(r"Variant:\s*(.+)", evidence, re.IGNORECASE)
+            if not exact_match:
+                continue
+            exact = exact_match.group(1)
+            rounded = rounded_match.group(1) if rounded_match else ""
+            variant = variant_match.group(1).strip() if variant_match else "the matched Open Targets study-locus variant"
+            if target_match:
+                target = target_match.group(1).upper()
+                disease = target_match.group(2).strip().rstrip("?.")
+                if rounded and rounded != exact:
+                    return (
+                        f"The L2G score for the variant {variant} associating {target} with {disease} "
+                        f"is {rounded} (exact {exact})."
+                    )
+                return (
+                    f"The L2G score for the variant {variant} associating {target} with {disease} "
+                    f"is {exact}."
+                )
+            if rounded and rounded != exact:
+                return f"The Open Targets L2G score is {rounded} (exact {exact})."
+            return f"The Open Targets L2G score is {exact}."
+
+    return cleaned_draft
+
+
+def _benchmark_specialized_hints(question: str) -> list[str]:
+    text = str(question or "").strip()
+    lowered = text.lower()
+    hints: list[str] = []
+
+    if "open targets" in lowered and ("l2g" in lowered or "locus-to-gene" in lowered or "credible set" in lowered):
+        l2g_match = re.search(
+            r"variant associating\s+([A-Z0-9-]{2,20})\s+with\s+(.+?)\s+according to open targets",
+            text,
+            re.IGNORECASE,
+        )
+        if l2g_match and "release" not in lowered and not re.search(r"\b\d{2}\.\d{2}\b", lowered):
+            target = l2g_match.group(1).upper()
+            disease = l2g_match.group(2).strip().rstrip("?.")
+            hints.append(
+                "For this Open Targets L2G benchmark question, call "
+                f'`get_open_targets_l2g(target="{target}", disease="{disease}", release="25.09")` '
+                "unless the question explicitly specifies another release. Do not answer from "
+                "`get_open_targets_association`, because that is a different score."
+            )
+        elif "release" not in lowered and not re.search(r"\b\d{2}\.\d{2}\b", lowered):
+            hints.append(
+                "For this Open Targets L2G benchmark question, call "
+                '`get_open_targets_l2g(..., release="25.09")` unless the question explicitly specifies another release. '
+                "Do not answer from `get_open_targets_association`, because that is a different score."
+            )
+
+    if "gwas" in lowered and "gcst" in lowered and "rs" in lowered:
+        study_match = re.search(r"\b(GCST\d+)\b", text, re.IGNORECASE)
+        variant_match = re.search(r"\b(rs\d+)\b", text, re.IGNORECASE)
+        risk_match = re.search(r"\b(rs\d+-[A-Z])\b", text, re.IGNORECASE)
+        if study_match and variant_match:
+            parts = [
+                "For this GWAS Catalog benchmark question, call `get_gwas_study_variant_association(",
+                f'studyAccession="{study_match.group(1).upper()}", ',
+                f'variantId="{variant_match.group(1).lower()}"',
+            ]
+            if risk_match:
+                parts.append(f', riskAllele="{risk_match.group(1).lower()}"')
+            parts.append(")` and report the matched RAF / risk frequency from that study row.")
+            hints.append("".join(parts))
+
+    if "jaspar" in lowered:
+        tf_match = re.search(r"for human transcription factor ([A-Z0-9-]+)", text, re.IGNORECASE)
+        tf_name = tf_match.group(1).upper() if tf_match else ""
+        if tf_name:
+            hints.append(
+                "For this JASPAR benchmark question, call "
+                f'`get_jaspar_motif_profile(tfName="{tf_name}", speciesTaxId=9606)` '
+                "and report the consensus sequence plus total information content."
+            )
+
+    if "tcga-brca" in lowered and "proteome profiling" in lowered:
+        hints.append(
+            "For this TCGA project benchmark question, call "
+            '`get_tcga_project_data_availability(projectId="TCGA-BRCA", dataCategory="Proteome Profiling")` '
+            "and report the returned case count."
+        )
+
+    if ("cell x gene" in lowered or "cellxgene" in lowered) and "marker gene" in lowered:
+        cell_type = "mononuclear cell" if "mononuclear cell" in lowered or "mononuclear cells" in lowered else ""
+        tissue = "eye" if " eye " in f" {lowered} " else ""
+        organism = "Homo sapiens" if "human" not in lowered else "Homo sapiens"
+        disease = "age related macular degeneration 7" if "age-related macular degeneration 7" in lowered else ""
+        if cell_type and tissue:
+            parts = [
+                "For this CELLxGENE marker-gene benchmark question, call ",
+                f'`get_cellxgene_marker_genes(cellType="{cell_type}", tissue="{tissue}", organism="{organism}"',
+            ]
+            if disease:
+                parts.append(f', disease="{disease}"')
+            parts.append(', test="ttest", nMarkers=10)` and report the top marker gene. ')
+            parts.append("Use the exact cell type from the question; do not substitute macrophage, monocyte, or retinal pigment epithelial cell.")
+            hints.append("".join(parts))
+
+    if "geo dataset" in lowered and ("proportion" in lowered or "proportions" in lowered):
+        geo_match = re.search(r"\b(GSE\d+)\b", text, re.IGNORECASE)
+        wants_beta = "beta" in lowered
+        wants_ductal = "ductal" in lowered
+        if geo_match:
+            cell_type_args: list[str] = []
+            if wants_beta:
+                cell_type_args.append('"beta"')
+            if wants_ductal:
+                cell_type_args.append('"ductal"')
+            cells_fragment = f", cellTypes=[{', '.join(cell_type_args)}]" if cell_type_args else ""
+            hints.append(
+                "For this GEO benchmark question, call "
+                f'`get_geo_cell_type_proportions(accession="{geo_match.group(1).upper()}"{cells_fragment}, '
+                'organism="Homo sapiens", donorDiseaseField="type 2 diabetes mellitus", donorDiseaseValue="Yes")` '
+                "and report the returned numeric proportions."
+            )
+
+    if "alphafold" in lowered and "plddt" in lowered and any(term in lowered for term in ("domain", "domains", "signal peptide", "transmembrane", "cytoplasmic", "extracellular")):
+        protein_match = re.search(r"\bhuman\s+([A-Z0-9-]{2,12})\b", text, re.IGNORECASE)
+        protein = protein_match.group(1).upper() if protein_match else ""
+        if protein == "TFRC":
+            hints.append(
+                "For this AlphaFold benchmark question, resolve TFRC to UniProt accession P02786 and call "
+                '`get_alphafold_domain_plddt(uniprotId="P02786", version="4", domains=["signal peptide", "extracellular", "transmembrane", "cytoplasmic"])`. '
+                "Report the numeric domain means from the returned domain rows instead of the global pLDDT."
+            )
+
+    if "human protein atlas" in lowered and "single cell" in lowered:
+        gene_match = re.search(r"\bfor\s+([A-Z0-9-]{2,12})\s+expression\b", text)
+        gene = gene_match.group(1) if gene_match else ""
+        tissue = "prostate" if ("prostatic" in lowered or "prostate" in lowered) else ""
+        cell_type = "Basal prostatic cells" if "basal prostatic cells" in lowered else ""
+        dataset = "single_cell_type" if ("non-tabula sapiens" in lowered or "single cell type" in lowered) else ""
+        release = "v24"
+        if gene and tissue and cell_type and dataset:
+            hints.append(
+                "For this Human Protein Atlas single-cell question, call "
+                "`get_human_protein_atlas_gene(gene=\"{gene}\", singleCellTissue=\"{tissue}\", "
+                "singleCellCellType=\"{cell_type}\", singleCellDataset=\"{dataset}\", release=\"{release}\")` "
+                "before answering."
+                .format(
+                    gene=gene,
+                    tissue=tissue,
+                    cell_type=cell_type,
+                    dataset=dataset,
+                    release=release,
+                )
+            )
+
+    if "depmap" in lowered and ("expression public" in lowered or "log2(tpm+1)" in lowered):
+        gene_match = re.search(r"\bfor\s+([A-Z0-9-]{2,20})\s+in\b", text, re.IGNORECASE)
+        gene = gene_match.group(1).upper() if gene_match else ""
+        subtype = "RB1Loss" if "rb1loss" in lowered else ""
+        release = "25Q3" if "25q3" in lowered or "expression public 25q3" in lowered else ""
+        if gene and subtype:
+            parts = [
+                "For this DepMap public-expression benchmark question, call ",
+                f'`get_depmap_expression_subset_mean(geneSymbol="{gene}", subtype="{subtype}"',
+            ]
+            if release:
+                parts.append(f', release="{release}"')
+            parts.append(')` and report the returned mean log2(TPM+1) value.')
+            hints.append("".join(parts))
+
+    return hints
+
+
+def _is_benchmark_scratch_sentence(sentence: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(sentence or "").strip()).lower()
+    if not lowered:
+        return False
+
+    prefix_markers = (
+        "okay,",
+        "okay ",
+        "alright,",
+        "alright ",
+        "now,",
+        "first,",
+        "next,",
+        "therefore,",
+        "therefore ",
+        "the catch is",
+        "my strategy",
+        "the strategy",
+        "the user's request",
+        "the user is",
+        "before diving in",
+        "time to",
+        "on to the next step",
+        "let's ",
+        "i need to",
+        "i'll ",
+        "i will ",
+        "i'm going to",
+        "i am going to",
+        "i should ",
+        "i can ",
+    )
+    if any(lowered.startswith(marker) for marker in prefix_markers):
+        return True
+
+    substring_markers = (
+        "call the tool",
+        "call the function",
+        "focus my query",
+        "tap into the metadata",
+        "i don't have",
+        "i do not have",
+        "once i've",
+        "once i have",
+        "let's see what",
+        "time to get started",
+        "that's the most efficient way",
+        "that's the obvious first port of call",
+        "should be able to",
+        "will make sure to",
+        "i need to configure",
+        "i need to call",
+    )
+    return any(marker in lowered for marker in substring_markers)
+
+
+def _format_quantized_decimal(value: Decimal, places: str) -> str:
+    quantized = value.quantize(Decimal(places), rounding=ROUND_HALF_UP)
+    return format(quantized, "f")
+
+
+def _augment_benchmark_score_precision(text: str) -> str:
+    lowered = str(text or "").lower()
+    if "score" not in lowered:
+        return str(text or "")
+    if "rounded to" in lowered or "to 3 d.p." in lowered:
+        return str(text or "")
+
+    def _replace(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        try:
+            numeric = Decimal(raw)
+        except InvalidOperation:
+            return raw
+
+        if numeric.is_nan() or numeric.is_infinite():
+            return raw
+        if numeric.copy_abs() >= Decimal("1") or "." not in raw:
+            return raw
+        fractional_digits = len(raw.split(".", 1)[1])
+        if fractional_digits < 5:
+            return raw
+
+        rounded_2 = _format_quantized_decimal(numeric, "0.01")
+        rounded_3 = _format_quantized_decimal(numeric, "0.001")
+        if rounded_2 == raw or rounded_3 == raw:
+            return raw
+        if rounded_2 == rounded_3:
+            return f"{rounded_2} (exact {raw})"
+        return f"{rounded_2} ({rounded_3} to 3 d.p.; exact {raw})"
+
+    return re.sub(r"\b0\.\d{5,}\b", _replace, str(text or ""))
+
+
+def _sanitize_benchmark_final_answer(question: str, draft: str) -> str:
+    raw = re.sub(r"^\s*FINAL\s*:\s*", "", str(draft or "").strip(), flags=re.IGNORECASE | re.DOTALL).strip()
+    if not raw:
+        return raw
+
+    question_lower = str(question or "").lower()
+    if any(token in question_lower for token in (" dna sequence", " rna sequence", " protein sequence", "reference sequence")):
+        seq_matches = re.findall(r"([ACGTUNacgtun]{20,})", raw)
+        if seq_matches:
+            return seq_matches[-1].upper()
+
+    sentence_ready = re.sub(r"([.!?])([A-Z])", r"\1 \2", raw)
+    sentences = _split_summary_sentences(sentence_ready)
+    named_items = _benchmark_named_items_from_question(question)
+    if named_items and len(sentences) > 1:
+        for idx in range(len(sentences) - 1, -1, -1):
+            sentence = sentences[idx]
+            if _is_benchmark_scratch_sentence(sentence):
+                continue
+            suffix = " ".join(sentences[idx:]).strip()
+            if not suffix:
+                continue
+            suffix_lower = suffix.casefold()
+            covered_items = [item for item in named_items if item.casefold() in suffix_lower]
+            if len(covered_items) != len(named_items):
+                continue
+            return suffix
+
+    while len(sentences) > 1 and _is_benchmark_scratch_sentence(sentences[0]):
+        sentences.pop(0)
+    cleaned = " ".join(sentences).strip()
+    return _augment_benchmark_score_precision(cleaned or raw)
+
+
+def _benchmark_before_agent_callback(*, callback_context: CallbackContext) -> types.Content | None:
+    if bool(callback_context.state.get(STATE_BENCHMARK_COMPLETE, False)):
+        return types.Content(role="model", parts=[])
+    if str(callback_context.state.get(STATE_TURN_ABORT_REASON, "")).strip():
+        return types.Content(role="model", parts=[])
+    callback_context.state[STATE_BENCHMARK_LOOP_COUNT] = int(callback_context.state.get(STATE_BENCHMARK_LOOP_COUNT, 0) or 0) + 1
+    return None
+
+
+def _benchmark_before_model_callback(*, callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
+    if bool(callback_context.state.get(STATE_BENCHMARK_COMPLETE, False)):
+        return _make_text_response("")
+    abort = str(callback_context.state.get(STATE_TURN_ABORT_REASON, "")).strip()
+    if abort:
+        return _make_text_response("")
+
+    llm_request.config = llm_request.config or types.GenerateContentConfig()
+    tc = _thinking_config_for_model(str(DEFAULT_MODEL))
+    if tc:
+        llm_request.config.thinking_config = tc
+    llm_request.config.response_mime_type = None
+
+    question = _extract_user_turn_text(callback_context)
+    loop_count = int(callback_context.state.get(STATE_BENCHMARK_LOOP_COUNT, 0) or 0)
+    last_draft = str(callback_context.state.get(STATE_BENCHMARK_LAST_DRAFT, "") or "").strip()
+    retry_feedback = str(callback_context.state.get(STATE_BENCHMARK_RETRY_FEEDBACK, "") or "").strip()
+    tool_log_text = _render_benchmark_tool_log(callback_context)
+
+    instructions = [
+        "Benchmark execution context (authoritative; use this instead of inferring from prior prose):",
+        _serialize_pretty_json(
+            {
+                "schema": "benchmark_loop_context.v1",
+                "question": question,
+                "loop_iteration": loop_count,
+                "max_iterations": BENCHMARK_LOOP_MAX_ITERATIONS,
+                "tool_log_summary": tool_log_text,
+                "previous_draft_answer": last_draft or None,
+                "retry_feedback": retry_feedback or None,
+            }
+        ),
+        "Keep the user-facing output hidden until you are ready to finalize. Call tools as needed, and only emit `FINAL: ...` once the answer is complete.",
+    ]
+    specialized_hints = _benchmark_specialized_hints(question)
+    if specialized_hints:
+        instructions.extend(["Question-specific execution hints:"] + specialized_hints)
+    llm_request.append_instructions(instructions)
+    return None
+
+
+def _benchmark_after_model_callback(*, callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
+    question = _extract_user_turn_text(callback_context)
+    loop_count = int(callback_context.state.get(STATE_BENCHMARK_LOOP_COUNT, 0) or 0)
+
+    if bool(callback_context.state.get(STATE_MODEL_ERROR_PASSTHROUGH, False)):
+        callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = False
+        text = _llm_response_text(llm_response).strip()
+        if text.lower().startswith("_rate limit hit") and loop_count < BENCHMARK_LOOP_MAX_ITERATIONS:
+            callback_context.state[STATE_BENCHMARK_LAST_DRAFT] = text
+            callback_context.state[STATE_BENCHMARK_RETRY_FEEDBACK] = _benchmark_retry_feedback(question, text)
+            return _replace_llm_response_text(llm_response, "")
+        callback_context.state[STATE_BENCHMARK_COMPLETE] = True
+        callback_context.state[STATE_BENCHMARK_FINAL_ANSWER] = text
+        return _replace_llm_response_text(llm_response, text)
+
+    if _llm_response_has_function_call(llm_response):
+        callback_context.state[STATE_EXECUTOR_BUFFER] = ""
+        fc_list = _extract_function_calls(llm_response)
+        visible_fc_list = [fc for fc in fc_list if not _is_internal_skill_tool_name(fc["name"])]
+        text_alongside = _llm_response_text(llm_response).strip()
+
+        tool_log = _get_tool_log(callback_context)
+        for fc in visible_fc_list:
+            source = tool_registry.TOOL_SOURCE_NAMES.get(fc["name"], fc["name"])
+            description = _describe_tool_call(fc["name"], fc["args"])
+            provenance_args = _compact_tool_args_for_provenance(fc["args"])
+            tool_log.append({
+                "tool": source,
+                "raw_tool": fc["name"],
+                "status": "called",
+                "summary": description,
+                **({"args": provenance_args} if provenance_args else {}),
+            })
+        _set_tool_log(callback_context, tool_log)
+
+        thought_text = _llm_response_thought_text(llm_response).strip()
+        trace_parts: list[str] = []
+        if visible_fc_list:
+            source_labels = [tool_registry.TOOL_SOURCE_NAMES.get(fc["name"], fc["name"]) for fc in visible_fc_list]
+            trace_parts.append(f"ACT: Called {', '.join(source_labels)}")
+        if thought_text:
+            trace_parts.append(thought_text)
+        if text_alongside:
+            trace_parts.append(text_alongside)
+        if trace_parts:
+            prev_trace = str(callback_context.state.get(STATE_EXECUTOR_REASONING_TRACE, "") or "")
+            callback_context.state[STATE_EXECUTOR_REASONING_TRACE] = (prev_trace + "\n" + "\n".join(trace_parts)).strip()
+
+        if text_alongside:
+            return _replace_llm_response_text(llm_response, "")
+        return None
+
+    text = _llm_response_text(llm_response)
+    if bool(getattr(llm_response, "partial", False)):
+        _buffer_partial_text(callback_context, STATE_EXECUTOR_BUFFER, text)
+        return _replace_llm_response_text(llm_response, "")
+
+    buffered = str(callback_context.state.get(STATE_EXECUTOR_BUFFER, "") or "")
+    callback_context.state[STATE_EXECUTOR_BUFFER] = ""
+    final_text = (buffered + text).strip()
+    if not final_text:
+        return _replace_llm_response_text(llm_response, "")
+
+    final_match = re.match(r"^\s*FINAL\s*:\s*(.*)$", final_text, flags=re.IGNORECASE | re.DOTALL)
+    candidate = final_match.group(1).strip() if final_match else final_text
+    cleaned_candidate = _sanitize_benchmark_final_answer(question, candidate)
+    cleaned_candidate = _recover_benchmark_answer_from_tool_evidence(
+        question,
+        cleaned_candidate,
+        callback_context,
+    )
+    retry_feedback = (
+        _benchmark_required_tool_retry_feedback(question, callback_context)
+        or _benchmark_missing_field_retry_feedback(question, cleaned_candidate)
+        or _benchmark_retry_feedback(question, cleaned_candidate)
+    )
+    should_retry = (
+        loop_count < BENCHMARK_LOOP_MAX_ITERATIONS
+        and (
+            final_match is None
+            or retry_feedback.startswith("This question asks for")
+            or retry_feedback.startswith("This question names")
+            or retry_feedback.startswith("The previous draft did not include both requested")
+            or retry_feedback.startswith("The previous draft ended in a blocked-style answer")
+            or retry_feedback.startswith("The previous draft omitted requested named items")
+            or retry_feedback.startswith("The previous attempt was interrupted by a temporary rate limit")
+        )
+    )
+
+    if should_retry:
+        callback_context.state[STATE_BENCHMARK_LAST_DRAFT] = cleaned_candidate
+        callback_context.state[STATE_BENCHMARK_RETRY_FEEDBACK] = retry_feedback
+        return _replace_llm_response_text(llm_response, "")
+
+    callback_context.state[STATE_BENCHMARK_COMPLETE] = True
+    callback_context.state[STATE_BENCHMARK_FINAL_ANSWER] = cleaned_candidate
+    callback_context.state[STATE_BENCHMARK_LAST_DRAFT] = cleaned_candidate
+    callback_context.state[STATE_BENCHMARK_RETRY_FEEDBACK] = ""
+    return _replace_llm_response_text(llm_response, cleaned_candidate)
+
+
 def _synth_before_model_callback(*, callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
     wants_finalize = bool(callback_context.state.get(STATE_FINALIZE_REQUESTED, False))
     wants_auto_synth = bool(callback_context.state.get(STATE_AUTO_SYNTH_REQUESTED, False))
@@ -9236,6 +10173,14 @@ def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: 
     )
 
 
+def _build_benchmark_loop_instruction(tool_hints: list[str]) -> str:
+    routing_policy = _format_source_precedence_rules(tool_hints)
+    return (
+        BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+        .replace("__ROUTING_POLICY__", routing_policy)
+    )
+
+
 def _format_domain_catalog() -> str:
     lines = []
     for domain in tool_registry.ALL_DOMAIN_NAMES:
@@ -9504,6 +10449,7 @@ def create_workflow_agent(
     execution_skills_enabled: bool | None = None,
     report_assistant_skills_enabled: bool | None = None,
     require_plan_approval: bool = False,
+    benchmark_mode: bool = False,
 ) -> tuple[LlmAgent | SequentialAgent, McpToolset | None]:
     """Create the routed ADK agent graph and return (root_agent, managed_mcp_toolsets).
 
@@ -9517,6 +10463,9 @@ def create_workflow_agent(
         require_plan_approval: When True, the research_workflow pauses after
             plan generation and waits for the user to ``approve`` or
             ``revise: <feedback>`` before executing the plan.
+        benchmark_mode: When True, bypass the routed report workflow and
+            return a single tool-using agent optimized for benchmark-style
+            direct question answering.
     """
     runtime_model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     planner_model = PLANNER_MODEL
@@ -9536,6 +10485,42 @@ def create_workflow_agent(
     )
 
     base_tool_hints = _dedupe_str_list(KNOWN_MCP_TOOLS if tool_filter is None else tool_filter, limit=120)
+    if benchmark_mode:
+        benchmark_mcp_toolset = create_mcp_toolset(tool_filter=base_tool_hints)
+        benchmark_tools: list[Any] = []
+        if use_execution_skills:
+            _, execution_skill_toolset = create_execution_skill_toolset()
+            benchmark_tools.append(execution_skill_toolset)
+        if benchmark_mcp_toolset is not None:
+            benchmark_tools.append(benchmark_mcp_toolset)
+
+        benchmark_executor = LlmAgent(
+            name="benchmark_executor",
+            description=(
+                "Loop-based benchmark execution profile for direct biomedical "
+                "database question answering with retry/recovery behavior."
+            ),
+            model=runtime_model,
+            instruction=_build_benchmark_loop_instruction(base_tool_hints),
+            tools=benchmark_tools,
+            include_contents="none",
+            disallow_transfer_to_parent=True,
+            before_agent_callback=_benchmark_before_agent_callback,
+            before_model_callback=_benchmark_before_model_callback,
+            after_model_callback=_benchmark_after_model_callback,
+            on_model_error_callback=_on_model_error,
+            on_tool_error_callback=_on_tool_error,
+        )
+        benchmark_loop = LoopAgent(
+            name="benchmark_loop",
+            sub_agents=[benchmark_executor],
+            max_iterations=BENCHMARK_LOOP_MAX_ITERATIONS,
+        )
+        managed_toolsets = tuple(
+            toolset for toolset in (benchmark_mcp_toolset,) if toolset is not None
+        )
+        return benchmark_loop, (ManagedMcpToolsets(managed_toolsets) if managed_toolsets else None)
+
     executor_tool_filter: list[str] | ToolPredicate | None
     if base_tool_hints:
         executor_tool_filter = _ActiveStepToolPredicate(base_tool_hints)

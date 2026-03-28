@@ -340,6 +340,15 @@ python agent.py --query "Evaluate LRRK2 as a drug target in Parkinson disease"
 
 `adk-agent/server.py` exposes a smaller programmatic interface (`GET /healthz`, `POST /query`) if you explicitly run that app. It is not the default local or Cloud Run entrypoint.
 
+It also exposes `POST /benchmark_query`, which uses a benchmark-optimized execution profile intended for direct database QA benchmarks such as LABBench2 `dbqa2`. This path bypasses the normal plan-and-report workflow and returns a compact direct answer.
+
+Example benchmark query:
+
+```bash
+cd adk-agent
+python agent.py --benchmark --query "What is the Open Targets Association Score for HTRA1 with vital capacity, according to the September 2025 release?"
+```
+
 ## Cloud Run Deployment
 
 ```bash

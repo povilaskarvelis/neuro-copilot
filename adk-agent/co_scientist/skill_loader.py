@@ -1,14 +1,19 @@
 """Repo-local helpers for loading workflow skills.
 
-This module isolates the current ADK private skill-directory loader behind a
-small wrapper so the workflow code does not depend on private ADK APIs
-directly.
+This module provides a small stable loader for repo-local skills so the
+workflow code does not depend on ADK private APIs that may disappear across
+releases.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
+import yaml
+from google.adk.skills.models import Frontmatter
+from google.adk.skills.models import Resources
+from google.adk.skills.models import Script
 from google.adk.skills.models import Skill
 from google.adk.tools.skill_toolset import SkillToolset
 
@@ -51,11 +56,75 @@ REPORT_ASSISTANT_SKILL_DIR_NAMES = (
 )
 
 
-def _load_skill_from_directory(skill_dir: Path) -> Skill:
-    """Load a single skill from disk via ADK's current directory loader."""
-    from google.adk.skills._utils import _load_skill_from_dir
+_FRONTMATTER_RE = re.compile(
+    r"\A---\s*\n(?P<frontmatter>.*?)\n---\s*(?:\n(?P<body>.*))?\Z",
+    re.DOTALL,
+)
 
-    return _load_skill_from_dir(skill_dir)
+
+def _read_text_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _parse_skill_markdown(skill_md_path: Path) -> tuple[Frontmatter, str]:
+    content = _read_text_file(skill_md_path)
+    match = _FRONTMATTER_RE.match(content)
+    if match is None:
+        raise ValueError(f"{skill_md_path} is missing YAML frontmatter delimited by ---")
+
+    frontmatter_raw = yaml.safe_load(match.group("frontmatter")) or {}
+    if not isinstance(frontmatter_raw, dict):
+        raise ValueError(f"{skill_md_path} frontmatter must be a YAML mapping")
+
+    frontmatter = Frontmatter.model_validate(frontmatter_raw)
+    instructions = (match.group("body") or "").strip()
+    return frontmatter, instructions
+
+
+def _load_text_resources(resource_dir: Path) -> dict[str, str]:
+    if not resource_dir.exists():
+        return {}
+    if not resource_dir.is_dir():
+        raise ValueError(f"Expected resource directory at {resource_dir}")
+
+    resources: dict[str, str] = {}
+    for path in sorted(resource_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        key = path.relative_to(resource_dir).as_posix()
+        resources[key] = _read_text_file(path)
+    return resources
+
+
+def _load_script_resources(resource_dir: Path) -> dict[str, Script]:
+    return {
+        key: Script(src=value)
+        for key, value in _load_text_resources(resource_dir).items()
+    }
+
+
+def _load_skill_from_directory(skill_dir: Path) -> Skill:
+    """Load a single skill from disk into ADK's public Skill model."""
+    skill_md_path = skill_dir / "SKILL.md"
+    if not skill_md_path.exists():
+        raise FileNotFoundError(f"SKILL.md not found in {skill_dir}")
+
+    frontmatter, instructions = _parse_skill_markdown(skill_md_path)
+    if frontmatter.name != skill_dir.name:
+        raise ValueError(
+            f"Skill frontmatter name '{frontmatter.name}' does not match directory name "
+            f"'{skill_dir.name}'"
+        )
+
+    return Skill(
+        frontmatter=frontmatter,
+        instructions=instructions,
+        resources=Resources(
+            references=_load_text_resources(skill_dir / "references"),
+            assets=_load_text_resources(skill_dir / "assets"),
+            scripts=_load_script_resources(skill_dir / "scripts"),
+        ),
+    )
 
 
 def load_skills(

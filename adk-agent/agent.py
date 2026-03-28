@@ -6,6 +6,7 @@ Usage:
     adk web .
     python agent.py
     python agent.py --query "Evaluate LRRK2 in Parkinson disease"
+    python agent.py --benchmark --query "What is the Open Targets score for HTRA1 with vital capacity?"
     python agent.py --help
 """
 
@@ -37,6 +38,7 @@ VERTEX_REQUIRED_ENVS = ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION")
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 ConfirmationHandler = Callable[[object], Awaitable[dict]]
+BENCHMARK_OUTPUT_AUTHORS = frozenset({"benchmark_qa", "benchmark_executor", "benchmark_loop"})
 
 
 def _is_truthy_env(value: str) -> bool:
@@ -294,6 +296,8 @@ async def _run_native_workflow_turn(
                 final_by_author[author] = f"{partial_by_author.pop(author, '')}{text}".strip() or text
                 continue
 
+            if author in BENCHMARK_OUTPUT_AUTHORS:
+                continue
             partial_by_author[author] = f"{partial_by_author.get(author, '')}{text}"
 
         if request_confirmation_call is not None:
@@ -331,6 +335,9 @@ async def _run_native_workflow_turn(
             continue
 
         for preferred_author in (
+            "benchmark_qa",
+            "benchmark_executor",
+            "benchmark_loop",
             "report_synthesizer",
             "general_qa",
             "clarifier",
@@ -434,6 +441,7 @@ async def run_single_query_native_with_confirmation_async(
     query: str,
     *,
     confirmation_handler: ConfirmationHandler | None,
+    benchmark_mode: bool = False,
 ) -> str:
     """Run one query with caller-selected confirmation behavior."""
     is_valid, error_message = validate_runtime_configuration()
@@ -441,14 +449,22 @@ async def run_single_query_native_with_confirmation_async(
         raise RuntimeError(error_message)
 
     session_service = InMemorySessionService()
-    workflow_agent, mcp_tools = create_workflow_agent(require_plan_approval=True)
+    app_name = (
+        "co_scientist_native_benchmark_query"
+        if benchmark_mode
+        else "co_scientist_native_single_query"
+    )
+    workflow_agent, mcp_tools = create_workflow_agent(
+        require_plan_approval=not benchmark_mode,
+        benchmark_mode=benchmark_mode,
+    )
     runner = Runner(
         agent=workflow_agent,
-        app_name="co_scientist_native_single_query",
+        app_name=app_name,
         session_service=session_service,
     )
     session = await session_service.create_session(
-        app_name="co_scientist_native_single_query",
+        app_name=app_name,
         user_id="researcher",
     )
 
@@ -468,6 +484,20 @@ async def run_single_query_native_with_confirmation_async(
 def run_single_query_native(query: str) -> str:
     """Sync wrapper for ADK-native single-query mode."""
     return asyncio.run(run_single_query_native_async(query))
+
+
+async def run_single_query_native_benchmark_async(query: str) -> str:
+    """Run one query in the benchmark-optimized execution profile."""
+    return await run_single_query_native_with_confirmation_async(
+        query,
+        confirmation_handler=None,
+        benchmark_mode=True,
+    )
+
+
+def run_single_query_native_benchmark(query: str) -> str:
+    """Sync wrapper for benchmark-optimized single-query mode."""
+    return asyncio.run(run_single_query_native_benchmark_async(query))
 
 
 async def run_interactive_async() -> None:
@@ -498,13 +528,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Run a single query and exit.",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run the query using the benchmark-optimized execution profile.",
+    )
     return parser
 
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
+    if args.benchmark and not args.query.strip():
+        raise SystemExit("--benchmark requires --query.")
     if args.query.strip():
-        print(run_single_query(args.query.strip()))
+        if args.benchmark:
+            print(run_single_query_native_benchmark(args.query.strip()))
+        else:
+            print(run_single_query(args.query.strip()))
         return
     run_interactive()
 

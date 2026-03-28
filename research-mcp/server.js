@@ -3,12 +3,16 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { BigQuery } from "@google-cloud/bigquery";
 import { XMLParser } from "fast-xml-parser";
 import { z } from "zod";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const execFileAsync = promisify(execFile);
 
 const server = new McpServer({
   name: "research-mcp",
@@ -37,7 +41,10 @@ const MONARCH_API = "https://monarchinitiative.org/v3/api";
 const ALLIANCE_GENOME_API = "https://www.alliancegenome.org/api";
 const GTOPDB_API = "https://www.guidetopharmacology.org/services";
 const ALPHAFOLD_API = "https://alphafold.ebi.ac.uk/api";
+const ALPHAFOLD_FTP_ROOT = "https://ftp.ebi.ac.uk/pub/databases/alphafold";
 const GWAS_CATALOG_API = "https://www.ebi.ac.uk/gwas/rest/api/v2";
+const GWAS_CATALOG_LEGACY_API = "https://www.ebi.ac.uk/gwas/rest/api";
+const JASPAR_API = "https://jaspar.elixir.no/api/v1";
 const DGIDB_GRAPHQL_API = "https://dgidb.org/api/graphql";
 const GTEX_API = "https://gtexportal.org/api/v2";
 const HPA_API = "https://www.proteinatlas.org";
@@ -59,6 +66,7 @@ const RCSB_SEARCH_API = "https://search.rcsb.org/rcsbsearch/v2/query";
 const RCSB_DATA_API = "https://data.rcsb.org/rest/v1";
 const CBIOPORTAL_API = "https://www.cbioportal.org/api";
 const DEPMAP_PORTAL_API = "https://depmap.org/portal";
+const GDC_API = "https://api.gdc.cancer.gov";
 const PUBCHEM_API = "https://pubchem.ncbi.nlm.nih.gov/rest/pug";
 const CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data";
 const IEDB_QUERY_API = "https://query-api.iedb.org";
@@ -100,6 +108,10 @@ const HF_DATASET_PUBMEDQA = String(process.env.HF_DATASET_PUBMEDQA || "qiaojin/P
 const HF_DATASET_BIOASQ = String(process.env.HF_DATASET_BIOASQ || "kroshan/BioASQ").trim();
 const HF_DATASET_GPQA = String(process.env.HF_DATASET_GPQA || "Idavidrein/gpqa").trim();
 const HF_TOKEN = String(process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN || "").trim();
+const RESEARCH_MCP_PYTHON = String(process.env.RESEARCH_MCP_PYTHON || "python3").trim() || "python3";
+const OPEN_TARGETS_RELEASE_QUERY_SCRIPT = path.join(__dirname, "open_targets_release_query.py");
+const OPEN_TARGETS_L2G_QUERY_SCRIPT = path.join(__dirname, "open_targets_l2g_query.py");
+const ALPHAFOLD_DOMAIN_QUERY_SCRIPT = path.join(__dirname, "alphafold_domain_plddt_query.py");
 const BIOGRID_ACCESS_KEY = String(process.env.BIOGRID_ACCESS_KEY || "").trim();
 const BIOGRID_ORCS_ACCESS_KEY = String(process.env.BIOGRID_ORCS_ACCESS_KEY || process.env.BIOGRID_ACCESS_KEY || "").trim();
 const OPENALEX_MAILTO = process.env.OPENALEX_MAILTO || process.env.CONTACT_EMAIL || "";
@@ -114,7 +126,19 @@ const BQ_DEFAULT_MAX_BYTES_BILLED = 5_000_000_000;
 const BQ_QUERY_TIMEOUT_MS = 30_000;
 const CELLXGENE_CURATION_API = "https://api.cellxgene.cziscience.com/curation/v1";
 const CELLXGENE_DISCOVER_API = "https://api.cellxgene.cziscience.com/dp/v1";
+const CELLXGENE_DE_API = "https://api.cellxgene.cziscience.com/de/v1";
+const CELLXGENE_WMG_API = "https://api.cellxgene.cziscience.com/wmg/v2";
 const FORBIDDEN_SQL_KEYWORDS = /\b(insert|update|delete|merge|drop|create|alter|truncate|grant|revoke|call|export|load|copy)\b/i;
+const RESEARCH_MCP_VENV_PYTHON = path.resolve(__dirname, "../.venv/bin/python");
+const RESEARCH_MCP_PYTHON_FALLBACKS = [
+  RESEARCH_MCP_PYTHON,
+  process.env.PYTHON,
+  RESEARCH_MCP_VENV_PYTHON,
+  "python3",
+  "python",
+  "/opt/homebrew/Caskroom/miniconda/base/bin/python3",
+].filter(Boolean);
+const RESEARCH_MCP_PYTHON_CACHE = new Map();
 const MONARCH_ASSOCIATION_MODES = {
   disease_to_phenotype: {
     category: "biolink:DiseaseToPhenotypicFeatureAssociation",
@@ -166,7 +190,15 @@ const ALLIANCE_MODEL_SPECIES_RANK = {
 let bigQueryClient = null;
 let depMapSummaryCache = null;
 let depMapDownloadCatalogCache = null;
+const depMapSubtypeTreeCache = new Map();
+const depMapSubtypeMatrixCache = new Map();
+const depMapExpressionSubsetMeanCache = new Map();
+const geoSupplementaryArchiveCache = new Map();
+const geoSampleQuickMetadataCache = new Map();
 let cellxgeneDatasetCache = null;
+let cellxgeneWmgPrimaryDimensionsCache = null;
+const cellxgeneWmgFiltersCache = new Map();
+const cellxgeneDeFiltersCache = new Map();
 let clinGenGeneValidityCache = null;
 let clinGenDosageCache = null;
 let gdscCompoundCache = null;
@@ -435,6 +467,10 @@ function inferResultItemLabel(toolName) {
     search_openalex_works: "articles",
     search_europe_pmc_literature: "articles",
     search_geo_datasets: "records",
+    search_refseq_sequences: "RefSeq records",
+    search_ucsc_genome: "UCSC genome hits",
+    search_encode_metadata: "ENCODE records",
+    search_zenodo_records: "Zenodo records",
     search_openneuro_datasets: "datasets",
     search_dandi_datasets: "datasets",
     search_nemar_datasets: "datasets",
@@ -460,6 +496,7 @@ function buildResultQueryScope(requestArgs) {
   }
   const scope = {};
   for (const key of [
+    "search",
     "query",
     "gene",
     "genes",
@@ -472,6 +509,33 @@ function buildResultQueryScope(requestArgs) {
     "sort",
     "minDate",
     "maxDate",
+    "maxMatches",
+    "maxItems",
+    "maxResults",
+    "maxBases",
+    "organism",
+    "moleculeType",
+    "identifier",
+    "refseqOnly",
+    "genome",
+    "chrom",
+    "start",
+    "end",
+    "track",
+    "revComp",
+    "hubUrl",
+    "categories",
+    "objectType",
+    "searchTerm",
+    "assayTitle",
+    "accessionOrPath",
+    "frame",
+    "searchQuery",
+    "recordType",
+    "community",
+    "allVersions",
+    "recordId",
+    "page",
   ]) {
     if (!(key in requestArgs)) {
       continue;
@@ -1279,6 +1343,118 @@ function summarizeUniProtFeatureTypes(entry, limit = 8) {
   return summarizeTopCounts(counts, limit);
 }
 
+function extractUniProtDiseaseVariantAnnotations(entry, limitDiseases = 6, limitVariantsPerDisease = 8) {
+  const comments = Array.isArray(entry?.comments) ? entry.comments : [];
+  const features = Array.isArray(entry?.features) ? entry.features : [];
+
+  const diseaseEntries = [];
+  for (const comment of comments) {
+    if (normalizeWhitespace(comment?.commentType || "").toUpperCase() !== "DISEASE") continue;
+    const disease = comment?.disease || {};
+    const acronym = normalizeWhitespace(disease?.acronym || "");
+    const diseaseId = normalizeWhitespace(disease?.diseaseId || "");
+    const aliases = [];
+    if (acronym) aliases.push(acronym);
+    if (acronym) {
+      const withoutTrailingDigits = acronym.replace(/\d+$/, "");
+      if (withoutTrailingDigits && withoutTrailingDigits !== acronym) aliases.push(withoutTrailingDigits);
+    }
+    if (diseaseId) aliases.push(diseaseId);
+    const normalizedAliases = dedupeArray(aliases.map((value) => normalizeWhitespace(value)).filter(Boolean));
+    if (normalizedAliases.length === 0) continue;
+    const primaryAlias = normalizedAliases[0];
+    const baseAlias = primaryAlias.replace(/\d+$/, "");
+    const label =
+      baseAlias && baseAlias !== primaryAlias
+        ? `${baseAlias}/${primaryAlias}`
+        : primaryAlias;
+    diseaseEntries.push({
+      label,
+      aliases: normalizedAliases,
+      diseaseId,
+      acronym,
+    });
+  }
+
+  const annotations = [];
+  for (const disease of diseaseEntries) {
+    const matchedVariants = [];
+    for (const feature of features) {
+      if (normalizeWhitespace(feature?.type || "").toLowerCase() !== "natural variant") continue;
+      const description = normalizeWhitespace(feature?.description || "");
+      if (!description) continue;
+      const loweredDescription = description.toLowerCase();
+      const matchedAlias = disease.aliases.find((alias) => loweredDescription.includes(alias.toLowerCase()));
+      if (!matchedAlias) continue;
+
+      const start = toNonNegativeInt(feature?.location?.start?.value);
+      const end = toNonNegativeInt(feature?.location?.end?.value);
+      let position = "";
+      if (start > 0 && end > 0) {
+        position = start === end ? `${start}` : `${start}-${end}`;
+      } else {
+        position = normalizeWhitespace(feature?.location?.start?.value || feature?.location?.end?.value || "");
+      }
+      if (!position) continue;
+
+      const originalResidue = normalizeWhitespace(feature?.alternativeSequence?.originalSequence || "");
+      const alternativeResidues = Array.isArray(feature?.alternativeSequence?.alternativeSequences)
+        ? feature.alternativeSequence.alternativeSequences.map((value) => normalizeWhitespace(value)).filter(Boolean)
+        : [];
+      const dbsnpRef = (Array.isArray(feature?.featureCrossReferences) ? feature.featureCrossReferences : []).find(
+        (ref) => normalizeWhitespace(ref?.database || "").toLowerCase() === "dbsnp"
+      );
+      const dbsnpId = normalizeWhitespace(dbsnpRef?.id || "");
+      const variantNotation =
+        originalResidue && alternativeResidues.length > 0
+          ? `${originalResidue}${position}${alternativeResidues[0]}`
+          : "";
+      matchedVariants.push({
+        position,
+        positionSort: toNonNegativeInt(start || end || Number.NaN),
+        description,
+        variantNotation,
+        dbsnpId,
+        featureId: normalizeWhitespace(feature?.featureId || ""),
+      });
+    }
+
+    if (matchedVariants.length === 0) continue;
+    const deduped = [];
+    const seen = new Set();
+    for (const variant of matchedVariants.sort((left, right) => {
+      const leftPos = Number.isFinite(left.positionSort) ? left.positionSort : Number.POSITIVE_INFINITY;
+      const rightPos = Number.isFinite(right.positionSort) ? right.positionSort : Number.POSITIVE_INFINITY;
+      return leftPos - rightPos || left.position.localeCompare(right.position);
+    })) {
+      const key = `${variant.position}|${variant.variantNotation}|${variant.dbsnpId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(variant);
+      if (deduped.length >= limitVariantsPerDisease) break;
+    }
+
+    const uniquePositions = dedupeArray(deduped.map((variant) => variant.position)).slice(0, limitVariantsPerDisease);
+    annotations.push({
+      label: disease.label,
+      acronym: disease.acronym,
+      diseaseId: disease.diseaseId,
+      aliases: disease.aliases,
+      positions: uniquePositions,
+      variants: deduped.map((variant) => ({
+        position: variant.position,
+        notation: variant.variantNotation || null,
+        dbsnpId: variant.dbsnpId || null,
+        description: variant.description,
+        featureId: variant.featureId || null,
+      })),
+    });
+    if (annotations.length >= limitDiseases) break;
+  }
+
+  return annotations;
+}
+
 async function fetchWithRetry(url, options = {}) {
   const retries = options.retries ?? 2;
   const timeoutMs = options.timeoutMs ?? 12000;
@@ -1329,6 +1505,93 @@ async function fetchJsonWithRetry(url, options = {}) {
   const response = await fetchWithRetry(url, options);
   return response.json();
 }
+
+async function fetchBufferWithRetry(url, options = {}) {
+  const response = await fetchWithRetry(url, options);
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+function helperScriptRequiresPandas(scriptPath) {
+  const base = path.basename(String(scriptPath || ""));
+  return base === "open_targets_release_query.py" || base === "open_targets_l2g_query.py";
+}
+
+function dedupeStringArray(values) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of values || []) {
+    const value = String(raw || "").trim();
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+function pythonSupportsModule(executable, moduleName) {
+  try {
+    execFileSync(executable, ["-c", `import ${moduleName}`], {
+      cwd: __dirname,
+      stdio: "ignore",
+      timeout: 10000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveResearchMcpPython(scriptPath) {
+  const requirePandas = helperScriptRequiresPandas(scriptPath);
+  const cacheKey = requirePandas ? "requires_pandas" : "generic";
+  if (RESEARCH_MCP_PYTHON_CACHE.has(cacheKey)) {
+    return RESEARCH_MCP_PYTHON_CACHE.get(cacheKey);
+  }
+
+  const candidates = dedupeStringArray(RESEARCH_MCP_PYTHON_FALLBACKS);
+  if (!requirePandas) {
+    const selected = candidates[0] || RESEARCH_MCP_PYTHON;
+    RESEARCH_MCP_PYTHON_CACHE.set(cacheKey, selected);
+    return selected;
+  }
+
+  for (const candidate of candidates) {
+    if (pythonSupportsModule(candidate, "pandas")) {
+      RESEARCH_MCP_PYTHON_CACHE.set(cacheKey, candidate);
+      return candidate;
+    }
+  }
+
+  const selected = candidates[0] || RESEARCH_MCP_PYTHON;
+  RESEARCH_MCP_PYTHON_CACHE.set(cacheKey, selected);
+  return selected;
+}
+
+async function runPythonJsonHelper(scriptPath, payload, { timeoutMs = 120000 } = {}) {
+  const pythonExecutable = resolveResearchMcpPython(scriptPath);
+  const { stdout } = await execFileAsync(
+    pythonExecutable,
+    [scriptPath, JSON.stringify(payload || {})],
+    {
+      cwd: __dirname,
+      timeout: timeoutMs,
+      maxBuffer: 25 * 1024 * 1024,
+    }
+  );
+  const raw = String(stdout || "").trim();
+  if (!raw) {
+    throw new Error(`Helper script ${path.basename(scriptPath)} returned no output.`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Helper script ${path.basename(scriptPath)} returned invalid JSON: ${raw.slice(0, 400)}`);
+  }
+}
+
 function formatGraphQLErrors(responsePayload) {
   const errors = Array.isArray(responsePayload?.errors) ? responsePayload.errors : [];
   if (errors.length === 0) return "";
@@ -2065,6 +2328,300 @@ async function fetchDepMapSummaryTable() {
   return text;
 }
 
+const DEPMAP_EXPRESSION_DATASET_FILES = {
+  protein_coding_stranded: "OmicsExpressionTPMLogp1HumanProteinCodingGenesStranded.csv",
+  protein_coding: "OmicsExpressionTPMLogp1HumanProteinCodingGenes.csv",
+  all_genes_stranded: "OmicsExpressionTPMLogp1HumanAllGenesStranded.csv",
+  all_genes: "OmicsExpressionTPMLogp1HumanAllGenes.csv",
+};
+
+function normalizeDepMapReleaseQuery(value) {
+  const text = normalizeWhitespace(value || "").toUpperCase();
+  if (!text) return "";
+  const quarterMatch = text.match(/\b(\d{2}Q[1-4])\b/);
+  if (quarterMatch) return quarterMatch[1];
+  return text;
+}
+
+function depMapCatalogRowMatchesRelease(row, releaseQuery = "") {
+  const normalizedQuery = normalizeDepMapReleaseQuery(releaseQuery);
+  if (!normalizedQuery) return true;
+  return normalizeWhitespace(row?.release || "").toUpperCase().includes(normalizedQuery);
+}
+
+function findDepMapCatalogRow(catalogRows, filename, releaseQuery = "") {
+  const wantedFilename = normalizeWhitespace(filename || "");
+  if (!wantedFilename) return null;
+  const rows = (Array.isArray(catalogRows) ? catalogRows : []).filter(
+    (row) => normalizeWhitespace(row?.filename || "") === wantedFilename
+  );
+  if (rows.length === 0) return null;
+  const releaseMatches = rows.filter((row) => depMapCatalogRowMatchesRelease(row, releaseQuery));
+  return (releaseMatches[0] || rows[0] || null);
+}
+
+async function fetchDepMapSubtypeTree(releaseQuery = "") {
+  const cacheKey = normalizeDepMapReleaseQuery(releaseQuery) || "LATEST";
+  const cached = getFreshCacheValue(depMapSubtypeTreeCache.get(cacheKey), 6 * 60 * 60 * 1000);
+  if (cached) return cached;
+
+  const catalogRows = await fetchDepMapDownloadCatalog();
+  const catalogRow = findDepMapCatalogRow(catalogRows, "SubtypeTree.csv", releaseQuery);
+  if (!catalogRow?.url) {
+    throw new Error(`No DepMap SubtypeTree.csv file was found for release "${releaseQuery || "latest"}".`);
+  }
+
+  const response = await fetchWithRetry(catalogRow.url, {
+    retries: 1,
+    timeoutMs: 45000,
+    maxBackoffMs: 5000,
+    headers: {
+      Accept: "text/csv",
+      "User-Agent": "Mozilla/5.0 research-mcp",
+    },
+  });
+  const rows = parseCsvObjects(await response.text());
+  const payload = {
+    rows,
+    release: normalizeWhitespace(catalogRow.release || cacheKey || "latest"),
+    sourceUrl: catalogRow.url,
+  };
+  depMapSubtypeTreeCache.set(cacheKey, storeCacheValue(null, payload));
+  return payload;
+}
+
+async function fetchDepMapSubtypeMatrix(releaseQuery = "") {
+  const cacheKey = normalizeDepMapReleaseQuery(releaseQuery) || "LATEST";
+  const cached = getFreshCacheValue(depMapSubtypeMatrixCache.get(cacheKey), 6 * 60 * 60 * 1000);
+  if (cached) return cached;
+
+  const catalogRows = await fetchDepMapDownloadCatalog();
+  const catalogRow = findDepMapCatalogRow(catalogRows, "SubtypeMatrix.csv", releaseQuery);
+  if (!catalogRow?.url) {
+    throw new Error(`No DepMap SubtypeMatrix.csv file was found for release "${releaseQuery || "latest"}".`);
+  }
+
+  const response = await fetchWithRetry(catalogRow.url, {
+    retries: 1,
+    timeoutMs: 45000,
+    maxBackoffMs: 5000,
+    headers: {
+      Accept: "text/csv",
+      "User-Agent": "Mozilla/5.0 research-mcp",
+    },
+  });
+  const text = await response.text();
+  const lines = String(text || "").split(/\r?\n/).filter((line) => line.trim().length > 0);
+  const header = lines.length > 0 ? parseCsvLine(lines[0]).map((value) => normalizeWhitespace(value)) : [];
+  const payload = {
+    text,
+    lines,
+    header,
+    release: normalizeWhitespace(catalogRow.release || cacheKey || "latest"),
+    sourceUrl: catalogRow.url,
+  };
+  depMapSubtypeMatrixCache.set(cacheKey, storeCacheValue(null, payload));
+  return payload;
+}
+
+function normalizeDepMapSubtypeLookupToken(value) {
+  return normalizeWhitespace(value || "")
+    .toLowerCase()
+    .replace(/loss of function/g, "loss")
+    .replace(/\blof\b/g, "loss")
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function buildDepMapSubtypeAliasLookup(treeRows) {
+  const lookup = new Map();
+  const addAlias = (alias, code) => {
+    const normalizedAlias = normalizeDepMapSubtypeLookupToken(alias);
+    const normalizedCode = normalizeWhitespace(code || "");
+    if (!normalizedAlias || !normalizedCode || lookup.has(normalizedAlias)) {
+      return;
+    }
+    lookup.set(normalizedAlias, normalizedCode);
+  };
+
+  for (const row of Array.isArray(treeRows) ? treeRows : []) {
+    const canonicalCode = normalizeWhitespace(
+      row?.MolecularSubtypeCode
+      || row?.DepmapModelType
+      || row?.NodeName
+      || row?.DisplayName
+      || ""
+    );
+    if (!canonicalCode) continue;
+    addAlias(canonicalCode, canonicalCode);
+    addAlias(row?.NodeName, canonicalCode);
+    addAlias(row?.DisplayName, canonicalCode);
+    addAlias(row?.DepmapModelType, canonicalCode);
+    addAlias(row?.MolecularSubtypeCode, canonicalCode);
+    if (/_LoF$/i.test(canonicalCode)) {
+      addAlias(canonicalCode.replace(/_LoF$/i, "Loss"), canonicalCode);
+      addAlias(canonicalCode.replace(/_LoF$/i, " Loss"), canonicalCode);
+      addAlias(canonicalCode.replace(/_LoF$/i, " loss"), canonicalCode);
+    }
+  }
+
+  return lookup;
+}
+
+function resolveDepMapSubtypeCode(subtypeQuery, treeRows, headerColumns = []) {
+  const rawQuery = normalizeWhitespace(subtypeQuery || "");
+  if (!rawQuery) {
+    return { code: "", matchedBy: "", query: rawQuery };
+  }
+
+  const queryToken = normalizeDepMapSubtypeLookupToken(rawQuery);
+  const headerLookup = new Map(
+    (Array.isArray(headerColumns) ? headerColumns : [])
+      .map((value) => [normalizeDepMapSubtypeLookupToken(value), normalizeWhitespace(value)])
+      .filter(([token, value]) => token && value)
+  );
+  const aliasLookup = buildDepMapSubtypeAliasLookup(treeRows);
+
+  let code = headerLookup.get(queryToken) || aliasLookup.get(queryToken) || "";
+  if (!code && queryToken.endsWith("loss")) {
+    const lofToken = `${queryToken.slice(0, -4)}lof`;
+    code = headerLookup.get(lofToken) || aliasLookup.get(lofToken) || "";
+  }
+  if (!code && queryToken.endsWith("lof")) {
+    const lossToken = `${queryToken.slice(0, -3)}loss`;
+    code = headerLookup.get(lossToken) || aliasLookup.get(lossToken) || "";
+  }
+
+  return {
+    code: normalizeWhitespace(code || ""),
+    matchedBy: code ? "alias" : "",
+    query: rawQuery,
+  };
+}
+
+function resolveDepMapExpressionGeneColumn(headers, geneSymbol) {
+  const query = normalizeWhitespace(geneSymbol || "").toUpperCase();
+  if (!query) return null;
+  const candidates = [];
+
+  (Array.isArray(headers) ? headers : []).forEach((header, index) => {
+    const label = normalizeWhitespace(header || "");
+    if (!label) return;
+    const bare = label.replace(/\s*\([^)]*\)\s*$/, "").trim().toUpperCase();
+    const upper = label.toUpperCase();
+    let score = -1;
+    if (upper === query) score = 120;
+    else if (bare === query) score = 110;
+    else if (upper.startsWith(`${query} (`)) score = 100;
+    if (score >= 0) {
+      candidates.push({ index, label, score });
+    }
+  });
+
+  candidates.sort((a, b) => b.score - a.score || a.index - b.index);
+  return candidates[0] || null;
+}
+
+async function computeDepMapExpressionSubsetMeanFromResponse(response, {
+  modelIds,
+  geneSymbol,
+  defaultProfileOnly = true,
+}) {
+  const reader = response?.body?.getReader?.();
+  if (!reader) {
+    throw new Error("DepMap expression response body is not stream-readable.");
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let header = null;
+  let modelIndex = -1;
+  let defaultModelIndex = -1;
+  let geneColumn = null;
+  let valueCount = 0;
+  let valueSum = 0;
+  const matchedModels = new Set();
+
+  const processLine = (rawLine) => {
+    let line = String(rawLine || "");
+    if (!line) return;
+    if (line.endsWith("\r")) line = line.slice(0, -1);
+    if (!header) {
+      header = parseCsvLine(line).map((value) => normalizeWhitespace(value));
+      modelIndex = header.indexOf("ModelID");
+      defaultModelIndex = header.indexOf("IsDefaultEntryForModel");
+      geneColumn = resolveDepMapExpressionGeneColumn(header, geneSymbol);
+      if (modelIndex < 0 || !geneColumn) {
+        throw new Error(`Could not resolve ModelID or gene column for ${geneSymbol} in the selected DepMap expression file.`);
+      }
+      return;
+    }
+
+    const cols = parseCsvLine(line);
+    const modelId = normalizeWhitespace(cols[modelIndex] || "");
+    if (!modelId || !modelIds.has(modelId)) {
+      return;
+    }
+    if (defaultProfileOnly && defaultModelIndex >= 0) {
+      const isDefault = ["1", "1.0", "true", "yes"].includes(String(cols[defaultModelIndex] || "").trim().toLowerCase());
+      if (!isDefault) {
+        return;
+      }
+    }
+    const value = toFiniteNumber(cols[geneColumn.index], Number.NaN);
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    valueSum += value;
+    valueCount += 1;
+    matchedModels.add(modelId);
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex >= 0) {
+      processLine(buffer.slice(0, newlineIndex));
+      buffer = buffer.slice(newlineIndex + 1);
+      newlineIndex = buffer.indexOf("\n");
+    }
+
+    if (done) {
+      const tail = decoder.decode();
+      if (tail) buffer += tail;
+      break;
+    }
+  }
+
+  if (buffer.trim().length > 0) {
+    processLine(buffer);
+  }
+
+  return {
+    geneColumn,
+    valueCount,
+    valueSum,
+    matchedModelCount: matchedModels.size,
+  };
+}
+
+function buildDepMapExpressionSubsetMeanCacheKey({
+  geneSymbol,
+  subtypeCode,
+  release,
+  expressionDataset,
+  defaultProfileOnly,
+}) {
+  return [
+    normalizeWhitespace(geneSymbol || "").toUpperCase(),
+    normalizeWhitespace(subtypeCode || ""),
+    normalizeDepMapReleaseQuery(release || "") || "LATEST",
+    normalizeWhitespace(expressionDataset || ""),
+    defaultProfileOnly ? "default" : "all",
+  ].join("::");
+}
+
 function extractDepMapEntityId(characterizationRows) {
   const rows = Array.isArray(characterizationRows) ? characterizationRows : [];
   for (const row of rows) {
@@ -2142,6 +2699,145 @@ async function fetchCellxgeneDatasets() {
 
   cellxgeneDatasetCache = storeCacheValue(cellxgeneDatasetCache, rows);
   return rows;
+}
+
+function normalizeCellxgeneOntologyOptions(items) {
+  const rows = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== "object") continue;
+    for (const [rawId, rawLabel] of Object.entries(item)) {
+      const id = normalizeOntologyCurie(rawId);
+      const label = normalizeWhitespace(rawLabel || rawId || "");
+      if (!id || !label) continue;
+      rows.push({ id, label });
+    }
+  }
+  return rows;
+}
+
+function normalizeCellxgeneMatchText(value) {
+  return normalizeWhitespace(value || "")
+    .toLowerCase()
+    .replace(/\bcells\b/g, "cell")
+    .replace(/\bgenes\b/g, "gene")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scoreCellxgeneOntologyOption(option, query) {
+  if (!option || typeof option !== "object") return Number.NEGATIVE_INFINITY;
+  const normalizedQuery = normalizeCellxgeneMatchText(query || "");
+  if (!normalizedQuery) return Number.NEGATIVE_INFINITY;
+  const queryTokens = tokenizeQuery(normalizedQuery);
+  const label = normalizeCellxgeneMatchText(option?.label || "");
+  const id = normalizeWhitespace(option?.id || "").toLowerCase();
+  let score = 0;
+  if (label === normalizedQuery) score += 1000;
+  if (id === normalizedQuery) score += 950;
+  if (label.replace(/[-_]/g, " ") === normalizedQuery.replace(/[-_]/g, " ")) score += 900;
+  if (label.includes(normalizedQuery)) score += 200;
+  if (normalizedQuery.includes(label)) score += 100;
+  if (queryTokens.length > 0 && queryTokens.every((token) => label.includes(token))) {
+    score += 120 + queryTokens.length;
+  }
+  if (label.startsWith(normalizedQuery)) score += 40;
+  return score;
+}
+
+function resolveCellxgeneOntologyOption(items, query) {
+  const options = normalizeCellxgeneOntologyOptions(items);
+  if (!query) return null;
+  const sorted = options
+    .slice()
+    .sort((a, b) => scoreCellxgeneOntologyOption(b, query) - scoreCellxgeneOntologyOption(a, query));
+  if (sorted.length === 0) return null;
+  const bestScore = scoreCellxgeneOntologyOption(sorted[0], query);
+  return bestScore > 0 ? sorted[0] : null;
+}
+
+function buildCellxgeneWmgFiltersCacheKey(filterPayload) {
+  try {
+    return JSON.stringify(filterPayload || {});
+  } catch {
+    return String(filterPayload || "");
+  }
+}
+
+async function fetchCellxgeneWmgPrimaryDimensions() {
+  const cached = getFreshCacheValue(cellxgeneWmgPrimaryDimensionsCache, 60 * 60 * 1000);
+  if (cached) return cached;
+  const data = await fetchJsonWithRetry(`${CELLXGENE_WMG_API}/primary_filter_dimensions`, {
+    retries: 1,
+    timeoutMs: 25000,
+    maxBackoffMs: 3000,
+  });
+  cellxgeneWmgPrimaryDimensionsCache = storeCacheValue(cellxgeneWmgPrimaryDimensionsCache, data);
+  return data;
+}
+
+async function fetchCellxgeneWmgFilters(filterPayload) {
+  const cacheKey = buildCellxgeneWmgFiltersCacheKey(filterPayload);
+  const cached = getFreshCacheValue(cellxgeneWmgFiltersCache.get(cacheKey), 30 * 60 * 1000);
+  if (cached) return cached;
+  const data = await fetchJsonWithRetry(`${CELLXGENE_WMG_API}/filters`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ filter: filterPayload || {} }),
+    retries: 1,
+    timeoutMs: 25000,
+    maxBackoffMs: 3000,
+  });
+  cellxgeneWmgFiltersCache.set(cacheKey, storeCacheValue(null, data));
+  return data;
+}
+
+async function fetchCellxgeneDeFilters(filterPayload) {
+  const cacheKey = buildCellxgeneWmgFiltersCacheKey(filterPayload);
+  const cached = getFreshCacheValue(cellxgeneDeFiltersCache.get(cacheKey), 30 * 60 * 1000);
+  if (cached) return cached;
+  const data = await fetchJsonWithRetry(`${CELLXGENE_DE_API}/filters`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ filter: filterPayload || {} }),
+    retries: 1,
+    timeoutMs: 25000,
+    maxBackoffMs: 3000,
+  });
+  cellxgeneDeFiltersCache.set(cacheKey, storeCacheValue(null, data));
+  return data;
+}
+
+async function fetchCellxgeneMarkerGenes({ cellTypeId, organismId, tissueId, nMarkers = 10, test = "ttest" }) {
+  return fetchJsonWithRetry(`${CELLXGENE_WMG_API}/markers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      celltype: cellTypeId,
+      organism: organismId,
+      tissue: tissueId,
+      n_markers: Math.max(1, Math.min(50, Math.round(nMarkers || 10))),
+      test: normalizeWhitespace(test || "ttest") || "ttest",
+    }),
+    retries: 1,
+    timeoutMs: 25000,
+    maxBackoffMs: 3000,
+  });
+}
+
+function buildCellxgeneGeneSymbolMap(primaryDimensions, organismId) {
+  const rows = Array.isArray(primaryDimensions?.gene_terms?.[organismId]) ? primaryDimensions.gene_terms[organismId] : [];
+  const out = new Map();
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    for (const [geneId, geneSymbol] of Object.entries(row)) {
+      const normalizedId = normalizeWhitespace(geneId || "");
+      const symbol = normalizeWhitespace(geneSymbol || geneId || "");
+      if (normalizedId && symbol) {
+        out.set(normalizedId, symbol);
+      }
+    }
+  }
+  return out;
 }
 
 function normalizeGdscLookupText(value) {
@@ -4699,7 +5395,248 @@ server.registerTool(
 );
 
 // ============================================
-// TOOL 7: Benchmark dataset overview (GPQA, PubMedQA, BioASQ)
+// TOOL 7: Open Targets association score lookup
+// ============================================
+server.registerTool(
+  "get_open_targets_association",
+  {
+    description:
+      "Looks up a target-disease association score from Open Targets using the official EBI parquet release archive. Prefer this over BigQuery/current Open Targets sources when the question pins a specific release such as 'September 2025' or asks for an association score for one target-disease pair.",
+    inputSchema: {
+      target: z
+        .string()
+        .describe("Gene symbol or Ensembl gene ID (for example 'HTRA1' or 'ENSG00000166033')."),
+      disease: z
+        .string()
+        .describe("Disease, phenotype, or trait label as used by Open Targets (for example 'vital capacity')."),
+      release: z
+        .string()
+        .optional()
+        .default("latest")
+        .describe("Open Targets release to query. Use YY.MM (for example '25.09') or a natural label like 'September 2025'. Use 'latest' when no release is specified."),
+      maxDiseaseMatches: z
+        .number()
+        .int()
+        .min(1)
+        .max(10)
+        .optional()
+        .default(5)
+        .describe("How many candidate disease matches to retain for debugging ambiguous disease names."),
+    },
+  },
+  async ({ target, disease, release = "latest", maxDiseaseMatches = 5 }) => {
+    const result = await runPythonJsonHelper(
+      OPEN_TARGETS_RELEASE_QUERY_SCRIPT,
+      {
+        target,
+        disease,
+        release,
+        max_disease_matches: maxDiseaseMatches,
+      },
+      { timeoutMs: 180000 }
+    );
+
+    if (!result?.ok) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error in get_open_targets_association: ${compactErrorMessage(result?.error || "unknown error", 320)}`,
+          },
+        ],
+      };
+    }
+
+    const releaseTag = normalizeWhitespace(result.release || release || "");
+    const targetId = normalizeWhitespace(result.target_id || "");
+    const targetSymbol = normalizeWhitespace(result.target_symbol || target || "");
+    const targetName = normalizeWhitespace(result.target_name || "");
+    const diseaseId = normalizeWhitespace(result.disease_id || "");
+    const diseaseName = normalizeWhitespace(result.disease_name || disease || "");
+    const scoreValue = Number(result.score);
+    const evidenceCount = Number(result.evidence_count);
+    const candidateDiseases = Array.isArray(result.candidate_diseases) ? result.candidate_diseases : [];
+
+    const keyFields = [
+      `Release: ${releaseTag || "latest archived release"}`,
+      `Target: ${targetSymbol}${targetId ? ` (${targetId})` : ""}${targetName ? ` — ${targetName}` : ""}`,
+      `Disease: ${diseaseName}${diseaseId ? ` (${diseaseId})` : ""}`,
+      `Association score: ${Number.isFinite(scoreValue) ? String(scoreValue) : normalizeWhitespace(result.score || "")}`,
+      `Evidence count: ${Number.isFinite(evidenceCount) ? String(evidenceCount) : normalizeWhitespace(result.evidence_count || "")}`,
+    ];
+
+    if (candidateDiseases.length > 1) {
+      const preview = candidateDiseases
+        .slice(0, 3)
+        .map((entry) => normalizeWhitespace(entry?.disease_name || ""))
+        .filter(Boolean)
+        .join("; ");
+      if (preview) {
+        keyFields.push(`Top disease matches considered: ${preview}`);
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Open Targets association_overall_direct score for ${targetSymbol || targetId} and ${diseaseName} in release ${releaseTag || "latest archived release"} is ${Number.isFinite(scoreValue) ? String(scoreValue) : "unavailable"}.`,
+            keyFields,
+            sources: [
+              normalizeWhitespace(result.association_source_url || ""),
+              normalizeWhitespace(result.disease_resolution_source || ""),
+              normalizeWhitespace(result.target_resolution_source || ""),
+            ].filter(Boolean),
+            limitations: [
+              "This uses the official archived parquet release files rather than the current live API or BigQuery mirror.",
+              "The lookup resolves one target-disease pair at a time.",
+            ],
+          }),
+        },
+      ],
+    };
+  }
+);
+
+// ============================================
+// TOOL 8: Open Targets L2G lookup
+// ============================================
+server.registerTool(
+  "get_open_targets_l2g",
+  {
+    description:
+      "Looks up an Open Targets Locus-to-Gene (L2G) score for a target-disease pair using the official archived platform release files. Prefer this over BigQuery/current Open Targets sources for genetics questions about L2G, credible sets, study-locus rows, or release-specific Open Targets genetics results.",
+    inputSchema: {
+      target: z
+        .string()
+        .describe("Gene symbol or Ensembl gene ID for the candidate causal gene (for example 'SEMA7A' or 'ENSG00000138623')."),
+      disease: z
+        .string()
+        .describe("Disease, phenotype, or trait label as used by Open Targets (for example 'caffeine metabolite measurement')."),
+      variant: z
+        .string()
+        .optional()
+        .describe("Optional variant constraint to disambiguate the study-locus. Use rsID or Open Targets variant ID such as '15_74490015_G_A'."),
+      release: z
+        .string()
+        .optional()
+        .default("latest")
+        .describe("Open Targets release to query. Use YY.MM (for example '25.09') or a natural label like 'September 2025'. Uses the latest archived release when omitted unless OPEN_TARGETS_L2G_DEFAULT_RELEASE is set."),
+      maxDiseaseMatches: z
+        .number()
+        .int()
+        .min(1)
+        .max(10)
+        .optional()
+        .default(5)
+        .describe("How many candidate disease matches to retain for debugging ambiguous disease names."),
+      maxStudyMatches: z
+        .number()
+        .int()
+        .min(1)
+        .max(25)
+        .optional()
+        .default(10)
+        .describe("How many candidate Open Targets studies to retain before evaluating credible sets."),
+    },
+  },
+  async ({ target, disease, variant, release = "latest", maxDiseaseMatches = 5, maxStudyMatches = 10 }) => {
+    const result = await runPythonJsonHelper(
+      OPEN_TARGETS_L2G_QUERY_SCRIPT,
+      {
+        target,
+        disease,
+        variant,
+        release,
+        max_disease_matches: maxDiseaseMatches,
+        max_study_matches: maxStudyMatches,
+      },
+      { timeoutMs: 240000 }
+    );
+
+    if (!result?.ok) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error in get_open_targets_l2g: ${compactErrorMessage(result?.error || "unknown error", 320)}`,
+          },
+        ],
+      };
+    }
+
+    const releaseTag = normalizeWhitespace(result.release || release || "");
+    const targetId = normalizeWhitespace(result.target_id || "");
+    const targetSymbol = normalizeWhitespace(result.target_symbol || target || "");
+    const targetName = normalizeWhitespace(result.target_name || "");
+    const diseaseId = normalizeWhitespace(result.disease_id || "");
+    const diseaseName = normalizeWhitespace(result.disease_name || disease || "");
+    const studyId = normalizeWhitespace(result.study_id || "");
+    const traitFromSource = normalizeWhitespace(result.trait_from_source || "");
+    const studyLocusId = normalizeWhitespace(result.study_locus_id || "");
+    const variantId = normalizeWhitespace(result.variant_id || "");
+    const rsIds = Array.isArray(result.rs_ids)
+      ? result.rs_ids.map((entry) => normalizeWhitespace(entry)).filter(Boolean)
+      : [];
+    const l2gScore = Number(result.score);
+    const roundedScore = Number(result.score_rounded_3dp);
+    const candidateMatches = Array.isArray(result.candidate_matches) ? result.candidate_matches : [];
+
+    const keyFields = [
+      `Release: ${releaseTag || "latest archived release"}`,
+      `Target: ${targetSymbol}${targetId ? ` (${targetId})` : ""}${targetName ? ` — ${targetName}` : ""}`,
+      `Disease: ${diseaseName}${diseaseId ? ` (${diseaseId})` : ""}`,
+      `L2G score: ${Number.isFinite(l2gScore) ? String(l2gScore) : normalizeWhitespace(result.score || "")}`,
+      `Rounded L2G score (3 d.p.): ${Number.isFinite(roundedScore) ? roundedScore.toFixed(3) : "unavailable"}`,
+      `Study: ${studyId || "unavailable"}${traitFromSource ? ` — ${traitFromSource}` : ""}`,
+      `Study locus: ${studyLocusId || "unavailable"}`,
+      `Variant: ${variantId || "unavailable"}${rsIds.length ? ` (${rsIds.join(", ")})` : ""}`,
+    ];
+
+    if (candidateMatches.length > 1) {
+      const preview = candidateMatches
+        .slice(0, 3)
+        .map((entry) => {
+          const score = Number(entry?.score);
+          const trait = normalizeWhitespace(entry?.trait_from_source || "");
+          const variantPreview = normalizeWhitespace(entry?.variant_id || "");
+          return `${trait || "unknown trait"}${variantPreview ? ` [${variantPreview}]` : ""}${Number.isFinite(score) ? ` = ${score}` : ""}`;
+        })
+        .filter(Boolean)
+        .join("; ");
+      if (preview) {
+        keyFields.push(`Top L2G matches considered: ${preview}`);
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Open Targets L2G score for ${targetSymbol || targetId} and ${diseaseName} in release ${releaseTag || "latest archived release"} is ${Number.isFinite(l2gScore) ? String(l2gScore) : "unavailable"}.`,
+            keyFields,
+            sources: [
+              normalizeWhitespace(result.l2g_source_url || ""),
+              normalizeWhitespace(result.credible_set_source_url || ""),
+              normalizeWhitespace(result.study_source_url || ""),
+              normalizeWhitespace(result.disease_resolution_source || ""),
+              normalizeWhitespace(result.target_resolution_source || ""),
+            ].filter(Boolean),
+            limitations: [
+              "This uses the official archived Open Targets release files rather than the current live API or BigQuery mirror.",
+              "The lookup resolves one target-disease pair at a time and picks the best matching study-locus row when multiple candidates exist.",
+            ],
+          }),
+        },
+      ],
+    };
+  }
+);
+
+// ============================================
+// TOOL 9: Benchmark dataset overview (GPQA, PubMedQA, BioASQ)
 // ============================================
 server.registerTool(
   "benchmark_dataset_overview",
@@ -5557,6 +6494,195 @@ function buildGeoRecordUrl(accession) {
   return `https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=${encodeURIComponent(cleanAccession)}`;
 }
 
+function buildGeoSeriesFtpRoot(accession) {
+  const cleanAccession = normalizeGeoIdentifier(accession);
+  if (!/^GSE\d+$/.test(cleanAccession)) return "";
+  const digits = cleanAccession.replace(/^GSE/i, "");
+  const prefixDigits = digits.length > 3 ? digits.slice(0, -3) : digits;
+  return `https://ftp.ncbi.nlm.nih.gov/geo/series/GSE${prefixDigits}nnn/${cleanAccession}`;
+}
+
+function buildGeoSupplementaryArchiveUrl(accession) {
+  const root = buildGeoSeriesFtpRoot(accession);
+  const cleanAccession = normalizeGeoIdentifier(accession);
+  if (!root || !cleanAccession) return "";
+  return `${root}/suppl/${cleanAccession}_RAW.tar`;
+}
+
+function buildGeoSupplementaryFileListUrl(accession) {
+  const root = buildGeoSeriesFtpRoot(accession);
+  return root ? `${root}/suppl/filelist.txt` : "";
+}
+
+function parseGeoFileList(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .slice(1)
+    .map((line) => line.split("\t"))
+    .filter((parts) => parts.length >= 5)
+    .map((parts) => ({
+      archive_or_file: normalizeWhitespace(parts[0]),
+      name: normalizeWhitespace(parts[1]),
+      size: normalizeWhitespace(parts[3]),
+      type: normalizeWhitespace(parts[4]),
+    }))
+    .filter((row) => row.name);
+}
+
+function buildTarEntryIndex(buffer) {
+  const entries = new Map();
+  if (!Buffer.isBuffer(buffer)) return entries;
+  let offset = 0;
+  while (offset + 512 <= buffer.length) {
+    const header = buffer.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) {
+      break;
+    }
+    const name = header.subarray(0, 100).toString("utf8").replace(/\0.*$/, "").trim();
+    const sizeOctal = header.subarray(124, 136).toString("utf8").replace(/\0.*$/, "").trim() || "0";
+    const size = Number.parseInt(sizeOctal, 8) || 0;
+    const contentStart = offset + 512;
+    if (name) {
+      entries.set(name, {
+        name,
+        size,
+        contentStart,
+        contentEnd: contentStart + size,
+      });
+    }
+    offset = contentStart + Math.ceil(size / 512) * 512;
+  }
+  return entries;
+}
+
+async function fetchGeoSupplementaryArchive(accession) {
+  const cleanAccession = normalizeGeoIdentifier(accession);
+  const cacheKey = cleanAccession;
+  const cached = getFreshCacheValue(geoSupplementaryArchiveCache.get(cacheKey), 6 * 60 * 60 * 1000);
+  if (cached) {
+    return cached;
+  }
+
+  const archiveUrl = buildGeoSupplementaryArchiveUrl(cleanAccession);
+  if (!archiveUrl) {
+    throw new Error(`Unsupported GEO series accession: ${accession}`);
+  }
+  const buffer = await fetchBufferWithRetry(archiveUrl, { retries: 1, timeoutMs: 120000, maxBackoffMs: 4000 });
+  const payload = {
+    archiveUrl,
+    buffer,
+    entryIndex: buildTarEntryIndex(buffer),
+  };
+  geoSupplementaryArchiveCache.set(cacheKey, storeCacheValue(null, payload));
+  return payload;
+}
+
+function extractGeoTarEntryBuffer(archivePayload, memberName) {
+  const entryIndex = archivePayload?.entryIndex;
+  const buffer = archivePayload?.buffer;
+  if (!(entryIndex instanceof Map) || !Buffer.isBuffer(buffer)) {
+    return null;
+  }
+  const entry = entryIndex.get(memberName);
+  if (!entry) return null;
+  return buffer.subarray(entry.contentStart, entry.contentEnd);
+}
+
+function parseGeoSampleQuickMetadata(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const characteristics = {};
+  let organism = "";
+  let sourceName = "";
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("!Sample_organism_ch1 = ")) {
+      organism = normalizeWhitespace(line.split("=", 2)[1] || "");
+      continue;
+    }
+    if (line.startsWith("!Sample_source_name_ch1 = ")) {
+      sourceName = normalizeWhitespace(line.split("=", 2)[1] || "");
+      continue;
+    }
+    if (!line.startsWith("!Sample_characteristics_ch1 = ")) {
+      continue;
+    }
+    const value = normalizeWhitespace(line.split("=", 2)[1] || "");
+    if (!value) continue;
+    const separatorIndex = value.indexOf(":");
+    if (separatorIndex === -1) {
+      characteristics[value.toLowerCase()] = value;
+      continue;
+    }
+    const key = normalizeWhitespace(value.slice(0, separatorIndex)).toLowerCase();
+    const fieldValue = normalizeWhitespace(value.slice(separatorIndex + 1));
+    if (key) {
+      characteristics[key] = fieldValue;
+    }
+  }
+  return {
+    organism,
+    source_name: sourceName,
+    characteristics,
+  };
+}
+
+async function fetchGeoSampleQuickMetadata(accession) {
+  const cleanAccession = normalizeGeoIdentifier(accession);
+  const cached = getFreshCacheValue(geoSampleQuickMetadataCache.get(cleanAccession), 6 * 60 * 60 * 1000);
+  if (cached) {
+    return cached;
+  }
+  const url = `${buildGeoRecordUrl(cleanAccession)}&targ=self&form=text&view=quick`;
+  const response = await fetchWithRetry(url, { retries: 1, timeoutMs: 20000, maxBackoffMs: 2500 });
+  const text = await response.text();
+  const payload = parseGeoSampleQuickMetadata(text);
+  geoSampleQuickMetadataCache.set(cleanAccession, storeCacheValue(null, payload));
+  return payload;
+}
+
+function computeGeoClusterProportionsFromCountsCsv(csvText, clusterColumn = "assigned_cluster") {
+  const lines = String(csvText || "")
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0);
+  if (lines.length < 2) {
+    throw new Error("The GEO supplementary CSV did not contain any data rows.");
+  }
+  const header = parseDelimitedLine(lines[0], ",");
+  const clusterIndex = header.findIndex((column) => normalizeWhitespace(column).toLowerCase() === clusterColumn.toLowerCase());
+  if (clusterIndex === -1) {
+    throw new Error(`Column ${clusterColumn} was not found in the GEO supplementary CSV header.`);
+  }
+
+  const counts = new Map();
+  let totalRows = 0;
+  for (let idx = 1; idx < lines.length; idx += 1) {
+    const values = parseDelimitedLine(lines[idx], ",");
+    const cluster = normalizeWhitespace(values[clusterIndex] || "");
+    if (!cluster) continue;
+    totalRows += 1;
+    counts.set(cluster, (counts.get(cluster) || 0) + 1);
+  }
+  if (totalRows === 0) {
+    throw new Error("No labeled cells were found in the GEO supplementary CSV.");
+  }
+
+  const proportions = Array.from(counts.entries())
+    .map(([cellType, count]) => ({
+      cell_type: cellType,
+      count,
+      proportion: count / totalRows,
+      proportion_rounded: Number((count / totalRows).toFixed(2)),
+    }))
+    .sort((left, right) => right.count - left.count);
+
+  return {
+    total_rows: totalRows,
+    cluster_column: clusterColumn,
+    counts: proportions,
+  };
+}
+
 function buildGeoDocsumMap(summaryResult) {
   const uids = Array.isArray(summaryResult?.uids) ? summaryResult.uids : [];
   const docs = [];
@@ -6167,6 +7293,201 @@ server.registerTool(
 );
 
 // ============================================
+// RefSeq helpers (NCBI Entrez nuccore / protein)
+// ============================================
+const REFSEQ_PROTEIN_ACCESSION_PREFIX = /^(NP_|XP_|YP_|AP_|WP_)/i;
+
+function inferRefseqEntrezDbFromIdentifier(rawIdentifier) {
+  const token = String(rawIdentifier || "").trim().split(/\s+/)[0] || "";
+  if (REFSEQ_PROTEIN_ACCESSION_PREFIX.test(token)) {
+    return "protein";
+  }
+  return "nuccore";
+}
+
+function buildRefseqRecordUrl(db, accessionVersion, caption) {
+  const acc = String(accessionVersion || caption || "").trim();
+  if (!acc) {
+    return "https://www.ncbi.nlm.nih.gov/refseq/";
+  }
+  if (db === "protein") {
+    return `https://www.ncbi.nlm.nih.gov/protein/${encodeURIComponent(acc)}`;
+  }
+  return `https://www.ncbi.nlm.nih.gov/nuccore/${encodeURIComponent(acc)}`;
+}
+
+function parseRefseqEsummaryDocs(payload) {
+  const result = payload?.result;
+  const uids = result?.uids;
+  if (!Array.isArray(uids) || uids.length === 0) {
+    return [];
+  }
+  return uids
+    .map((uid) => result?.[uid])
+    .filter((doc) => doc && typeof doc === "object");
+}
+
+function summarizeRefseqDocSum(doc, db) {
+  const accVer = normalizeWhitespace(doc?.accessionversion || doc?.caption || "") || "";
+  const title = normalizeWhitespace(doc?.title || "") || "";
+  const organism = normalizeWhitespace(doc?.organism || "") || "";
+  const slen = Number(doc?.slen || 0) || 0;
+  const molecule = normalizeWhitespace(doc?.biomol || doc?.moltype || "") || "";
+  const location = normalizeWhitespace(doc?.subname || "") || "";
+  const uid = normalizeWhitespace(doc?.uid || "") || "";
+  const caption = normalizeWhitespace(doc?.caption || "") || null;
+  const capOrVer = accVer || caption || "";
+  return {
+    uid,
+    accessionversion: accVer || null,
+    caption,
+    title,
+    organism,
+    length: slen,
+    molecule,
+    location: location || null,
+    sourcedb: normalizeWhitespace(doc?.sourcedb || "") || null,
+    record_url: buildRefseqRecordUrl(db, capOrVer, caption),
+  };
+}
+
+async function refseqEsearch(db, term, retmax) {
+  const params = new URLSearchParams({
+    db,
+    term,
+    retmax: String(retmax),
+    retmode: "json",
+  });
+  const url = buildNcbiEutilsUrl(PUBMED_ESEARCH, params);
+  return fetchJsonWithRetry(url, { retries: 2, timeoutMs: 10000, maxBackoffMs: 2500 });
+}
+
+async function refseqEsummary(db, idList) {
+  const cleanIds = idList.map((id) => String(id).trim()).filter(Boolean);
+  if (cleanIds.length === 0) {
+    return { result: { uids: [] } };
+  }
+  const params = new URLSearchParams({
+    db,
+    id: cleanIds.join(","),
+    retmode: "json",
+  });
+  const url = buildNcbiEutilsUrl(PUBMED_ESUMMARY, params);
+  return fetchJsonWithRetry(url, { retries: 2, timeoutMs: 12000, maxBackoffMs: 2500 });
+}
+
+async function resolveRefseqUidsForLookup(db, identifier, retmax) {
+  const raw = String(identifier || "").trim();
+  if (/^\d+$/.test(raw)) {
+    const summaryPayload = await refseqEsummary(db, [raw]);
+    const docs = parseRefseqEsummaryDocs(summaryPayload);
+    if (docs.length > 0) {
+      return { uids: [raw], totalCount: 1 };
+    }
+  }
+  const data = await refseqEsearch(db, raw, retmax);
+  const uids = Array.isArray(data?.esearchresult?.idlist) ? data.esearchresult.idlist : [];
+  const totalCount = Number(data?.esearchresult?.count || 0);
+  return { uids, totalCount };
+}
+
+async function refseqEfetchXml(db, id) {
+  const params = new URLSearchParams({
+    db,
+    id: String(id || "").trim(),
+    rettype: db === "protein" ? "gp" : "gbc",
+    retmode: "xml",
+  });
+  const url = buildNcbiEutilsUrl(PUBMED_EFETCH, params);
+  const response = await fetchWithRetry(url, { retries: 2, timeoutMs: 20000, maxBackoffMs: 2500 });
+  return response.text();
+}
+
+const REFSEQ_FEATURE_QUALIFIER_SKIP = new Set(["translation"]);
+const REFSEQ_FEATURE_SUMMARY_QUALIFIER_PRIORITY = ["gene", "product", "protein_id", "peptide", "note", "inference"];
+
+function summarizeRefseqFeatureAnnotation(feature) {
+  if (!feature || typeof feature !== "object") {
+    return null;
+  }
+  const key = normalizeWhitespace(feature?.INSDFeature_key || "");
+  const location = normalizeWhitespace(feature?.INSDFeature_location || "");
+  if (!key || !location) {
+    return null;
+  }
+
+  const intervals = asArray(feature?.INSDFeature_intervals?.INSDInterval)
+    .map((interval) => ({
+      from: normalizeWhitespace(interval?.INSDInterval_from || "") || null,
+      to: normalizeWhitespace(interval?.INSDInterval_to || "") || null,
+      accession: normalizeWhitespace(interval?.INSDInterval_accession || "") || null,
+    }))
+    .filter((interval) => interval.from || interval.to || interval.accession);
+
+  const qualifiers = {};
+  for (const qualifier of asArray(feature?.INSDFeature_quals?.INSDQualifier)) {
+    const name = normalizeWhitespace(qualifier?.INSDQualifier_name || "").toLowerCase();
+    const value = normalizeWhitespace(qualifier?.INSDQualifier_value || "");
+    if (!name || !value || REFSEQ_FEATURE_QUALIFIER_SKIP.has(name)) {
+      continue;
+    }
+    if (!qualifiers[name]) {
+      qualifiers[name] = [];
+    }
+    if (qualifiers[name].length < 4) {
+      qualifiers[name].push(compactErrorMessage(value, 180));
+    }
+  }
+
+  const summaryBits = [`${key} ${location}`];
+  for (const qualifierName of REFSEQ_FEATURE_SUMMARY_QUALIFIER_PRIORITY) {
+    const firstValue = qualifiers[qualifierName]?.[0];
+    if (firstValue) {
+      summaryBits.push(`${qualifierName}: ${firstValue}`);
+    }
+  }
+
+  return {
+    key,
+    location,
+    intervals,
+    qualifiers,
+    summary_line: summaryBits.join(" | "),
+  };
+}
+
+function parseRefseqFeatureAnnotations(xmlText, { maxFeatures = 20, highlightKeys = [] } = {}) {
+  const parsed = parseXmlDocument(xmlText);
+  const record = Array.isArray(parsed?.INSDSet?.INSDSeq) ? parsed.INSDSet.INSDSeq[0] : parsed?.INSDSet?.INSDSeq;
+  const rawFeatures = asArray(record?.["INSDSeq_feature-table"]?.INSDFeature);
+  const features = rawFeatures
+    .map((feature) => summarizeRefseqFeatureAnnotation(feature))
+    .filter(Boolean);
+
+  const normalizedHighlightKeys = new Set(
+    asArray(highlightKeys).map((value) => normalizeWhitespace(value || "").toLowerCase()).filter(Boolean)
+  );
+  const highlightedFeatures = normalizedHighlightKeys.size > 0
+    ? features.filter((feature) => normalizedHighlightKeys.has(feature.key.toLowerCase()))
+    : features.slice(0, maxFeatures);
+
+  const featureLookup = {};
+  for (const feature of features) {
+    if (!featureLookup[feature.key]) {
+      featureLookup[feature.key] = [];
+    }
+    featureLookup[feature.key].push(feature.location);
+  }
+
+  return {
+    feature_count: features.length,
+    features: features.slice(0, maxFeatures),
+    highlighted_features: highlightedFeatures.slice(0, maxFeatures),
+    feature_lookup: featureLookup,
+  };
+}
+
+// ============================================
 // TOOL: Search GEO datasets
 // ============================================
 server.registerTool(
@@ -6427,6 +7748,2386 @@ server.registerTool(
           schema: "get_geo_dataset.v1",
           result_status: "error",
           identifier: normalizedIdentifier,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL: Compute GEO cell-type proportions from supplementary count matrices
+// ============================================
+server.registerTool(
+  "get_geo_cell_type_proportions",
+  {
+    description:
+      "Compute cell-type proportions from GEO supplementary count matrices when the raw per-cell CSV includes a cell-type/cluster label column " +
+      "(for example GSE84133 `assigned_cluster`). Can filter donors by sample metadata such as disease status before aggregating counts.",
+    inputSchema: {
+      accession: z.string().describe("GEO series accession (GSE...), e.g. 'GSE84133'."),
+      cellTypes: z.array(z.string()).optional().describe("Optional list of cell types/clusters to report explicitly, e.g. ['beta', 'ductal']."),
+      sampleAccession: z.string().optional().describe("Optional specific GEO sample accession (GSM...) to use instead of filtering all samples in the series."),
+      organism: z.string().optional().describe("Optional organism filter for sample metadata, default 'Homo sapiens'."),
+      donorDiseaseField: z.string().optional().describe("Sample metadata field used to identify a donor subset, default 'type 2 diabetes mellitus'."),
+      donorDiseaseValue: z.string().optional().describe("Required value for donorDiseaseField, default 'Yes'."),
+      clusterColumn: z.string().optional().describe("CSV column containing cell-type labels, default 'assigned_cluster'."),
+    },
+  },
+  async ({ accession, cellTypes, sampleAccession, organism, donorDiseaseField, donorDiseaseValue, clusterColumn }) => {
+    const cleanAccession = normalizeGeoIdentifier(accession);
+    if (!/^GSE\d+$/.test(cleanAccession)) {
+      return { content: [{ type: "text", text: "Provide a GEO series accession such as GSE84133." }] };
+    }
+
+    const targetCellTypes = Array.isArray(cellTypes)
+      ? cellTypes.map((value) => normalizeWhitespace(value)).filter(Boolean)
+      : [];
+    const cleanSampleAccession = normalizeGeoIdentifier(sampleAccession);
+    const organismFilter = normalizeWhitespace(organism || "Homo sapiens");
+    const diseaseField = normalizeWhitespace(donorDiseaseField || "type 2 diabetes mellitus").toLowerCase();
+    const diseaseValue = normalizeWhitespace(donorDiseaseValue || "Yes").toLowerCase();
+    const clusterField = normalizeWhitespace(clusterColumn || "assigned_cluster") || "assigned_cluster";
+
+    try {
+      const fileListUrl = buildGeoSupplementaryFileListUrl(cleanAccession);
+      if (!fileListUrl) {
+        throw new Error(`Could not derive a GEO supplementary-file URL for ${cleanAccession}.`);
+      }
+      const fileListResponse = await fetchWithRetry(fileListUrl, { retries: 1, timeoutMs: 20000, maxBackoffMs: 2500 });
+      const fileListRows = parseGeoFileList(await fileListResponse.text());
+      const csvMembers = fileListRows
+        .map((row) => row.name)
+        .filter((name) => /^GSM\d+_.+\.csv\.gz$/i.test(name));
+
+      if (csvMembers.length === 0) {
+        throw new Error(`No supplementary per-cell CSV files were found for ${cleanAccession}.`);
+      }
+
+      const matchingMembers = [];
+      for (const memberName of csvMembers) {
+        const gsmMatch = memberName.match(/^(GSM\d+)_/i);
+        const gsmAccession = normalizeGeoIdentifier(gsmMatch?.[1] || "");
+        if (!gsmAccession) continue;
+        if (cleanSampleAccession && gsmAccession !== cleanSampleAccession) {
+          continue;
+        }
+        const sampleMetadata = await fetchGeoSampleQuickMetadata(gsmAccession);
+        const sampleOrganism = normalizeWhitespace(sampleMetadata?.organism || "");
+        if (organismFilter && sampleOrganism && sampleOrganism.toLowerCase() !== organismFilter.toLowerCase()) {
+          continue;
+        }
+        if (!cleanSampleAccession) {
+          const characteristicValue = normalizeWhitespace(sampleMetadata?.characteristics?.[diseaseField] || "").toLowerCase();
+          if (!characteristicValue || characteristicValue !== diseaseValue) {
+            continue;
+          }
+        }
+        matchingMembers.push({
+          gsm_accession: gsmAccession,
+          member_name: memberName,
+          metadata: sampleMetadata,
+        });
+      }
+
+      if (matchingMembers.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No supplementary GEO samples matched the requested donor filter in ${cleanAccession}.`,
+              keyFields: [
+                `Series: ${cleanAccession}`,
+                `Requested sample: ${cleanSampleAccession || "none"}`,
+                `Organism filter: ${organismFilter || "none"}`,
+                `Donor filter: ${diseaseField || "none"} = ${diseaseValue || "none"}`,
+              ],
+              sources: [buildGeoRecordUrl(cleanAccession), fileListUrl],
+              limitations: [
+                "This tool only works when GEO supplementary files include a per-cell label column such as `assigned_cluster`.",
+                "Sample-level donor filtering relies on GEO sample metadata fields and may not cover every study design.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_geo_cell_type_proportions.v1",
+            result_status: "not_found_or_empty",
+            accession: cleanAccession,
+            sample_accessions: [],
+            cell_type_proportions: [],
+          },
+        };
+      }
+
+      const archivePayload = await fetchGeoSupplementaryArchive(cleanAccession);
+      const aggregatedCounts = new Map();
+      let totalRows = 0;
+      const sampleSummaries = [];
+
+      for (const member of matchingMembers) {
+        const gzBuffer = extractGeoTarEntryBuffer(archivePayload, member.member_name);
+        if (!gzBuffer) {
+          throw new Error(`Supplementary member ${member.member_name} was not found inside ${cleanAccession}_RAW.tar.`);
+        }
+        const csvText = gunzipSync(gzBuffer).toString("utf8");
+        const sampleResult = computeGeoClusterProportionsFromCountsCsv(csvText, clusterField);
+        totalRows += sampleResult.total_rows;
+        for (const row of sampleResult.counts) {
+          aggregatedCounts.set(row.cell_type, (aggregatedCounts.get(row.cell_type) || 0) + row.count);
+        }
+        sampleSummaries.push({
+          gsm_accession: member.gsm_accession,
+          member_name: member.member_name,
+          total_rows: sampleResult.total_rows,
+          source_name: normalizeWhitespace(member.metadata?.source_name || "") || null,
+          donor_characteristics: member.metadata?.characteristics || {},
+        });
+      }
+
+      const allProportions = Array.from(aggregatedCounts.entries())
+        .map(([cellType, count]) => ({
+          cell_type: cellType,
+          count,
+          proportion: count / totalRows,
+          proportion_rounded: Number((count / totalRows).toFixed(2)),
+        }))
+        .sort((left, right) => right.count - left.count);
+
+      const filteredProportions = targetCellTypes.length > 0
+        ? allProportions.filter((row) => targetCellTypes.some((cellType) => cellType.toLowerCase() === row.cell_type.toLowerCase()))
+        : allProportions;
+
+      const keyFields = [
+        `Series: ${cleanAccession}`,
+        `Matched samples: ${matchingMembers.map((member) => member.gsm_accession).join(", ")}`,
+        `Organism filter: ${organismFilter}`,
+        cleanSampleAccession
+          ? `Specific sample: ${cleanSampleAccession}`
+          : `Donor filter: ${diseaseField} = ${diseaseValue}`,
+        `Cluster column: ${clusterField}`,
+        `Total labeled cells: ${totalRows}`,
+        "\nComputed proportions:",
+        ...filteredProportions.map((row) => `${row.cell_type}: ${row.proportion.toFixed(4)} (${row.count}/${totalRows})`),
+      ];
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Computed GEO cell-type proportions from ${cleanAccession} supplementary count matrices.`,
+            keyFields,
+            sources: [
+              buildGeoRecordUrl(cleanAccession),
+              fileListUrl,
+              archivePayload.archiveUrl,
+              ...matchingMembers.slice(0, 4).map((member) => buildGeoRecordUrl(member.gsm_accession)),
+            ],
+            limitations: [
+              "This tool depends on a per-cell label column already being present in the supplementary CSV.",
+              "Donor subset filtering is based on GEO sample metadata rather than re-inferred from the expression matrix.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_geo_cell_type_proportions.v1",
+          result_status: "ok",
+          accession: cleanAccession,
+          organism: organismFilter || null,
+          sample_accessions: matchingMembers.map((member) => member.gsm_accession),
+          donor_filter: cleanSampleAccession ? null : { field: diseaseField, value: diseaseValue },
+          cluster_column: clusterField,
+          total_cells: totalRows,
+          cell_type_proportions: filteredProportions,
+          all_cell_type_proportions: allProportions,
+          sample_summaries: sampleSummaries,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error computing GEO cell-type proportions: ${detail}` }],
+        structuredContent: {
+          schema: "get_geo_cell_type_proportions.v1",
+          result_status: "error",
+          accession: cleanAccession,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL: Search RefSeq (NCBI Entrez)
+// ============================================
+server.registerTool(
+  "search_refseq_sequences",
+  {
+    description:
+      "Searches NCBI RefSeq nucleotide records (nuccore; NM/NR/NC/NG/XM/XR accessions) or RefSeq protein records (NP/XP/WP accessions) using Entrez. " +
+      "Use for locating curated RefSeq accessions by gene symbol, keyword, or accession stem; follow up with get_refseq_record for a specific hit.",
+    inputSchema: {
+      query: z.string().describe("Entrez query, e.g. 'TP53[Gene Name]', 'NM_000546', 'brca1 AND human', or 'BRCA1[Gene Name]'."),
+      moleculeType: z.enum(["nucleotide", "protein"]).optional().describe("Search nuccore (transcripts/genomic RefSeq) or protein. Default 'nucleotide'."),
+      organism: z.string().optional().describe("Optional organism filter, e.g. 'Homo sapiens' or 'Mus musculus' (adds Organism field to the query)."),
+      refseqOnly: z.boolean().optional().describe("When true (default), restricts to refseq[filter]. Set false to search the full nucleotide/protein index."),
+      maxResults: z.number().optional().describe("Maximum records to return (default 15, max 50)."),
+    },
+  },
+  async ({ query, moleculeType, organism, refseqOnly, maxResults }) => {
+    const normalizedQuery = normalizeWhitespace(query || "");
+    if (!normalizedQuery) {
+      return { content: [{ type: "text", text: "Provide a RefSeq search query." }] };
+    }
+
+    const db = (moleculeType || "nucleotide") === "protein" ? "protein" : "nuccore";
+    const useRefseqOnly = refseqOnly !== false;
+    const limit = Math.min(Math.max(1, Math.round(maxResults || 15)), 50);
+    let term = `(${normalizedQuery})`;
+    if (useRefseqOnly) {
+      term += " AND refseq[filter]";
+    }
+    const org = normalizeWhitespace(organism || "");
+    if (org) {
+      term += ` AND "${org}"[Organism]`;
+    }
+
+    try {
+      const searchData = await refseqEsearch(db, term, limit);
+      const idList = Array.isArray(searchData?.esearchresult?.idlist) ? searchData.esearchresult.idlist : [];
+      const totalCount = Number(searchData?.esearchresult?.count || 0);
+
+      if (idList.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No RefSeq (${db}) matches for this query.`,
+              keyFields: [
+                `Query: ${normalizedQuery}`,
+                `Entrez db: ${db}`,
+                `RefSeq filter: ${useRefseqOnly ? "on" : "off"}`,
+                org ? `Organism: ${org}` : null,
+              ].filter(Boolean),
+              sources: [
+                "https://www.ncbi.nlm.nih.gov/refseq/",
+                `https://www.ncbi.nlm.nih.gov/${db === "protein" ? "protein" : "nuccore"}/?term=${encodeURIComponent(term)}`,
+              ],
+              limitations: [
+                "Try a simpler gene symbol query with organism filter, or search the opposite moleculeType (nuccore vs protein).",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "search_refseq_sequences.v1",
+            result_status: "not_found_or_empty",
+            entrez_db: db,
+            query: normalizedQuery,
+            refseq_filter: useRefseqOnly,
+            organism: org || null,
+            total_count: 0,
+            records: [],
+          },
+        };
+      }
+
+      const summaryPayload = await refseqEsummary(db, idList);
+      const docs = parseRefseqEsummaryDocs(summaryPayload);
+      const records = docs.map((doc) => summarizeRefseqDocSum(doc, db));
+      const lines = records.map((rec, idx) => {
+        const acc = rec.accessionversion || rec.caption || rec.uid;
+        const bit = [
+          `${String(idx + 1).padStart(3)}. ${acc}`,
+          rec.title && rec.title.length > 140 ? `${rec.title.slice(0, 137)}...` : rec.title,
+          rec.organism ? `[${rec.organism}]` : "",
+          rec.length ? `len=${rec.length}` : "",
+        ].filter(Boolean);
+        return bit.join(" | ");
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `RefSeq search (${db}): ${totalCount} hit(s). Showing ${records.length}.`,
+            keyFields: [
+              `Query: ${normalizedQuery}`,
+              `Entrez db: ${db}`,
+              `RefSeq filter: ${useRefseqOnly ? "on" : "off"}`,
+              org ? `Organism: ${org}` : null,
+              "\nResults:",
+              ...lines,
+            ].filter(Boolean),
+            sources: [
+              "https://www.ncbi.nlm.nih.gov/refseq/",
+              `https://www.ncbi.nlm.nih.gov/${db === "protein" ? "protein" : "nuccore"}/?term=${encodeURIComponent(term)}`,
+            ],
+            limitations: [
+              "Summaries are Entrez esummary fields only—no raw FASTA or full GenBank flatfile here. Use get_refseq_record on an accession or UID for consistent metadata.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "search_refseq_sequences.v1",
+          result_status: "ok",
+          entrez_db: db,
+          query: normalizedQuery,
+          refseq_filter: useRefseqOnly,
+          organism: org || null,
+          total_count: totalCount,
+          records,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error searching RefSeq: ${detail}` }],
+        structuredContent: {
+          schema: "search_refseq_sequences.v1",
+          result_status: "error",
+          entrez_db: db,
+          query: normalizedQuery,
+          refseq_filter: useRefseqOnly,
+          organism: org || null,
+          total_count: 0,
+          records: [],
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL: Get RefSeq record metadata
+// ============================================
+server.registerTool(
+  "get_refseq_record",
+  {
+    description:
+      "Fetches detailed RefSeq metadata from NCBI Entrez (nuccore or protein) for a RefSeq accession (e.g. NM_000546.6, NP_000537.3) or numeric GI/UID. " +
+      "Returns accession version, title, organism, sequence length, molecule type, map location when present, a stable NCBI link, and GenBank feature annotations when available.",
+    inputSchema: {
+      identifier: z.string().describe("RefSeq accession with or without version, Entrez UID, or accession text accepted by Entrez, e.g. 'NM_000546', '1808862652'."),
+      moleculeType: z.enum(["auto", "nucleotide", "protein"]).optional().describe("Force Entrez db: nuccore vs protein. Default 'auto' uses NP/XP/WP/... → protein, otherwise nuccore."),
+    },
+  },
+  async ({ identifier, moleculeType }) => {
+    const rawId = normalizeWhitespace(identifier || "");
+    if (!rawId) {
+      return { content: [{ type: "text", text: "Provide a RefSeq accession or Entrez UID." }] };
+    }
+
+    const mode = moleculeType || "auto";
+    const db = mode === "protein"
+      ? "protein"
+      : mode === "nucleotide"
+        ? "nuccore"
+        : inferRefseqEntrezDbFromIdentifier(rawId);
+
+    try {
+      const { uids, totalCount } = await resolveRefseqUidsForLookup(db, rawId, 1);
+      if (!uids.length) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No RefSeq (${db}) record found for "${rawId}".`,
+              keyFields: [`Identifier: ${rawId}`, `Entrez db: ${db}`, totalCount > 1 ? `Entrez reports ${totalCount} match(es); refine the accession.` : null].filter(Boolean),
+              sources: [
+                "https://www.ncbi.nlm.nih.gov/refseq/",
+                `https://www.ncbi.nlm.nih.gov/${db === "protein" ? "protein" : "nuccore"}/?term=${encodeURIComponent(rawId)}`,
+              ],
+              limitations: [
+                "If an accession moved, try without the version number or use search_refseq_sequences to list current RefSeq accessions.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_refseq_record.v1",
+            result_status: "not_found_or_empty",
+            entrez_db: db,
+            identifier: rawId,
+          },
+        };
+      }
+
+      const summaryPayload = await refseqEsummary(db, uids);
+      const docs = parseRefseqEsummaryDocs(summaryPayload);
+      if (!docs.length) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `RefSeq esummary returned no document for "${rawId}".`,
+              keyFields: [`Identifier: ${rawId}`, `Entrez db: ${db}`],
+              sources: [`https://www.ncbi.nlm.nih.gov/${db === "protein" ? "protein" : "nuccore"}/${encodeURIComponent(uids[0])}`],
+              limitations: ["Try moleculeType 'nucleotide' vs 'protein' if the accession class was mis-inferred."],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_refseq_record.v1",
+            result_status: "not_found_or_empty",
+            entrez_db: db,
+            identifier: rawId,
+          },
+        };
+      }
+
+      const doc = docs[0];
+      const rec = summarizeRefseqDocSum(doc, db);
+      let featureAnnotations = null;
+      let featureAnnotationError = "";
+      if (db === "nuccore") {
+        try {
+          const xml = await refseqEfetchXml(db, rec.accessionversion || rec.uid || rawId);
+          featureAnnotations = parseRefseqFeatureAnnotations(xml, {
+            maxFeatures: 20,
+            highlightKeys: ["CDS", "sig_peptide", "mat_peptide"],
+          });
+        } catch (error) {
+          featureAnnotationError = compactErrorMessage(error?.message || "feature annotations unavailable", 180);
+        }
+      }
+      const keyFields = [
+        `Identifier: ${rawId}`,
+        `Entrez db: ${db}`,
+        `UID: ${rec.uid}`,
+        `Accession: ${rec.accessionversion || rec.caption || "n/a"}`,
+        `Title: ${rec.title || "n/a"}`,
+      ];
+      if (rec.organism) keyFields.push(`Organism: ${rec.organism}`);
+      if (rec.length) keyFields.push(`${db === "protein" ? "Length (aa)" : "Length (bases)"}: ${rec.length}`);
+      if (rec.molecule) keyFields.push(`Molecule: ${rec.molecule}`);
+      if (rec.location) keyFields.push(`Map / context: ${rec.location}`);
+      if (rec.sourcedb) keyFields.push(`Source: ${rec.sourcedb}`);
+      if (featureAnnotations?.highlighted_features?.length) {
+        keyFields.push("\nFeature annotations:");
+        for (const feature of featureAnnotations.highlighted_features.slice(0, 8)) {
+          keyFields.push(feature.summary_line);
+        }
+      } else if (featureAnnotationError) {
+        keyFields.push(`Feature annotations unavailable: ${featureAnnotationError}`);
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `RefSeq metadata for ${rec.accessionversion || rec.caption || rec.uid}.`,
+            keyFields,
+            sources: [rec.record_url],
+            limitations: [
+              "This tool does not return raw sequence text; open the NCBI link or use efetch for FASTA/GenBank when needed.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_refseq_record.v1",
+          result_status: "ok",
+          entrez_db: db,
+          identifier: rawId,
+          feature_count: featureAnnotations?.feature_count || 0,
+          highlighted_features: featureAnnotations?.highlighted_features || [],
+          features: featureAnnotations?.features || [],
+          feature_lookup: featureAnnotations?.feature_lookup || {},
+          feature_annotation_error: featureAnnotationError || null,
+          ...rec,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error fetching RefSeq record: ${detail}` }],
+        structuredContent: {
+          schema: "get_refseq_record.v1",
+          result_status: "error",
+          entrez_db: db,
+          identifier: rawId,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// UCSC Genome Browser REST API (api.genome.ucsc.edu)
+// ============================================
+const UCSC_API_BASE = "https://api.genome.ucsc.edu";
+
+function safeDecodeURIComponent(value) {
+  const raw = String(value || "");
+  try {
+    return decodeURIComponent(raw.replace(/\+/g, " "));
+  } catch {
+    return raw;
+  }
+}
+
+function buildUcscBrowserUrl(genome, position) {
+  const db = String(genome || "").trim();
+  const pos = String(position || "").trim();
+  if (!db || !pos) {
+    return "https://genome.ucsc.edu/";
+  }
+  return `https://genome.ucsc.edu/cgi-bin/hgTracks?db=${encodeURIComponent(db)}&position=${encodeURIComponent(pos)}`;
+}
+
+function buildUcscApiSearchUrl(search, genome, categories) {
+  const params = new URLSearchParams({
+    search: String(search || "").trim(),
+    genome: String(genome || "").trim(),
+  });
+  const cat = String(categories || "").trim();
+  if (cat) {
+    params.set("categories", cat);
+  }
+  return `${UCSC_API_BASE}/search?${params.toString()}`;
+}
+
+function buildUcscGetDataSequenceParams({ genome, chrom, start, end, revComp, hubUrl }) {
+  const parts = [];
+  const hub = String(hubUrl || "").trim();
+  if (hub) {
+    parts.push(`hubUrl=${encodeURIComponent(hub)}`);
+  }
+  parts.push(`genome=${encodeURIComponent(String(genome || "").trim())}`);
+  parts.push(`chrom=${encodeURIComponent(String(chrom || "").trim())}`);
+  parts.push(`start=${Math.round(Number(start))}`);
+  parts.push(`end=${Math.round(Number(end))}`);
+  if (revComp) {
+    parts.push("revComp=1");
+  }
+  return parts.join(";");
+}
+
+function buildUcscGetDataTrackParams({ genome, track, chrom, start, end, maxItemsOutput, hubUrl }) {
+  const parts = [];
+  const hub = String(hubUrl || "").trim();
+  if (hub) {
+    parts.push(`hubUrl=${encodeURIComponent(hub)}`);
+  }
+  parts.push(`genome=${encodeURIComponent(String(genome || "").trim())}`);
+  parts.push(`track=${encodeURIComponent(String(track || "").trim())}`);
+  const chr = String(chrom || "").trim();
+  if (chr) {
+    parts.push(`chrom=${encodeURIComponent(chr)}`);
+  }
+  if (start !== undefined && end !== undefined && String(chrom || "").trim()) {
+    parts.push(`start=${Math.round(Number(start))}`);
+    parts.push(`end=${Math.round(Number(end))}`);
+  }
+  const cap = Math.max(1, Math.min(500, Math.round(maxItemsOutput || 25)));
+  parts.push(`maxItemsOutput=${cap}`);
+  return parts.join(";");
+}
+
+function flattenUcscSearchMatches(payload, maxTotal) {
+  const limit = Math.max(1, Math.min(100, Math.round(maxTotal || 40)));
+  const sections = Array.isArray(payload?.positionMatches) ? payload.positionMatches : [];
+  const out = [];
+  for (const section of sections) {
+    const trackName = normalizeWhitespace(section?.trackName || section?.name || "") || "";
+    const trackDesc = normalizeWhitespace(section?.description || "") || null;
+    const matches = Array.isArray(section?.matches) ? section.matches : [];
+    for (const m of matches) {
+      if (out.length >= limit) {
+        return out;
+      }
+      const position = normalizeWhitespace(m?.position || "") || null;
+      out.push({
+        track: trackName,
+        track_description: trackDesc,
+        position,
+        name: normalizeWhitespace(m?.posName || "") || null,
+        match_id: normalizeWhitespace(safeDecodeURIComponent(m?.hgFindMatches || "")) || null,
+        description: normalizeWhitespace(m?.description || "") || null,
+        canonical: Boolean(m?.canonical),
+        browser_url: position ? buildUcscBrowserUrl(payload?.genome, position) : buildUcscBrowserUrl(payload?.genome, ""),
+      });
+    }
+  }
+  return out;
+}
+
+function extractUcscTrackRows(payload, trackName) {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+  const t = String(trackName || "").trim();
+  if (t && Array.isArray(payload[t])) {
+    return payload[t];
+  }
+  const skip = new Set([
+    "downloadTime",
+    "downloadTimeStamp",
+    "genome",
+    "dataTime",
+    "dataTimeStamp",
+    "trackType",
+    "track",
+    "chrom",
+    "chromSize",
+    "bigDataUrl",
+    "start",
+    "end",
+  ]);
+  for (const [key, val] of Object.entries(payload)) {
+    if (skip.has(key)) {
+      continue;
+    }
+    if (Array.isArray(val)) {
+      return val;
+    }
+  }
+  return [];
+}
+
+function summarizeUcscTrackRow(row) {
+  if (!row || typeof row !== "object") {
+    return null;
+  }
+  const gene = normalizeWhitespace(row.geneName || row.name2 || "") || null;
+  const tx = normalizeWhitespace(row.name || "") || null;
+  const start = Number.isFinite(Number(row.chromStart)) ? Number(row.chromStart) : null;
+  const end = Number.isFinite(Number(row.chromEnd)) ? Number(row.chromEnd) : null;
+  const chrom = normalizeWhitespace(row.chrom || "") || null;
+  const strand = normalizeWhitespace(row.strand || "") || null;
+  const interval = chrom && start !== null && end !== null ? `${chrom}:${start}-${end}` : null;
+  const bits = [
+    gene || tx || "record",
+    interval,
+    strand ? `(${strand})` : null,
+    tx && gene ? `tx ${tx}` : null,
+  ].filter(Boolean);
+  return {
+    summary: bits.join(" "),
+    gene,
+    transcript: tx,
+    chrom,
+    chromStart: start,
+    chromEnd: end,
+    strand,
+  };
+}
+
+function summarizeDnaComposition(dna) {
+  const text = typeof dna === "string" ? dna.toUpperCase() : "";
+  let aCount = 0;
+  let cCount = 0;
+  let gCount = 0;
+  let tCount = 0;
+  let nonAcgtCount = 0;
+
+  for (const base of text) {
+    if (base === "A") aCount += 1;
+    else if (base === "C") cCount += 1;
+    else if (base === "G") gCount += 1;
+    else if (base === "T") tCount += 1;
+    else nonAcgtCount += 1;
+  }
+
+  const canonicalBaseCount = aCount + cCount + gCount + tCount;
+  const gcCount = cCount + gCount;
+  const atCount = aCount + tCount;
+  const gcFraction = canonicalBaseCount > 0 ? gcCount / canonicalBaseCount : null;
+  const atFraction = canonicalBaseCount > 0 ? atCount / canonicalBaseCount : null;
+
+  return {
+    aCount,
+    cCount,
+    gCount,
+    tCount,
+    gcCount,
+    atCount,
+    canonicalBaseCount,
+    nonAcgtCount,
+    gcFraction,
+    gcPercent: gcFraction === null ? null : gcFraction * 100,
+    atFraction,
+    atPercent: atFraction === null ? null : atFraction * 100,
+  };
+}
+
+// ============================================
+// TOOL: UCSC genome search
+// ============================================
+server.registerTool(
+  "search_ucsc_genome",
+  {
+    description:
+      "Searches within a UCSC Genome Browser assembly ( positions, genes, tracks metadata ) via the public REST /search API. " +
+      "Use to resolve gene symbols (e.g. BRCA1) or features to chromosomal coordinates and to obtain direct Genome Browser links. Default assembly is hg38.",
+    inputSchema: {
+      search: z.string().describe("Search string, e.g. gene symbol 'BRCA1', 'HOXA1', region text, or track keyword."),
+      genome: z.string().optional().describe("UCSC assembly name, e.g. hg38, hg19, mm39, mm10 (default hg38)."),
+      categories: z.enum(["helpDocs", "publicHubs", "trackDb"]).optional().describe(
+        "Restrict search scope: help documentation, public hubs, or trackDb settings. Omit for the default feature/position search.",
+      ),
+      maxMatches: z.number().optional().describe("Maximum flattened hits to return (default 40, max 100)."),
+    },
+  },
+  async ({ search, genome, categories, maxMatches }) => {
+    const q = normalizeWhitespace(search || "");
+    if (!q) {
+      return { content: [{ type: "text", text: "Provide a UCSC search string." }] };
+    }
+    const asm = normalizeWhitespace(genome || "") || "hg38";
+    const cap = Math.max(1, Math.min(100, Math.round(maxMatches || 40)));
+
+    try {
+      const url = buildUcscApiSearchUrl(q, asm, categories || "");
+      const payload = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 20000, maxBackoffMs: 4000 });
+      const matches = categories
+        ? []
+        : flattenUcscSearchMatches({ ...payload, genome: asm }, cap);
+
+      if (!categories && matches.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No UCSC position matches for "${q}" on ${asm}.`,
+              keyFields: [`Search: ${q}`, `Genome: ${asm}`],
+              sources: [url, buildUcscBrowserUrl(asm, q)],
+              limitations: [
+                "Try hg19 if the assembly is wrong, or a more specific symbol. For raw sequence use get_ucsc_genomic_sequence with coordinates from a hit.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "search_ucsc_genome.v1",
+            result_status: "not_found_or_empty",
+            genome: asm,
+            search: q,
+            categories: categories || null,
+            matches: [],
+          },
+        };
+      }
+
+      if (categories) {
+        const textJson = JSON.stringify(payload, null, 2);
+        const clipped = textJson.length > 12000 ? `${textJson.slice(0, 11997)}...` : textJson;
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `UCSC search (${asm}, categories=${categories}) for "${q}".`,
+              keyFields: ["Raw JSON (trimmed if long):", clipped],
+              sources: [url, "https://api.genome.ucsc.edu/goldenPath/help/api.html"],
+              limitations: ["Category searches return API-specific JSON shapes; inspect fields for hub or help hits."],
+            }),
+          }],
+          structuredContent: {
+            schema: "search_ucsc_genome.v1",
+            result_status: "ok",
+            genome: asm,
+            search: q,
+            categories,
+            raw: payload,
+          },
+        };
+      }
+
+      const lines = matches.map((m, i) => {
+        const head = `${String(i + 1).padStart(3)}. [${m.track}] ${m.name || "—"} @ ${m.position || "—"}`;
+        const tail = m.description && m.description.length > 0
+          ? (m.description.length > 160 ? `${m.description.slice(0, 157)}...` : m.description)
+          : "";
+        return tail ? `${head}\n    ${tail}` : head;
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `UCSC search on ${asm}: ${matches.length} hit(s) for "${q}".`,
+            keyFields: [
+              `Search: ${q}`,
+              `Genome: ${asm}`,
+              "\nHits:",
+              ...lines,
+            ],
+            sources: [
+              url,
+              ...matches.map((m) => m.browser_url).filter(Boolean).slice(0, 5),
+            ],
+            limitations: [
+              "Hits can include secondary matches (e.g. similarly named genes). Prefer canonical rows and verify on the browser.",
+              "Respect UCSC API usage: avoid rapid-fire requests; prefer narrow intervals for track/sequence follow-ups.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "search_ucsc_genome.v1",
+          result_status: "ok",
+          genome: asm,
+          search: q,
+          categories: null,
+          matches,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error querying UCSC search API: ${detail}` }],
+        structuredContent: {
+          schema: "search_ucsc_genome.v1",
+          result_status: "error",
+          genome: asm,
+          search: q,
+          categories: categories || null,
+          matches: [],
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL: UCSC genomic sequence
+// ============================================
+server.registerTool(
+  "get_ucsc_genomic_sequence",
+  {
+    description:
+      "Returns genomic DNA via UCSC REST getData/sequence for a UCSC assembly, chromosome, and half-open interval (start 0-based, end 1-based per UCSC API). " +
+      "Use after search_ucsc_genome for coordinates. Enforces a maximum span to avoid huge downloads.",
+    inputSchema: {
+      genome: z.string().describe("UCSC database, e.g. hg38, hg19, mm39."),
+      chrom: z.string().describe("Chromosome, e.g. chr17, chrM."),
+      start: z.number().describe("Start position (0-based, inclusive)."),
+      end: z.number().describe("End position (1-based per UCSC; exclusive in zero-based terms)."),
+      revComp: z.boolean().optional().describe("If true, return reverse complement."),
+      maxBases: z.number().optional().describe("Maximum interval width allowed (default 250000, hard cap 1000000)."),
+      hubUrl: z.string().optional().describe("Optional track/assembly hub URL when sequence is defined on a hub."),
+    },
+  },
+  async ({ genome, chrom, start, end, revComp, maxBases, hubUrl }) => {
+    const asm = normalizeWhitespace(genome || "");
+    const chr = normalizeWhitespace(chrom || "");
+    const s = Math.round(Number(start));
+    const e = Math.round(Number(end));
+    if (!asm || !chr || !Number.isFinite(s) || !Number.isFinite(e)) {
+      return { content: [{ type: "text", text: "Provide genome, chrom, start, and end." }] };
+    }
+    if (e <= s) {
+      return { content: [{ type: "text", text: "UCSC sequence requires end > start." }] };
+    }
+    const widthLimit = Math.max(1000, Math.min(1_000_000, Math.round(maxBases || 250_000)));
+    const width = e - s;
+    if (width > widthLimit) {
+      return {
+        content: [{
+          type: "text",
+          text: `Interval width ${width} bp exceeds maxBases=${widthLimit}. Narrow the range or raise maxBases up to 1000000.`,
+        }],
+      };
+    }
+
+    try {
+      const query = buildUcscGetDataSequenceParams({
+        genome: asm,
+        chrom: chr,
+        start: s,
+        end: e,
+        revComp: Boolean(revComp),
+        hubUrl,
+      });
+      const url = `${UCSC_API_BASE}/getData/sequence?${query}`;
+      const payload = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: Math.min(120_000, 15_000 + width / 50), maxBackoffMs: 4000 });
+      const dnaRaw = payload?.dna;
+      const dna = typeof dnaRaw === "string" ? dnaRaw : "";
+      if (!dna) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: "UCSC returned no sequence for this request.",
+              keyFields: [`URL: ${url}`],
+              sources: [url, "https://api.genome.ucsc.edu/goldenPath/help/api.html"],
+              limitations: ["Check assembly, chromosome name (e.g. chr1 vs 1), and coordinates."],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_ucsc_genomic_sequence.v1",
+            result_status: "not_found_or_empty",
+            genome: asm,
+            chrom: chr,
+            start: s,
+            end: e,
+          },
+        };
+      }
+
+      const pos = `${chr}:${s}-${e}`;
+      const previewCap = 400;
+      const preview = dna.length > previewCap ? `${dna.slice(0, previewCap)}...` : dna;
+      const composition = summarizeDnaComposition(dna);
+      const structSeqMax = Math.max(2048, Math.min(50_000, widthLimit));
+      const structSeq = dna.length <= structSeqMax ? dna : `${dna.slice(0, structSeqMax)}...`;
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `UCSC sequence ${asm} ${pos} (${dna.length} bp).`,
+            keyFields: [
+              `Genome: ${asm}`,
+              `Interval: ${pos}`,
+              `Length: ${dna.length}`,
+              `Canonical bases counted: ${composition.canonicalBaseCount}`,
+              `GC fraction: ${composition.gcFraction === null ? "n/a" : composition.gcFraction.toFixed(4)}`,
+              `GC percent: ${composition.gcPercent === null ? "n/a" : `${composition.gcPercent.toFixed(2)}%`}`,
+              composition.nonAcgtCount > 0 ? `Non-ACGT bases: ${composition.nonAcgtCount}` : null,
+              revComp ? "strand: reverse complement" : null,
+              "\nSequence preview:",
+              preview,
+            ].filter(Boolean),
+            sources: [url, buildUcscBrowserUrl(asm, pos)],
+            limitations: [
+              "Coordinates follow the UCSC REST API convention; confirm numbering when comparing to other tools.",
+              "Large intervals can be slow; keep windows as small as practical.",
+              dna.length > structSeqMax
+                ? `Structured JSON sequence is truncated after ${structSeqMax} characters; narrow the interval if you need the entire sequence returned in one payload.`
+                : "Structured JSON includes the full sequence for this interval.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_ucsc_genomic_sequence.v1",
+          result_status: "ok",
+          genome: asm,
+          chrom: chr,
+          start: s,
+          end: e,
+          rev_comp: Boolean(revComp),
+          length: dna.length,
+          canonical_base_count: composition.canonicalBaseCount,
+          gc_fraction: composition.gcFraction,
+          gc_percent: composition.gcPercent,
+          at_fraction: composition.atFraction,
+          at_percent: composition.atPercent,
+          gc_count: composition.gcCount,
+          at_count: composition.atCount,
+          a_count: composition.aCount,
+          c_count: composition.cCount,
+          g_count: composition.gCount,
+          t_count: composition.tCount,
+          non_acgt_count: composition.nonAcgtCount,
+          sequence: structSeq,
+          sequence_truncated: dna.length > structSeqMax,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error fetching UCSC sequence: ${detail}` }],
+        structuredContent: {
+          schema: "get_ucsc_genomic_sequence.v1",
+          result_status: "error",
+          genome: asm,
+          chrom: chr,
+          start: s,
+          end: e,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL: UCSC track data (interval)
+// ============================================
+server.registerTool(
+  "get_ucsc_track_data",
+  {
+    description:
+      "Fetches rows from a UCSC Genome Browser track via REST getData/track (genePred, bed, bigBed-supported tracks, etc.). " +
+      "Always specify genome and track; strongly prefer chrom with start/end to limit output size. Default item cap is 25 (max 500).",
+    inputSchema: {
+      genome: z.string().describe("UCSC assembly, e.g. hg38."),
+      track: z.string().describe("Track name, e.g. knownGene, ncbiRefSeq, refGene (assembly-dependent)."),
+      chrom: z.string().optional().describe("Chromosome, e.g. chr17—recommended whenever possible."),
+      start: z.number().optional().describe("Start (0-based) when chrom is set; must be used with end."),
+      end: z.number().optional().describe("End (UCSC API end coordinate) when chrom is set; must be used with start."),
+      maxItems: z.number().optional().describe("maxItemsOutput (default 25, max 500)."),
+      hubUrl: z.string().optional().describe("Hub URL when querying hub tracks."),
+    },
+  },
+  async ({ genome, track, chrom, start, end, maxItems, hubUrl }) => {
+    const asm = normalizeWhitespace(genome || "");
+    const tr = normalizeWhitespace(track || "");
+    if (!asm || !tr) {
+      return { content: [{ type: "text", text: "Provide genome and track name." }] };
+    }
+    const chr = normalizeWhitespace(chrom || "");
+    const hasInterval = chr && start !== undefined && end !== undefined;
+    if (chr && !hasInterval) {
+      return {
+        content: [{
+          type: "text",
+          text: "When chrom is provided, include both start and end to bound the query and avoid huge responses.",
+        }],
+      };
+    }
+    if (hasInterval) {
+      const s = Math.round(Number(start));
+      const e = Math.round(Number(end));
+      if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) {
+        return { content: [{ type: "text", text: "Provide valid start and end with end > start." }] };
+      }
+    }
+
+    try {
+      const query = buildUcscGetDataTrackParams({
+        genome: asm,
+        track: tr,
+        chrom: chr || undefined,
+        start: hasInterval ? Math.round(Number(start)) : undefined,
+        end: hasInterval ? Math.round(Number(end)) : undefined,
+        maxItemsOutput: maxItems,
+        hubUrl,
+      });
+      const url = `${UCSC_API_BASE}/getData/track?${query}`;
+      const payload = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 25000, maxBackoffMs: 4000 });
+      const rows = extractUcscTrackRows(payload, tr);
+      const cap = Math.max(1, Math.min(500, Math.round(maxItems || 25)));
+      const sliced = rows.slice(0, cap);
+      const summaries = sliced.map(summarizeUcscTrackRow).filter(Boolean);
+      const lines = summaries.map((row, i) => `${String(i + 1).padStart(3)}. ${row.summary}`);
+
+      if (sliced.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No rows returned for track "${tr}" on ${asm} (with current filters).`,
+              keyFields: [`URL: ${url}`],
+              sources: [url, buildUcscBrowserUrl(asm, chr || "")],
+              limitations: [
+                "Track names vary by assembly; use search_ucsc_genome or the UCSC track list if unsure.",
+                "Some tracks are restricted or empty on certain chromosomes.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_ucsc_track_data.v1",
+            result_status: "not_found_or_empty",
+            genome: asm,
+            track: tr,
+            chrom: chr || null,
+            items: [],
+          },
+        };
+      }
+
+      const posLabel = hasInterval ? `${chr}:${Math.round(Number(start))}-${Math.round(Number(end))}` : (chr || "all");
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `UCSC track "${tr}" on ${asm} (${posLabel}): ${sliced.length} row(s).`,
+            keyFields: [
+              `Genome: ${asm}`,
+              `Track: ${tr}`,
+              `Region: ${posLabel}`,
+              "\nRows:",
+              ...lines,
+            ],
+            sources: [
+              url,
+              buildUcscBrowserUrl(asm, hasInterval ? posLabel : ""),
+            ],
+            limitations: [
+              "Rows are capped; widen maxItems (up to 500) or narrow coordinates if needed.",
+              "Binary or summary tracks may return fewer interpretable fields than gene tracks.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_ucsc_track_data.v1",
+          result_status: "ok",
+          genome: asm,
+          track: tr,
+          chrom: chr || null,
+          start: hasInterval ? Math.round(Number(start)) : null,
+          end: hasInterval ? Math.round(Number(end)) : null,
+          items_returned: sliced.length,
+          items: sliced,
+          summaries,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error fetching UCSC track data: ${detail}` }],
+        structuredContent: {
+          schema: "get_ucsc_track_data.v1",
+          result_status: "error",
+          genome: asm,
+          track: tr,
+          chrom: chr || null,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// Ensembl canonical transcript / TSS lookup
+// ============================================
+function normalizeEnsemblSpecies(species) {
+  const raw = normalizeWhitespace(species || "").toLowerCase();
+  if (!raw || raw === "human" || raw === "homo sapiens" || raw === "homo_sapiens") {
+    return "homo_sapiens";
+  }
+  if (raw === "mouse" || raw === "mus musculus" || raw === "mus_musculus") {
+    return "mus_musculus";
+  }
+  return raw.replace(/\s+/g, "_");
+}
+
+function normalizeEnsemblSequenceSpecies(species) {
+  const normalized = normalizeEnsemblSpecies(species);
+  if (normalized === "homo_sapiens") return "human";
+  if (normalized === "mus_musculus") return "mouse";
+  return normalized;
+}
+
+function stripEnsemblVersion(identifier) {
+  return String(identifier || "").trim().split(".")[0] || "";
+}
+
+function getEnsemblRestBaseForAssembly(assembly) {
+  const normalized = normalizeWhitespace(assembly || "").toUpperCase();
+  return normalized === "GRCH37" ? "https://grch37.rest.ensembl.org" : ENSEMBL_REST_API;
+}
+
+function buildEnsemblLookupUrl({ identifier, species, assembly }) {
+  const base = getEnsemblRestBaseForAssembly(assembly);
+  const raw = normalizeWhitespace(identifier || "");
+  const encoded = encodeURIComponent(raw);
+  if (/^ENSG/i.test(raw)) {
+    return `${base}/lookup/id/${encoded}?expand=1;content-type=application/json`;
+  }
+  const normalizedSpecies = normalizeEnsemblSpecies(species);
+  return `${base}/lookup/symbol/${encodeURIComponent(normalizedSpecies)}/${encoded}?expand=1;content-type=application/json`;
+}
+
+function buildEnsemblRegionSequenceUrl({ species, assembly, seqRegionName, start, end, strand }) {
+  const base = getEnsemblRestBaseForAssembly(assembly);
+  const sequenceSpecies = normalizeEnsemblSequenceSpecies(species);
+  const region = `${seqRegionName}:${Math.round(Number(start))}..${Math.round(Number(end))}:${Math.round(Number(strand))}`;
+  return `${base}/sequence/region/${encodeURIComponent(sequenceSpecies)}/${encodeURIComponent(region)}?content-type=text/plain`;
+}
+
+function resolveCanonicalTranscript(geneRecord) {
+  const transcripts = Array.isArray(geneRecord?.Transcript) ? geneRecord.Transcript : [];
+  const canonicalStableId = stripEnsemblVersion(geneRecord?.canonical_transcript || "");
+  if (canonicalStableId) {
+    const direct = transcripts.find((tx) => stripEnsemblVersion(tx?.id || "") === canonicalStableId);
+    if (direct) {
+      return direct;
+    }
+  }
+  return transcripts.find((tx) => Number(tx?.is_canonical || 0) === 1) || transcripts[0] || null;
+}
+
+server.registerTool(
+  "get_ensembl_canonical_transcript",
+  {
+    description:
+      "Resolve a gene symbol or Ensembl gene ID to Ensembl's canonical transcript, transcript bounds, strand, and TSS. " +
+      "Optionally return a TSS-centered genomic sequence window on GRCh38/GRCh37, which is useful for promoter and upstream/downstream sequence questions.",
+    inputSchema: {
+      identifier: z.string().describe("Gene symbol or Ensembl gene ID, e.g. 'HTRA1' or 'ENSG00000166033'."),
+      species: z.string().optional().describe("Ensembl species name, e.g. 'human', 'homo_sapiens', or 'mouse'. Default human."),
+      assembly: z.enum(["GRCh38", "GRCh37"]).optional().describe("Human Ensembl assembly. Default GRCh38."),
+      includeSequenceWindow: z.boolean().optional().describe("If true, fetch a genomic sequence window around the canonical TSS."),
+      upstreamBp: z.number().optional().describe("Bases upstream of the canonical TSS to include when fetching sequence (default 0)."),
+      downstreamBp: z.number().optional().describe("Bases downstream of the canonical TSS to include when fetching sequence (default 0)."),
+      sequenceOrientation: z.enum(["reference", "transcript"]).optional().describe(
+        "Sequence orientation when a window is requested: reference strand (default) or transcript strand.",
+      ),
+    },
+  },
+  async ({ identifier, species, assembly, includeSequenceWindow, upstreamBp, downstreamBp, sequenceOrientation }) => {
+    const rawIdentifier = normalizeWhitespace(identifier || "");
+    if (!rawIdentifier) {
+      return { content: [{ type: "text", text: "Provide a gene symbol or Ensembl gene ID." }] };
+    }
+
+    const normalizedSpecies = normalizeEnsemblSpecies(species);
+    const normalizedAssembly = normalizeWhitespace(assembly || "") || "GRCh38";
+    const upstream = Math.max(0, Math.round(Number(upstreamBp ?? 0)));
+    const downstream = Math.max(0, Math.round(Number(downstreamBp ?? 0)));
+    const windowRequested = Boolean(includeSequenceWindow) || upstream > 0 || downstream > 0;
+    const requestedWindowWidth = upstream + downstream + 1;
+    if (windowRequested && requestedWindowWidth > 50_000) {
+      return {
+        content: [{
+          type: "text",
+          text: `Requested TSS window (${requestedWindowWidth} bp) exceeds the 50000 bp limit. Narrow upstreamBp/downstreamBp.`,
+        }],
+      };
+    }
+
+    const lookupUrl = buildEnsemblLookupUrl({
+      identifier: rawIdentifier,
+      species: normalizedSpecies,
+      assembly: normalizedAssembly,
+    });
+
+    try {
+      const geneRecord = await fetchJsonWithRetry(lookupUrl, {
+        retries: 2,
+        timeoutMs: 20000,
+        maxBackoffMs: 3000,
+      });
+      const canonicalTranscript = resolveCanonicalTranscript(geneRecord);
+      if (!canonicalTranscript) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No transcript models returned by Ensembl for "${rawIdentifier}".`,
+              keyFields: [
+                `Identifier: ${rawIdentifier}`,
+                `Species: ${normalizedSpecies}`,
+                `Assembly: ${normalizedAssembly}`,
+              ],
+              sources: [lookupUrl],
+              limitations: [
+                "Try a canonical gene symbol or a stable Ensembl gene ID if the identifier was an alias.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_ensembl_canonical_transcript.v1",
+            result_status: "not_found_or_empty",
+            identifier: rawIdentifier,
+            species: normalizedSpecies,
+            assembly: normalizedAssembly,
+          },
+        };
+      }
+
+      const transcriptStart = Number(canonicalTranscript?.start);
+      const transcriptEnd = Number(canonicalTranscript?.end);
+      const transcriptStrand = Number(canonicalTranscript?.strand);
+      const seqRegionName = normalizeWhitespace(canonicalTranscript?.seq_region_name || geneRecord?.seq_region_name || "");
+      if (!Number.isFinite(transcriptStart) || !Number.isFinite(transcriptEnd) || !Number.isFinite(transcriptStrand) || !seqRegionName) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Ensembl returned an incomplete canonical transcript record for "${rawIdentifier}".`,
+              keyFields: [
+                `Identifier: ${rawIdentifier}`,
+                `Species: ${normalizedSpecies}`,
+                `Assembly: ${normalizedAssembly}`,
+              ],
+              sources: [lookupUrl],
+              limitations: [
+                "Transcript coordinate fields were missing, so TSS and sequence context could not be derived.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_ensembl_canonical_transcript.v1",
+            result_status: "degraded",
+            identifier: rawIdentifier,
+            species: normalizedSpecies,
+            assembly: normalizedAssembly,
+          },
+        };
+      }
+
+      const tss1Based = transcriptStrand >= 0 ? transcriptStart : transcriptEnd;
+      const windowStart1Based = windowRequested
+        ? Math.max(1, transcriptStrand >= 0 ? tss1Based - upstream : tss1Based - downstream)
+        : null;
+      const windowEnd1Based = windowRequested
+        ? transcriptStrand >= 0 ? tss1Based + downstream : tss1Based + upstream
+        : null;
+      const sequenceStrand = windowRequested && sequenceOrientation === "transcript" ? transcriptStrand : 1;
+
+      let sequence = null;
+      let sequenceUrl = null;
+      let sequenceError = "";
+      if (windowRequested && windowStart1Based !== null && windowEnd1Based !== null) {
+        sequenceUrl = buildEnsemblRegionSequenceUrl({
+          species: normalizedSpecies,
+          assembly: normalizedAssembly,
+          seqRegionName,
+          start: windowStart1Based,
+          end: windowEnd1Based,
+          strand: sequenceStrand,
+        });
+        try {
+          const response = await fetchWithRetry(sequenceUrl, {
+            retries: 2,
+            timeoutMs: 20000,
+            maxBackoffMs: 3000,
+          });
+          sequence = String(await response.text()).replace(/\s+/g, "").toUpperCase() || null;
+        } catch (error) {
+          sequenceError = compactErrorMessage(error?.message || "sequence unavailable", 180);
+        }
+      }
+
+      const canonicalTranscriptId = normalizeWhitespace(canonicalTranscript?.id || "") || null;
+      const canonicalTranscriptVersion = normalizeWhitespace(geneRecord?.canonical_transcript || "") || canonicalTranscriptId;
+      const geneId = normalizeWhitespace(geneRecord?.id || "") || null;
+      const geneSymbol = normalizeWhitespace(geneRecord?.display_name || rawIdentifier) || rawIdentifier;
+      const transcriptDisplayName = normalizeWhitespace(canonicalTranscript?.display_name || "") || null;
+      const transcriptBiotype = normalizeWhitespace(canonicalTranscript?.biotype || "") || null;
+      const strandSymbol = transcriptStrand >= 0 ? "+" : "-";
+      const transcriptInterval = `${seqRegionName}:${transcriptStart}-${transcriptEnd}`;
+      const tssInterval = `${seqRegionName}:${tss1Based}`;
+      const windowInterval = windowRequested && windowStart1Based !== null && windowEnd1Based !== null
+        ? `${seqRegionName}:${windowStart1Based}-${windowEnd1Based}`
+        : null;
+      const resultStatus = windowRequested && sequenceError ? "degraded" : "ok";
+
+      const keyFields = [
+        `Identifier: ${rawIdentifier}`,
+        `Species: ${normalizedSpecies}`,
+        `Assembly: ${normalizedAssembly}`,
+        `Gene: ${geneSymbol}${geneId ? ` (${geneId})` : ""}`,
+        `Canonical transcript: ${canonicalTranscriptVersion}${transcriptDisplayName ? ` (${transcriptDisplayName})` : ""}`,
+        transcriptBiotype ? `Biotype: ${transcriptBiotype}` : null,
+        `Transcript interval: ${transcriptInterval} (${strandSymbol})`,
+        `Canonical TSS (1-based): ${tssInterval}`,
+      ].filter(Boolean);
+
+      if (windowInterval) {
+        keyFields.push(`Requested TSS window: ${windowInterval} (${windowEnd1Based - windowStart1Based + 1} bp, ${sequenceStrand === 1 ? "reference" : "transcript"} orientation)`);
+        if (sequence) {
+          keyFields.push("\nSequence:");
+          keyFields.push(sequence);
+        } else if (sequenceError) {
+          keyFields.push(`Sequence unavailable: ${sequenceError}`);
+        }
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Ensembl canonical transcript for ${geneSymbol}: ${canonicalTranscriptVersion || "n/a"} with TSS at ${tssInterval}.`,
+            keyFields,
+            sources: [lookupUrl, sequenceUrl].filter(Boolean),
+            limitations: [
+              "Canonical transcript selection follows Ensembl's current canonical transcript assignment for the requested assembly.",
+              windowRequested && sequenceStrand !== 1
+                ? "Sequence was returned in transcript orientation because sequenceOrientation='transcript' was requested."
+                : "Sequence, when requested, is returned in reference orientation unless sequenceOrientation='transcript' is set.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_ensembl_canonical_transcript.v1",
+          result_status: resultStatus,
+          identifier: rawIdentifier,
+          species: normalizedSpecies,
+          assembly: normalizedAssembly,
+          gene_id: geneId,
+          gene_symbol: geneSymbol,
+          canonical_transcript_id: canonicalTranscriptId,
+          canonical_transcript: canonicalTranscriptVersion,
+          canonical_transcript_display_name: transcriptDisplayName,
+          canonical_transcript_biotype: transcriptBiotype,
+          seq_region_name: seqRegionName,
+          strand: transcriptStrand,
+          transcript_start_1based: transcriptStart,
+          transcript_end_1based: transcriptEnd,
+          tss_1based: tss1Based,
+          transcript_interval: transcriptInterval,
+          tss_interval: tssInterval,
+          upstream_bp: windowRequested ? upstream : null,
+          downstream_bp: windowRequested ? downstream : null,
+          sequence_orientation: windowRequested ? (sequenceStrand === 1 ? "reference" : "transcript") : null,
+          window_start_1based: windowStart1Based,
+          window_end_1based: windowEnd1Based,
+          window_interval: windowInterval,
+          sequence,
+          sequence_error: sequenceError || null,
+          lookup_url: lookupUrl,
+          sequence_url: sequenceUrl,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error fetching Ensembl canonical transcript: ${detail}` }],
+        structuredContent: {
+          schema: "get_ensembl_canonical_transcript.v1",
+          result_status: "error",
+          identifier: rawIdentifier,
+          species: normalizedSpecies,
+          assembly: normalizedAssembly,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// ENCODE Portal REST API (www.encodeproject.org)
+// ============================================
+const ENCODE_PORTAL_BASE = "https://www.encodeproject.org";
+
+const ENCODE_JSON_HEADERS = { Accept: "application/json", "User-Agent": "research-mcp/encode" };
+
+function describeEncodePortalRef(ref) {
+  if (ref === null || ref === undefined) {
+    return null;
+  }
+  if (typeof ref === "object") {
+    return (
+      normalizeWhitespace(ref.label || ref.name || ref.term_name || ref.accession || "") || null
+    );
+  }
+  const s = String(ref).trim();
+  if (!s) {
+    return null;
+  }
+  if (s.includes("/")) {
+    const tail = s.split("/").filter(Boolean).pop() || "";
+    return tail.replace(/\+/g, " ") || null;
+  }
+  return normalizeWhitespace(s) || null;
+}
+
+function buildEncodePortalItemUrl(item) {
+  const href = item?.["@id"];
+  if (typeof href === "string" && href.startsWith("/")) {
+    return `${ENCODE_PORTAL_BASE}${href}`;
+  }
+  const acc = normalizeWhitespace(item?.accession || "");
+  if (acc) {
+    return `${ENCODE_PORTAL_BASE}/${encodeURIComponent(acc)}/`;
+  }
+  return ENCODE_PORTAL_BASE;
+}
+
+function summarizeEncodeItem(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  const types = Array.isArray(item["@type"]) ? item["@type"] : [];
+  const primaryType = types.find((t) => t !== "Item") || types[0] || "";
+  const accession = normalizeWhitespace(item.accession || "") || null;
+  const assayTitle = normalizeWhitespace(item.assay_title || item.assay_term_name || "") || null;
+  const targetLabel = describeEncodePortalRef(item.target);
+  const biosampleSummary = normalizeWhitespace(item.biosample_summary || "") || null;
+  const biosampleOntology = describeEncodePortalRef(item.biosample_ontology);
+  let description = normalizeWhitespace(item.description || item.summary || "") || null;
+  if (description && description.length > 220) {
+    description = `${description.slice(0, 217)}...`;
+  }
+  const status = normalizeWhitespace(item.status || "") || null;
+  const outputType = normalizeWhitespace(item.output_type || "") || null;
+  const fileFormat = normalizeWhitespace(item.file_format || "") || null;
+  const assayTerm = normalizeWhitespace(item.assay_term_name || "") || null;
+  const portalUrl = buildEncodePortalItemUrl(item);
+  const line = [
+    accession || "—",
+    primaryType,
+    assayTitle || assayTerm,
+    targetLabel ? `target ${targetLabel}` : null,
+    biosampleOntology || biosampleSummary,
+    fileFormat || outputType,
+    status,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+  return {
+    accession,
+    object_type: primaryType || null,
+    assay_title: assayTitle || assayTerm,
+    target_label: targetLabel,
+    biosample_summary: biosampleSummary,
+    biosample_ontology: biosampleOntology,
+    description,
+    status,
+    output_type: outputType,
+    file_format: fileFormat,
+    portal_url: portalUrl,
+    summary_line: line,
+  };
+}
+
+function readEncodeApiError(payload) {
+  if (!payload || typeof payload !== "object") {
+    return "";
+  }
+  if (Number(payload._http_status) === 404 && Array.isArray(payload["@graph"])) {
+    return "";
+  }
+  if (payload.status === "error" && payload.description) {
+    return normalizeWhitespace(String(payload.description)) || "ENCODE API error";
+  }
+  if (Number(payload.code) === 404) {
+    return normalizeWhitespace(String(payload.description || "Not found")) || "Not found";
+  }
+  return "";
+}
+
+function buildEncodeSearchUrl({
+  objectType,
+  searchTerm,
+  organism,
+  assayTitle,
+  status,
+  limit,
+  frame,
+}) {
+  const params = new URLSearchParams();
+  params.set("type", normalizeWhitespace(objectType || "") || "Experiment");
+  const term = normalizeWhitespace(searchTerm || "");
+  if (term) {
+    params.set("searchTerm", term);
+  }
+  const org = normalizeWhitespace(organism || "");
+  if (org) {
+    params.set("organism.scientific_name", org);
+  }
+  const assay = normalizeWhitespace(assayTitle || "");
+  if (assay) {
+    params.set("assay_title", assay);
+  }
+  const stat = normalizeWhitespace(status || "");
+  if (stat && stat.toLowerCase() !== "any") {
+    params.set("status", stat);
+  }
+  const lim = Math.max(1, Math.min(50, Math.round(limit || 15)));
+  params.set("limit", String(lim));
+  params.set("frame", normalizeWhitespace(frame || "") || "object");
+  return `${ENCODE_PORTAL_BASE}/search/?${params.toString()}`;
+}
+
+function buildEncodeRecordFetchUrl(accessionOrPath, frame) {
+  let path = String(accessionOrPath || "").trim();
+  if (!path) {
+    return "";
+  }
+  if (!path.startsWith("/")) {
+    path = `/${path.replace(/^\/+/, "")}`;
+  }
+  if (!path.endsWith("/")) {
+    path = `${path}/`;
+  }
+  const params = new URLSearchParams();
+  const fr = normalizeWhitespace(frame || "") || "object";
+  if (fr) {
+    params.set("frame", fr);
+  }
+  return `${ENCODE_PORTAL_BASE}${path}?${params.toString()}`;
+}
+
+async function fetchEncodeJsonWithRetry(url, options = {}) {
+  const retries = options.retries ?? 2;
+  const timeoutMs = options.timeoutMs ?? 12000;
+  const maxBackoffMs = options.maxBackoffMs ?? 4000;
+  const fetchOptions = { ...options };
+  delete fetchOptions.retries;
+  delete fetchOptions.timeoutMs;
+  delete fetchOptions.maxBackoffMs;
+
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
+      clearTimeout(timer);
+      const rawText = await response.text().catch(() => "");
+      let parsed = null;
+      if (rawText) {
+        try {
+          parsed = JSON.parse(rawText);
+        } catch {
+          parsed = null;
+        }
+      }
+
+      if (response.ok) {
+        return parsed;
+      }
+
+      // ENCODE search often returns a 404 HTTP status for "no hits" while still providing a structured JSON body.
+      if (response.status === 404 && parsed && typeof parsed === "object") {
+        parsed._http_status = response.status;
+        return parsed;
+      }
+
+      const retryable = response.status === 429 || response.status >= 500;
+      lastError = new Error(
+        `Request failed (${response.status}): ${url}${
+          rawText ? ` | ${rawText.slice(0, 220).replace(/\s+/g, " ").trim()}` : ""
+        }`
+      );
+      if (!retryable || attempt >= retries) {
+        throw lastError;
+      }
+      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+      const backoffMs = Math.min(maxBackoffMs, retryAfterMs ?? Math.min(maxBackoffMs, 600 * 2 ** attempt));
+      await sleep(backoffMs + Math.floor(Math.random() * 200));
+    } catch (error) {
+      clearTimeout(timer);
+      lastError = error;
+      if (attempt >= retries) {
+        throw lastError;
+      }
+      const backoffMs = Math.min(maxBackoffMs, 600 * 2 ** attempt);
+      await sleep(backoffMs + Math.floor(Math.random() * 200));
+    }
+  }
+  throw lastError;
+}
+
+function shouldSearchEncodeFunctionalCharacterization({ objectType, searchTerm, assayTitle }) {
+  if (normalizeWhitespace(objectType || "") !== "Experiment") {
+    return false;
+  }
+  const haystack = `${normalizeWhitespace(searchTerm || "")} ${normalizeWhitespace(assayTitle || "")}`.toLowerCase();
+  return /\bmpra\b|\blentimpra\b|\bstarr\b|massively parallel reporter|reporter assay|crispr screen|functional characterization/.test(haystack);
+}
+
+async function runEncodeSearchQuery({ objectType, searchTerm, organism, assayTitle, status, maxResults, frame }) {
+  const url = buildEncodeSearchUrl({
+    objectType,
+    searchTerm,
+    organism,
+    assayTitle,
+    status,
+    limit: maxResults,
+    frame,
+  });
+  const payload = await fetchEncodeJsonWithRetry(url, {
+    retries: 2,
+    timeoutMs: 25000,
+    maxBackoffMs: 5000,
+    headers: ENCODE_JSON_HEADERS,
+  });
+  const errText = readEncodeApiError(payload);
+  const graph = Array.isArray(payload?.["@graph"]) ? payload["@graph"] : [];
+  const total = Number(payload?.total) || graph.length;
+  return { objectType, url, payload, errText, graph, total };
+}
+
+// ============================================
+// TOOL: Search ENCODE metadata
+// ============================================
+server.registerTool(
+  "search_encode_metadata",
+  {
+    description:
+      "Searches the ENCODE Portal metadata index (experiments, files, biosamples, and other object types) via the public REST API. " +
+      "Use for ChIP-seq, DNase-seq, RNA-seq, MPRA / functional-characterization assays, assay targets, biosamples, and file accessions. Defaults to released human/mouse experiments when filters are added. Respects ENCODE rate guidance (~10 GET/s).",
+    inputSchema: {
+      objectType: z.enum([
+        "Experiment",
+        "FunctionalCharacterizationExperiment",
+        "File",
+        "Biosample",
+        "Dataset",
+        "Reference",
+        "AntibodyLot",
+        "Library",
+        "GeneticModification",
+        "Treatment",
+      ]).optional().describe("ENCODE @type filter for /search (default Experiment)."),
+      searchTerm: z.string().optional().describe("Free-text search term (e.g. 'H3K4me3', 'DNase', 'ENCFF123ABC')."),
+      organism: z.string().optional().describe("Optional scientific name filter, e.g. 'Homo sapiens' or 'Mus musculus'."),
+      assayTitle: z.string().optional().describe("Optional assay_title facet, e.g. 'ChIP-seq', 'DNase-seq'."),
+      status: z.string().optional().describe("Metadata status filter (default 'released'). Pass 'any' to omit."),
+      maxResults: z.number().optional().describe("Max records (default 15, max 50)."),
+      frame: z.enum(["object", "embedded"]).optional().describe("Search result frame; default 'object' (smaller JSON)."),
+    },
+  },
+  async ({ objectType, searchTerm, organism, assayTitle, status, maxResults, frame }) => {
+    const requestedTypeFilter = objectType || "Experiment";
+    const stat = status !== undefined && status !== null && String(status).trim() !== ""
+      ? String(status).trim()
+      : "released";
+
+    const focusedTerm = normalizeWhitespace(searchTerm || "");
+    const focusedOrg = normalizeWhitespace(organism || "");
+    const focusedAssay = normalizeWhitespace(assayTitle || "");
+    if (!focusedTerm && !focusedOrg && !focusedAssay) {
+      return {
+        content: [{
+          type: "text",
+          text: "Provide at least one of searchTerm, organism, or assayTitle so ENCODE search stays specific (required to avoid scanning the entire ENCODE catalog).",
+        }],
+      };
+    }
+
+    try {
+      const candidateObjectTypes = dedupeArray([
+        requestedTypeFilter,
+        shouldSearchEncodeFunctionalCharacterization({
+          objectType: requestedTypeFilter,
+          searchTerm,
+          assayTitle,
+        })
+          ? "FunctionalCharacterizationExperiment"
+          : null,
+      ]);
+
+      const attemptedSearches = [];
+      let selectedSearch = null;
+      let firstNotFoundSearch = null;
+      let firstErrorSearch = null;
+
+      for (const candidateType of candidateObjectTypes) {
+        const searchResult = await runEncodeSearchQuery({
+          objectType: candidateType,
+          searchTerm,
+          organism,
+          assayTitle,
+          status: stat,
+          maxResults,
+          frame,
+        });
+        attemptedSearches.push({
+          object_type: candidateType,
+          search_url: searchResult.url,
+          total: searchResult.total,
+          records_returned: searchResult.graph.length,
+          error: searchResult.errText || null,
+        });
+        if (searchResult.errText) {
+          firstErrorSearch ||= searchResult;
+          continue;
+        }
+        if (searchResult.graph.length === 0) {
+          firstNotFoundSearch ||= searchResult;
+          continue;
+        }
+        selectedSearch = searchResult;
+        break;
+      }
+
+      if (!selectedSearch && firstNotFoundSearch) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No ENCODE ${requestedTypeFilter} results for this query.`,
+              keyFields: [
+                `Requested search type: ${requestedTypeFilter}`,
+                `Resolved search type: ${firstNotFoundSearch.objectType}`,
+                `Search URL: ${firstNotFoundSearch.url}`,
+                `Total reported: ${firstNotFoundSearch.total}`,
+              ],
+              sources: [firstNotFoundSearch.url, "https://www.encodeproject.org/help/rest-api/"],
+              limitations: [
+                "Broaden searchTerm, clear organism/assay filters, or set status to 'any' if you expect unreleased or non-human records.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "search_encode_metadata.v1",
+            result_status: "not_found_or_empty",
+            requested_object_type: requestedTypeFilter,
+            object_type: firstNotFoundSearch.objectType,
+            total: firstNotFoundSearch.total,
+            records: [],
+            search_url: firstNotFoundSearch.url,
+            attempted_searches: attemptedSearches,
+          },
+        };
+      }
+
+      if (!selectedSearch) {
+        const detail = firstErrorSearch?.errText || "unknown ENCODE search error";
+        return {
+          content: [{ type: "text", text: `Error searching ENCODE: ${detail}` }],
+          structuredContent: {
+            schema: "search_encode_metadata.v1",
+            result_status: "error",
+            requested_object_type: requestedTypeFilter,
+            object_type: firstErrorSearch?.objectType || requestedTypeFilter,
+            error: detail,
+            attempted_searches: attemptedSearches,
+          },
+        };
+      }
+
+      const { objectType: resolvedTypeFilter, url, graph, total } = selectedSearch;
+
+      const records = graph
+        .map((row) => summarizeEncodeItem(row))
+        .filter(Boolean);
+      const lines = records.map((rec, idx) => `${String(idx + 1).padStart(3)}. ${rec.summary_line}`);
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `ENCODE search: ${total} total match(es); showing ${records.length} ${resolvedTypeFilter} record(s).`,
+            keyFields: [
+              `Requested search type: ${requestedTypeFilter}`,
+              resolvedTypeFilter !== requestedTypeFilter ? `Resolved search type: ${resolvedTypeFilter}` : null,
+              "Results:",
+              ...lines,
+            ].filter(Boolean),
+            sources: [
+              url,
+              ...records.map((r) => r.portal_url).filter(Boolean).slice(0, 6),
+            ],
+            limitations: [
+              "Programmatic limit is 10 GET requests/sec per ENCODE policy.",
+              "Use get_encode_record with an accession or @id path for full metadata and file links.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "search_encode_metadata.v1",
+          result_status: "ok",
+          requested_object_type: requestedTypeFilter,
+          object_type: resolvedTypeFilter,
+          total,
+          records_returned: records.length,
+          records,
+          search_url: url,
+          attempted_searches: attemptedSearches,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error searching ENCODE: ${detail}` }],
+        structuredContent: {
+          schema: "search_encode_metadata.v1",
+          result_status: "error",
+          object_type: requestedTypeFilter,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL: Get ENCODE record
+// ============================================
+server.registerTool(
+  "get_encode_record",
+  {
+    description:
+      "Retrieves one ENCODE metadata object by accession (ENCSR..., ENCFF..., ENCBS..., ...) or API path (e.g. /experiments/ENCSR123/) using GET + JSON. " +
+      "Use after search_encode_metadata or when the accession is known. Default frame is 'object'; use 'embedded' for expanded nested links (larger payload).",
+    inputSchema: {
+      accessionOrPath: z.string().describe("ENCODE accession, or path starting with /experiments/, /files/, /biosamples/, etc."),
+      frame: z.enum(["object", "embedded"]).optional().describe("Record frame (default 'object')."),
+    },
+  },
+  async ({ accessionOrPath, frame }) => {
+    const raw = String(accessionOrPath || "").trim();
+    if (!raw) {
+      return { content: [{ type: "text", text: "Provide an ENCODE accession or /type/accession/ path." }] };
+    }
+
+    const frameMode = frame || "object";
+    try {
+      const url = buildEncodeRecordFetchUrl(raw, frameMode);
+      if (!url) {
+        return { content: [{ type: "text", text: "Invalid ENCODE accession or path." }] };
+      }
+      const fetched = await fetchEncodeJsonWithRetry(url, {
+        retries: 2,
+        timeoutMs: frameMode === "embedded" ? 45000 : 20000,
+        maxBackoffMs: 5000,
+        headers: ENCODE_JSON_HEADERS,
+      });
+      const errText = readEncodeApiError(fetched);
+      if (errText) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `ENCODE record not retrieved: ${errText}`,
+              keyFields: [`URL: ${url}`],
+              sources: [url, `${ENCODE_PORTAL_BASE}/help/rest-api/`],
+              limitations: ["Verify accession spelling; use search_encode_metadata to discover identifiers."],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_encode_record.v1",
+            result_status: "not_found_or_empty",
+            accession_or_path: raw,
+            error: errText,
+          },
+        };
+      }
+
+      let item = fetched;
+      if (Array.isArray(fetched?.["@graph"]) && fetched["@graph"].length === 1) {
+        item = fetched["@graph"][0];
+      }
+
+      const summary = summarizeEncodeItem(item);
+      const files = Array.isArray(item.files) ? item.files : [];
+      const filePreview = files.slice(0, 8).map((f) => {
+        if (typeof f === "string") {
+          return f;
+        }
+        return normalizeWhitespace(f?.accession || f?.["@id"] || "") || "";
+      }).filter(Boolean);
+
+      const keyFields = [
+        summary?.accession ? `Accession: ${summary.accession}` : null,
+        summary?.object_type ? `Type: ${summary.object_type}` : null,
+        summary?.assay_title ? `Assay: ${summary.assay_title}` : null,
+        summary?.target_label ? `Target: ${summary.target_label}` : null,
+        summary?.biosample_summary ? `Biosample: ${summary.biosample_summary}` : null,
+        summary?.status ? `Status: ${summary.status}` : null,
+        files.length ? `Linked files: ${files.length}${filePreview.length ? ` (e.g. ${filePreview.join(", ")})` : ""}` : null,
+        summary?.description ? `Description: ${summary.description}` : null,
+      ].filter(Boolean);
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: summary?.summary_line
+              ? `ENCODE ${summary.summary_line}`
+              : "ENCODE record retrieved.",
+            keyFields: keyFields.length > 0 ? keyFields : [JSON.stringify(item, null, 2).slice(0, 1500)],
+            sources: [summary?.portal_url || url, url],
+            limitations: [
+              "Large file lists and raw metadata may be truncated in chat; open the portal link for full detail and downloads.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_encode_record.v1",
+          result_status: "ok",
+          accession_or_path: raw,
+          frame: frameMode,
+          summary,
+          file_count: files.length,
+          file_sample: filePreview,
+          record: frameMode === "object" ? item : null,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error fetching ENCODE record: ${detail}` }],
+        structuredContent: {
+          schema: "get_encode_record.v1",
+          result_status: "error",
+          accession_or_path: raw,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// Zenodo REST API (zenodo.org/api)
+// ============================================
+const ZENODO_API_BASE = "https://zenodo.org/api";
+
+function zenodoRequestHeaders() {
+  const headers = {
+    Accept: "application/json",
+    "User-Agent": "research-mcp/zenodo",
+  };
+  const token = String(process.env.ZENODO_ACCESS_TOKEN || "").trim();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
+}
+
+function zenodoAnonymousMaxPageSize() {
+  return String(process.env.ZENODO_ACCESS_TOKEN || "").trim() ? 100 : 25;
+}
+
+function stripHtmlSnippet(value, maxLen) {
+  const raw = String(value || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  if (!maxLen || raw.length <= maxLen) {
+    return raw;
+  }
+  return `${raw.slice(0, Math.max(0, maxLen - 3)).trim()}...`;
+}
+
+function parseZenodoRecordId(raw) {
+  const s = String(raw || "").trim();
+  if (!s) {
+    return null;
+  }
+  const lower = s.toLowerCase();
+  const recordPath = lower.match(/zenodo\.org\/(?:record|records)\/(\d+)/);
+  if (recordPath) {
+    return recordPath[1];
+  }
+  const doiMatch = s.match(/10\.5281\/zenodo\.(\d+)/i);
+  if (doiMatch) {
+    return doiMatch[1];
+  }
+  if (/^\d+$/.test(s)) {
+    return s;
+  }
+  return null;
+}
+
+function summarizeZenodoHit(hit) {
+  if (!hit || typeof hit !== "object") {
+    return null;
+  }
+  const md = hit.metadata && typeof hit.metadata === "object" ? hit.metadata : {};
+  const title = normalizeWhitespace(md.title || "") || null;
+  const pubDate = normalizeWhitespace(md.publication_date || "") || null;
+  const access = normalizeWhitespace(md.access_right || "") || null;
+  const rtype = md.resource_type && typeof md.resource_type === "object"
+    ? normalizeWhitespace(md.resource_type.title || md.resource_type.type || "")
+    : null;
+  const creators = Array.isArray(md.creators) ? md.creators : [];
+  const creatorNames = creators
+    .map((c) => normalizeWhitespace(c?.name || ""))
+    .filter(Boolean)
+    .slice(0, 4);
+  const kw = Array.isArray(md.keywords) ? md.keywords.filter(Boolean).slice(0, 6) : [];
+  const concept = hit.conceptrecid !== undefined && hit.conceptrecid !== null
+    ? String(hit.conceptrecid)
+    : null;
+  const id = hit.id !== undefined && hit.id !== null ? String(hit.id) : null;
+  const doi = normalizeWhitespace(hit.doi || md.doi || "") || null;
+  const doiUrl = normalizeWhitespace(hit.doi_url || "") || (doi ? `https://doi.org/${encodeURIComponent(doi)}` : null);
+  const htmlLink = typeof hit.links?.html === "string" ? hit.links.html : null;
+  const apiSelf = typeof hit.links?.self === "string" ? hit.links.self : null;
+  const portal = htmlLink || (id ? `https://zenodo.org/records/${encodeURIComponent(id)}` : "https://zenodo.org/");
+  const desc = stripHtmlSnippet(md.description || "", 220);
+  const line = [
+    id ? `id ${id}` : null,
+    concept ? `concept ${concept}` : null,
+    title,
+    rtype ? `[${rtype}]` : null,
+    pubDate,
+    access,
+    creatorNames.length ? creatorNames.join("; ") : null,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+  return {
+    id,
+    conceptrecid: concept,
+    title,
+    publication_date: pubDate,
+    resource_type: rtype,
+    access_right: access,
+    creators: creatorNames,
+    keywords: kw,
+    description: desc || null,
+    doi,
+    doi_url: doiUrl,
+    portal_url: portal,
+    api_url: apiSelf,
+    summary_line: line,
+  };
+}
+
+function buildZenodoSearchUrl({
+  searchQuery,
+  sort,
+  size,
+  recordType,
+  community,
+  status,
+  allVersions,
+  page,
+}) {
+  const params = new URLSearchParams();
+  const q = normalizeWhitespace(searchQuery || "");
+  if (q) {
+    params.set("q", q);
+  }
+  const s = normalizeWhitespace(sort || "") || "bestmatch";
+  params.set("sort", s);
+  const lim = Math.max(1, Math.min(zenodoAnonymousMaxPageSize(), Math.round(size || 10)));
+  params.set("size", String(lim));
+  const p = Math.max(1, Math.round(page || 1));
+  if (p > 1) {
+    params.set("page", String(p));
+  }
+  const rt = normalizeWhitespace(recordType || "");
+  if (rt) {
+    params.set("type", rt.toLowerCase());
+  }
+  const comm = normalizeWhitespace(community || "");
+  if (comm) {
+    params.set("communities", comm);
+  }
+  const st = normalizeWhitespace(status || "");
+  if (st) {
+    params.set("status", st);
+  }
+  if (allVersions === true || allVersions === 1 || String(allVersions).toLowerCase() === "true") {
+    params.set("all_versions", "1");
+  }
+  return `${ZENODO_API_BASE}/records?${params.toString()}`;
+}
+
+// ============================================
+// TOOL: Search Zenodo records
+// ============================================
+server.registerTool(
+  "search_zenodo_records",
+  {
+    description:
+      "Searches published Zenodo records (datasets, software, publications, and other uploads) via GET /api/records. " +
+      "Supports Elasticsearch-style query strings in searchQuery. Anonymous requests are capped at 25 hits per page (~30 requests/min per Zenodo policy); set ZENODO_ACCESS_TOKEN for higher page sizes.",
+    inputSchema: {
+      searchQuery: z.string().describe("Search string (e.g. 'single cell RNA', 'fMRI', 'resource_type.type:dataset')."),
+      maxResults: z.number().optional().describe("Page size (default 10; max 25 without token, 100 with ZENODO_ACCESS_TOKEN)."),
+      sort: z.enum(["bestmatch", "mostrecent", "newest", "-mostrecent"]).optional().describe("Sort order (default bestmatch). Use mostrecent or -mostrecent per Zenodo API."),
+      recordType: z.string().optional().describe("Zenodo type filter, e.g. 'dataset', 'software', 'publication' (passed as the API type= parameter)."),
+      community: z.string().optional().describe("Zenodo community identifier to restrict results."),
+      status: z.string().optional().describe("Deposit status filter, typically 'published'."),
+      allVersions: z.boolean().optional().describe("If true, include all versions of a record."),
+      page: z.number().optional().describe("Page number (default 1)."),
+    },
+  },
+  async ({ searchQuery, maxResults, sort, recordType, community, status, allVersions, page }) => {
+    const q = normalizeWhitespace(searchQuery || "");
+    if (!q) {
+      return { content: [{ type: "text", text: "Provide a Zenodo searchQuery." }] };
+    }
+
+    const sortValue = (() => {
+      const s = String(sort || "bestmatch").trim();
+      if (s === "newest") {
+        return "mostrecent";
+      }
+      return s;
+    })();
+
+    try {
+      const url = buildZenodoSearchUrl({
+        searchQuery: q,
+        sort: sortValue,
+        size: maxResults,
+        recordType,
+        community,
+        status,
+        allVersions,
+        page,
+      });
+      const payload = await fetchJsonWithRetry(url, {
+        retries: 2,
+        timeoutMs: 25000,
+        maxBackoffMs: 5000,
+        headers: zenodoRequestHeaders(),
+      });
+      const total = Number(payload?.hits?.total ?? 0);
+      const hits = Array.isArray(payload?.hits?.hits) ? payload.hits.hits : [];
+      if (hits.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No Zenodo records matched "${q}".`,
+              keyFields: [`Request: ${url}`, `Reported total (index): ${total}`],
+              sources: [url, "https://developers.zenodo.org/", "https://help.zenodo.org/guides/search/"],
+              limitations: ["Try broader terms, a different type= filter, or fielded search syntax from the Zenodo search guide."],
+            }),
+          }],
+          structuredContent: {
+            schema: "search_zenodo_records.v1",
+            result_status: "not_found_or_empty",
+            search_query: q,
+            total,
+            records: [],
+            request_url: url,
+          },
+        };
+      }
+
+      const records = hits.map((h) => summarizeZenodoHit(h)).filter(Boolean);
+      const lines = records.map((rec, idx) => `${String(idx + 1).padStart(3)}. ${rec.summary_line}`);
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Zenodo: ${total} total hit(s); showing ${records.length} on this page for "${q}".`,
+            keyFields: ["Results:", ...lines],
+            sources: [
+              url,
+              ...records.map((r) => r.portal_url).filter(Boolean).slice(0, 6),
+            ],
+            limitations: [
+              "Zenodo limits anonymous API page size to 25 and throttles ~30 GETs/min; configure ZENODO_ACCESS_TOKEN if you need larger pages.",
+              "Use get_zenodo_record with a numeric id, DOI (10.5281/zenodo.N), or Zenodo record URL for full metadata and file links.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "search_zenodo_records.v1",
+          result_status: "ok",
+          search_query: q,
+          total,
+          records_returned: records.length,
+          records,
+          request_url: url,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error searching Zenodo: ${detail}` }],
+        structuredContent: {
+          schema: "search_zenodo_records.v1",
+          result_status: "error",
+          search_query: q,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL: Get Zenodo record
+// ============================================
+server.registerTool(
+  "get_zenodo_record",
+  {
+    description:
+      "Retrieves one published Zenodo record via GET /api/records/:id. Accepts numeric record id, DOI (10.5281/zenodo.N), or a zenodo.org record URL. " +
+      "Returns title, type, dates, access rights, creators, DOI, and a compact file list with download links when present.",
+    inputSchema: {
+      recordId: z.string().describe("Numeric Zenodo id, DOI 10.5281/zenodo.N, or URL containing /records/N."),
+    },
+  },
+  async ({ recordId }) => {
+    const resolved = parseZenodoRecordId(recordId);
+    if (!resolved) {
+      return {
+        content: [{
+          type: "text",
+          text: "Provide a Zenodo numeric id, a 10.5281/zenodo.N DOI, or a https://zenodo.org/records/N URL.",
+        }],
+      };
+    }
+
+    try {
+      const url = `${ZENODO_API_BASE}/records/${encodeURIComponent(resolved)}`;
+      const record = await fetchJsonWithRetry(url, {
+        retries: 2,
+        timeoutMs: 25000,
+        maxBackoffMs: 5000,
+        headers: zenodoRequestHeaders(),
+      });
+      if (record?.status === "error" || record?.message) {
+        const msg = normalizeWhitespace(record?.message || record?.description || "Zenodo error") || "Zenodo error";
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Zenodo record error: ${msg}`,
+              keyFields: [`URL: ${url}`],
+              sources: [url, "https://developers.zenodo.org/"],
+              limitations: ["Verify the id or DOI refers to a published record."],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_zenodo_record.v1",
+            result_status: "error",
+            record_id: resolved,
+            error: msg,
+          },
+        };
+      }
+
+      const summary = summarizeZenodoHit(record);
+      const files = Array.isArray(record.files) ? record.files : [];
+      const fileRows = files.slice(0, 12).map((f) => ({
+        key: normalizeWhitespace(f?.key || "") || null,
+        size: f?.size !== undefined ? Number(f.size) : null,
+        type: normalizeWhitespace(f?.type || "") || null,
+        link: typeof f?.links?.self === "string" ? f.links.self : null,
+      }));
+
+      const keyFields = [
+        summary?.title ? `Title: ${summary.title}` : null,
+        summary?.id ? `Id: ${summary.id} (concept ${summary.conceptrecid || "—"})` : null,
+        summary?.resource_type ? `Type: ${summary.resource_type}` : null,
+        summary?.publication_date ? `Date: ${summary.publication_date}` : null,
+        summary?.access_right ? `Access: ${summary.access_right}` : null,
+        summary?.doi ? `DOI: ${summary.doi}` : null,
+        summary?.creators?.length ? `Creators: ${summary.creators.join("; ")}` : null,
+        summary?.description ? `About: ${summary.description}` : null,
+        files.length ? `Files: ${files.length}` : null,
+        ...fileRows
+          .filter((r) => r.key)
+          .map((r) => `  - ${r.key}${r.size ? ` (${r.size} B)` : ""}`),
+      ].filter(Boolean);
+
+      let recordForStruct = record;
+      try {
+        if (JSON.stringify(recordForStruct).length > 100000) {
+          recordForStruct = {
+            id: record.id,
+            conceptrecid: record.conceptrecid,
+            doi: record.doi,
+            links: record.links,
+            metadata: record.metadata,
+            files: fileRows,
+            _note: "Full record JSON exceeded size cap in structured output.",
+          };
+        }
+      } catch {
+        recordForStruct = { id: record.id, conceptrecid: record.conceptrecid };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: summary?.summary_line ? `Zenodo record: ${summary.summary_line}` : `Zenodo record ${resolved}`,
+            keyFields: keyFields.length > 0 ? keyFields : [JSON.stringify(record, null, 2).slice(0, 1200)],
+            sources: [summary?.portal_url || url, url],
+            limitations: [
+              "Binary attachments and very large metadata should be downloaded from Zenodo directly, not via chat transcripts.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_zenodo_record.v1",
+          result_status: "ok",
+          record_id: resolved,
+          summary,
+          file_count: files.length,
+          files: fileRows,
+          record: recordForStruct,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error fetching Zenodo record: ${detail}` }],
+        structuredContent: {
+          schema: "get_zenodo_record.v1",
+          result_status: "error",
+          record_id: resolved,
           error: detail,
         },
       };
@@ -7788,6 +11489,215 @@ server.registerTool(
       };
     } catch (error) {
       return { content: [{ type: "text", text: `Error in search_cellxgene_datasets: ${error.message}` }] };
+    }
+  }
+);
+
+// ============================================
+// TOOL: CELLxGENE marker genes
+// ============================================
+server.registerTool(
+  "get_cellxgene_marker_genes",
+  {
+    description:
+      "Get top marker genes for a CELLxGENE / Census cell type within an organism+tissue context using the public WMG marker-gene API. " +
+      "Prefer this for Cell X Gene questions about highest marker genes or marker-effect rankings, not dataset discovery.",
+    inputSchema: {
+      cellType: z.string().describe("Cell type label or ontology ID (for example 'mononuclear cell' or 'CL:0000842')."),
+      tissue: z.string().describe("Tissue label or ontology ID (for example 'eye' or 'UBERON:0000970')."),
+      organism: z.string().optional().default("Homo sapiens").describe("Organism label or ontology ID (default 'Homo sapiens')."),
+      disease: z.string().optional().describe("Optional disease label used to refine CELLxGENE ontology resolution before the marker-gene lookup."),
+      test: z.enum(["ttest", "binomtest"]).optional().default("ttest").describe("Marker-gene scoring method supported by the public WMG API."),
+      nMarkers: z.number().optional().default(10).describe("Maximum marker genes to return (1-50)."),
+    },
+  },
+  async ({ cellType, tissue, organism = "Homo sapiens", disease = "", test = "ttest", nMarkers = 10 }) => {
+    const requestedCellType = normalizeWhitespace(cellType || "");
+    const requestedTissue = normalizeWhitespace(tissue || "");
+    const requestedOrganism = normalizeWhitespace(organism || "Homo sapiens") || "Homo sapiens";
+    const requestedDisease = normalizeWhitespace(disease || "");
+    const boundedMarkers = Math.max(1, Math.min(50, Math.round(nMarkers || 10)));
+
+    if (!requestedCellType || !requestedTissue) {
+      return { content: [{ type: "text", text: "Provide both a CELLxGENE cell type and tissue." }] };
+    }
+
+    try {
+      const primaryDimensions = await fetchCellxgeneWmgPrimaryDimensions();
+      const organismOption = resolveCellxgeneOntologyOption(primaryDimensions?.organism_terms, requestedOrganism);
+      if (!organismOption) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `CELLxGENE could not resolve organism "${requestedOrganism}".`,
+              keyFields: [`Requested organism: ${requestedOrganism}`],
+              sources: [`${CELLXGENE_WMG_API}/primary_filter_dimensions`],
+              limitations: ["Use a CELLxGENE-supported organism label such as 'Homo sapiens' or an NCBITaxon CURIE."],
+            }),
+          }],
+        };
+      }
+
+      const tissueOptions = primaryDimensions?.tissue_terms?.[organismOption.id];
+      const tissueOption = resolveCellxgeneOntologyOption(tissueOptions, requestedTissue);
+      if (!tissueOption) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `CELLxGENE could not resolve tissue "${requestedTissue}" for ${organismOption.label}.`,
+              keyFields: [
+                `Requested tissue: ${requestedTissue}`,
+                `Resolved organism: ${organismOption.label} (${organismOption.id})`,
+              ],
+              sources: [`${CELLXGENE_WMG_API}/primary_filter_dimensions`],
+              limitations: ["The tissue may not be represented in the public WMG release for the requested organism."],
+            }),
+          }],
+        };
+      }
+
+      const baseFilter = {
+        organism_ontology_term_id: organismOption.id,
+        tissue_ontology_term_ids: [tissueOption.id],
+      };
+      const deFilterResponse = await fetchCellxgeneDeFilters(baseFilter);
+      let diseaseScopedDeFilterResponse = null;
+      let diseaseOption = null;
+      if (requestedDisease) {
+        diseaseOption = resolveCellxgeneOntologyOption(deFilterResponse?.filter_dims?.disease_terms, requestedDisease);
+        if (diseaseOption) {
+          diseaseScopedDeFilterResponse = await fetchCellxgeneDeFilters({
+            ...baseFilter,
+            disease_ontology_term_ids: [diseaseOption.id],
+          });
+        }
+      }
+
+      const cellTypeResolutionSource = diseaseScopedDeFilterResponse || deFilterResponse;
+      const cellTypeOption = resolveCellxgeneOntologyOption(
+        cellTypeResolutionSource?.filter_dims?.cell_type_terms,
+        requestedCellType,
+      );
+      if (!cellTypeOption) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `CELLxGENE could not resolve cell type "${requestedCellType}" in ${tissueOption.label}.`,
+              keyFields: [
+                `Requested cell type: ${requestedCellType}`,
+                `Resolved organism: ${organismOption.label} (${organismOption.id})`,
+                `Resolved tissue: ${tissueOption.label} (${tissueOption.id})`,
+                ...(diseaseOption ? [`Disease context: ${diseaseOption.label} (${diseaseOption.id})`] : []),
+              ],
+              sources: [`${CELLXGENE_DE_API}/filters`],
+              limitations: ["The requested cell type may not be represented in the public CELLxGENE WMG release for that context."],
+            }),
+          }],
+        };
+      }
+
+      const markerResponse = await fetchCellxgeneMarkerGenes({
+        cellTypeId: cellTypeOption.id,
+        organismId: organismOption.id,
+        tissueId: tissueOption.id,
+        nMarkers: boundedMarkers,
+        test,
+      });
+      const markerRows = Array.isArray(markerResponse?.marker_genes) ? markerResponse.marker_genes : [];
+      const geneSymbols = buildCellxgeneGeneSymbolMap(primaryDimensions, organismOption.id);
+      const rankedMarkers = markerRows.map((row) => {
+        const geneId = normalizeWhitespace(row?.gene_ontology_term_id || "");
+        const geneSymbol = geneSymbols.get(geneId) || geneId || "unknown gene";
+        const markerScore = toNullableNumber(row?.marker_score);
+        const specificity = toNullableNumber(row?.specificity);
+        return {
+          geneId,
+          geneSymbol,
+          markerScore,
+          specificity,
+        };
+      });
+
+      if (rankedMarkers.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `CELLxGENE returned no marker genes for ${cellTypeOption.label} in ${tissueOption.label}.`,
+              keyFields: [
+                `Resolved organism: ${organismOption.label} (${organismOption.id})`,
+                `Resolved tissue: ${tissueOption.label} (${tissueOption.id})`,
+                `Resolved cell type: ${cellTypeOption.label} (${cellTypeOption.id})`,
+                ...(diseaseOption ? [`Disease context: ${diseaseOption.label} (${diseaseOption.id})`] : []),
+                `Marker test: ${test}`,
+              ],
+              sources: [`${CELLXGENE_WMG_API}/markers`, `${CELLXGENE_WMG_API}/filters`],
+              limitations: ["The public WMG marker endpoint can return empty marker lists for some cell-type/tissue contexts."],
+            }),
+          }],
+        };
+      }
+
+      const topMarker = rankedMarkers[0];
+      const keyFields = [
+        `Top marker gene: ${topMarker.geneSymbol}${Number.isFinite(topMarker.markerScore) ? ` (marker score ${topMarker.markerScore.toFixed(4)})` : ""}`,
+        `Resolved organism: ${organismOption.label} (${organismOption.id})`,
+        `Resolved tissue: ${tissueOption.label} (${tissueOption.id})`,
+        `Resolved cell type: ${cellTypeOption.label} (${cellTypeOption.id})`,
+        ...(diseaseOption ? [`Disease context used for ontology resolution: ${diseaseOption.label} (${diseaseOption.id})`] : []),
+        `Marker test: ${test}`,
+        ...rankedMarkers.slice(0, Math.min(10, rankedMarkers.length)).map((row, idx) => (
+          `${idx + 1}. ${row.geneSymbol}` +
+          `${Number.isFinite(row.markerScore) ? ` | marker score ${row.markerScore.toFixed(4)}` : ""}` +
+          `${Number.isFinite(row.specificity) ? ` | specificity ${row.specificity.toFixed(4)}` : ""}` +
+          `${row.geneId ? ` | ${row.geneId}` : ""}`
+        )),
+      ];
+
+      const sources = [
+        `${CELLXGENE_WMG_API}/primary_filter_dimensions`,
+        `${CELLXGENE_WMG_API}/filters`,
+        `${CELLXGENE_WMG_API}/markers`,
+      ];
+      const contextDatasetsSource = diseaseScopedDeFilterResponse || deFilterResponse;
+      const datasets = Array.isArray(contextDatasetsSource?.filter_dims?.datasets) ? contextDatasetsSource.filter_dims.datasets : [];
+      for (const dataset of datasets.slice(0, 3)) {
+        const collectionId = normalizeWhitespace(dataset?.collection_id || "");
+        if (collectionId) {
+          sources.push(`${CELLXGENE_DISCOVER_API}/collections/${encodeURIComponent(collectionId)}`);
+        }
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `CELLxGENE marker-gene lookup returned ${rankedMarkers.length} marker gene(s) for ${cellTypeOption.label} in ${tissueOption.label}.`,
+            keyFields,
+            sources: dedupeArray(sources),
+            limitations: [
+              "The public WMG marker endpoint ranks genes by a marker score, not by a raw differential-expression coefficient.",
+              "Optional disease context is used here to refine ontology resolution; the marker API itself is organism+tissue+cell-type based.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "cellxgene_marker_genes.v1",
+          result_status: "ok",
+          organism: organismOption,
+          tissue: tissueOption,
+          cell_type: cellTypeOption,
+          disease: diseaseOption,
+          marker_test: test,
+          top_marker_gene: topMarker.geneSymbol,
+          marker_genes: rankedMarkers,
+        },
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error in get_cellxgene_marker_genes: ${error.message}` }] };
     }
   }
 );
@@ -9543,7 +13453,7 @@ server.registerTool(
   "get_uniprot_protein_profile",
   {
     description:
-      "Get a concise UniProt protein profile by accession, including function, localization, sequence facts, and major cross-references.",
+      "Get a concise UniProt protein profile by accession, including function, localization, sequence facts, disease-linked natural variants, and major cross-references.",
     inputSchema: {
       accession: z.string().describe("UniProt accession (e.g., P00533 for human EGFR)"),
     },
@@ -9575,11 +13485,29 @@ server.registerTool(
       const functionHighlights = extractUniProtCommentTexts(record, "FUNCTION", 2, 320);
       const subcellularLocations = extractUniProtSubcellularLocations(record, 8);
       const diseaseNotes = extractUniProtCommentTexts(record, "DISEASE", 3, 220);
+      const diseaseVariantAnnotations = extractUniProtDiseaseVariantAnnotations(record, 6, 8);
       const ensemblGeneIds = extractUniProtEnsemblGeneIds(record, 8);
       const pdbIds = extractUniProtCrossRefs(record, "PDB", 8);
       const reactomeIds = extractUniProtCrossRefs(record, "Reactome", 8);
       const featureSummary = summarizeUniProtFeatureTypes(record, 10);
       const lastUpdate = normalizeWhitespace(record?.entryAudit?.lastAnnotationUpdateDate || "");
+      const diseaseVariantPositionSummary = diseaseVariantAnnotations
+        .map((item) => `${item.label}: ${item.positions.join(", ")}`)
+        .filter(Boolean);
+      const diseaseVariantNotationSummary = diseaseVariantAnnotations
+        .map((item) => {
+          const variantBits = item.variants
+            .map((variant) => {
+              const notation = normalizeWhitespace(variant?.notation || "");
+              const dbsnpId = normalizeWhitespace(variant?.dbsnpId || "");
+              if (notation && dbsnpId) return `${notation} (${dbsnpId})`;
+              return notation || dbsnpId;
+            })
+            .filter(Boolean)
+            .slice(0, 4);
+          return variantBits.length > 0 ? `${item.label}: ${variantBits.join(", ")}` : "";
+        })
+        .filter(Boolean);
 
       const keyFields = [
         `Accession: [${primaryAccession}](${profileUrl})`,
@@ -9596,6 +13524,12 @@ server.registerTool(
         `PDB cross-references: ${pdbIds.length > 0 ? pdbIds.join(", ") : "N/A"}`,
         `Reactome cross-references: ${reactomeIds.length > 0 ? reactomeIds.join(", ") : "N/A"}`,
         `Feature type summary: ${featureSummary.length > 0 ? featureSummary.join("; ") : "N/A"}`,
+        ...(diseaseVariantPositionSummary.length > 0
+          ? [`Disease-associated natural variant positions: ${diseaseVariantPositionSummary.join(" | ")}`]
+          : []),
+        ...(diseaseVariantNotationSummary.length > 0
+          ? [`Disease-associated variant examples: ${diseaseVariantNotationSummary.join(" | ")}`]
+          : []),
         ...(functionHighlights.length > 0 ? [`Function highlights: ${functionHighlights.join(" | ")}`] : []),
         ...(diseaseNotes.length > 0 ? [`Disease notes: ${diseaseNotes.join(" | ")}`] : []),
         ...(lastUpdate ? [`Last annotation update: ${lastUpdate}`] : []),
@@ -9616,6 +13550,11 @@ server.registerTool(
             }),
           },
         ],
+        structuredContent: {
+          accession: primaryAccession,
+          uniprotId: entryId || null,
+          diseaseVariantAnnotations,
+        },
       };
     } catch (error) {
       const message = String(error?.message || "unknown error");
@@ -10310,18 +14249,76 @@ server.registerTool(
 
     const proteinHgvsMatch = normalizedId.match(/^([A-Za-z0-9_-]+)[:\s]+(p\.[A-Za-z][A-Za-z0-9*]+)$/i);
     const proteinShorthandMatch = normalizedId.match(/^([A-Za-z0-9_-]+)[:\s]+([A-Za-z]\d+[A-Za-z*])$/i);
+    const codingHgvsMatch = normalizedId.match(/^([A-Za-z0-9_-]+)[:\s]+(c\.\d+[ACGT]>[ACGT])$/i);
+    const codingShorthandMatch = normalizedId.match(/^([A-Za-z0-9_-]+)[:\s]+(\d+[ACGT]>[ACGT])$/i);
     const proteinQueryMeta = proteinHgvsMatch
       ? { gene: proteinHgvsMatch[1].toUpperCase(), protein: proteinHgvsMatch[2] }
       : proteinShorthandMatch
         ? { gene: proteinShorthandMatch[1].toUpperCase(), protein: `p.${proteinShorthandMatch[2]}` }
         : null;
+    const codingQueryMeta = codingHgvsMatch
+      ? {
+          gene: codingHgvsMatch[1].toUpperCase(),
+          coding: `c.${codingHgvsMatch[2].replace(/^c\./i, "").toUpperCase()}`,
+          shorthand: codingHgvsMatch[2].replace(/^c\./i, "").toUpperCase(),
+        }
+      : codingShorthandMatch
+        ? {
+            gene: codingShorthandMatch[1].toUpperCase(),
+            coding: `c.${codingShorthandMatch[2].toUpperCase()}`,
+            shorthand: codingShorthandMatch[2].toUpperCase(),
+          }
+        : null;
+
+    const extractHitGeneValues = (hit) =>
+      dedupeArray(
+        [
+          ...asArray(hit?.dbnsfp?.genename),
+          normalizeWhitespace(hit?.clinvar?.gene?.symbol || ""),
+          normalizeWhitespace(hit?.dbsnp?.gene?.symbol || ""),
+        ]
+          .map((value) => normalizeWhitespace(value).toUpperCase())
+          .filter(Boolean)
+      );
+
+    const extractHitCodingValues = (hit) =>
+      dedupeArray(
+        [
+          ...asArray(hit?.dbnsfp?.hgvsc),
+          ...asArray(hit?.clinvar?.hgvs?.coding),
+          ...asArray(hit?.dbsnp?.gene?.rnas).map((entry) => normalizeWhitespace(entry?.hgvs || "")),
+        ]
+          .map((value) => normalizeWhitespace(value))
+          .filter(Boolean)
+      );
+
+    const extractHitProteinValues = (hit) =>
+      dedupeArray(
+        [
+          ...asArray(hit?.dbnsfp?.hgvsp),
+          ...asArray(hit?.clinvar?.hgvs?.protein),
+        ]
+          .map((value) => normalizeWhitespace(value))
+          .filter(Boolean)
+      );
 
     const scoreProteinQueryHit = (hit, { gene, protein }) => {
-      const hitGeneValues = asArray(hit?.dbnsfp?.genename).map((value) => normalizeWhitespace(value).toUpperCase()).filter(Boolean);
-      const hitProteinValues = asArray(hit?.dbnsfp?.hgvsp).map((value) => normalizeWhitespace(value)).filter(Boolean);
+      const hitGeneValues = extractHitGeneValues(hit);
+      const hitProteinValues = extractHitProteinValues(hit);
       let score = 0;
       if (hitGeneValues.includes(gene)) score += 6;
       if (hitProteinValues.includes(protein)) score += 8;
+      if (/^chr[\w]+:g\.\d+[ACGT]>[ACGT]$/i.test(normalizeWhitespace(hit?._id || ""))) score += 2;
+      return score;
+    };
+
+    const scoreCodingQueryHit = (hit, { gene, coding, shorthand }) => {
+      const hitGeneValues = extractHitGeneValues(hit);
+      const hitCodingValues = extractHitCodingValues(hit);
+      let score = 0;
+      if (hitGeneValues.includes(gene)) score += 6;
+      if (hitCodingValues.includes(coding)) score += 10;
+      if (shorthand && hitCodingValues.some((value) => value.endsWith(`:${coding}`) || value.endsWith(shorthand))) score += 4;
       if (/^chr[\w]+:g\.\d+[ACGT]>[ACGT]$/i.test(normalizeWhitespace(hit?._id || ""))) score += 2;
       return score;
     };
@@ -10349,6 +14346,31 @@ server.registerTool(
       return { hit: null, url: `${MYVARIANT_API}/query?q=${encodeURIComponent(`${gene} ${protein}`)}` };
     };
 
+    const fetchCodingHgvsHit = async ({ gene, coding, shorthand }) => {
+      const searchQueries = dedupeArray([
+        `dbnsfp.genename:${gene} AND ${shorthand}`,
+        `dbnsfp.genename:${gene} AND ${coding}`,
+        `${gene} ${coding}`,
+        `${gene} ${shorthand}`,
+      ]);
+      for (const queryText of searchQueries) {
+        const params = new URLSearchParams({
+          q: queryText,
+          fields: `_id,${requestFields}`,
+          size: "10",
+        });
+        const queryUrl = `${MYVARIANT_API}/query?${params}`;
+        const queryData = await fetchJsonWithRetry(queryUrl, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+        const queryHits = Array.isArray(queryData?.hits) ? queryData.hits : [];
+        if (queryHits.length === 0) continue;
+        const ranked = [...queryHits].sort(
+          (a, b) => scoreCodingQueryHit(b, { gene, coding, shorthand }) - scoreCodingQueryHit(a, { gene, coding, shorthand })
+        );
+        return { hit: ranked[0], url: queryUrl };
+      }
+      return { hit: null, url: `${MYVARIANT_API}/query?q=${encodeURIComponent(`${gene} ${coding}`)}` };
+    };
+
     let resolvedId = normalizedId;
     let useHg38 = false;
     const ncMatch = normalizedId.match(/^NC_0*(\d{2})\.\d+:(.+)$/);
@@ -10369,6 +14391,10 @@ server.registerTool(
       const proteinResolution = await fetchProteinHgvsHit(proteinQueryMeta);
       hit = proteinResolution.hit;
       url = proteinResolution.url;
+    } else if (codingQueryMeta) {
+      const codingResolution = await fetchCodingHgvsHit(codingQueryMeta);
+      hit = codingResolution.hit;
+      url = codingResolution.url;
     } else if (isRsId) {
       const params = new URLSearchParams({ q: `dbsnp.rsid:${resolvedId}`, fields: requestFields, size: "1" });
       url = `${MYVARIANT_API}/query?${params}`;
@@ -10492,14 +14518,22 @@ server.registerTool(
 
     if (hit.clinvar) {
       const cv = hit.clinvar;
-      const sig = normalizeWhitespace(
-        Array.isArray(cv.rcv) ? cv.rcv.map((r) => normalizeWhitespace(r.clinical_significance || "")).filter(Boolean).join("; ")
-        : cv.rcv?.clinical_significance || ""
-      );
+      const clinvarEntries = asArray(cv.rcv);
+      const sig = dedupeArray(
+        clinvarEntries.map((entry) => normalizeWhitespace(entry?.clinical_significance || "")).filter(Boolean)
+      ).join("; ");
       if (sig) keyFields.push(`ClinVar significance: ${sig}`);
-      const conditions = Array.isArray(cv.rcv)
-        ? [...new Set(cv.rcv.map((r) => normalizeWhitespace(r.conditions?.identifiers?.medgen || r.conditions?.name || "")).filter(Boolean))].slice(0, 3)
-        : [];
+      const conditions = dedupeArray(
+        clinvarEntries
+          .map((entry) =>
+            normalizeWhitespace(
+              entry?.conditions?.name
+              || entry?.conditions?.identifiers?.medgen
+              || ""
+            )
+          )
+          .filter(Boolean)
+      ).slice(0, 3);
       if (conditions.length > 0) keyFields.push(`ClinVar conditions: ${conditions.join(", ")}`);
     }
 
@@ -10649,9 +14683,248 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "get_alphafold_domain_plddt",
+  {
+    description:
+      "Compute domain-level mean pLDDT values from AlphaFold models for a UniProt accession. Supports the latest AlphaFold model via API and historical archive-backed versions such as v4, then combines the model with UniProt feature annotations (topological domains, transmembrane regions, signal peptides, and a few clearly-labeled derived regions).",
+    inputSchema: {
+      uniprotId: z.string().describe("UniProt accession (for example P02786 for TFRC)."),
+      version: z.string().optional().describe("AlphaFold model version such as 'latest', 'v4', or '6'. Default 'latest'."),
+      domains: z.array(z.string()).optional().describe("Optional domain labels to prioritize in the response, for example ['signal peptide', 'extracellular', 'transmembrane', 'cytoplasmic']."),
+    },
+  },
+  async ({ uniprotId, version, domains }) => {
+    const normalizedId = normalizeWhitespace(uniprotId || "").toUpperCase();
+    if (!normalizedId) {
+      return { content: [{ type: "text", text: "Provide a UniProt accession (for example P02786)." }] };
+    }
+
+    try {
+      const helperResult = await runPythonJsonHelper(
+        ALPHAFOLD_DOMAIN_QUERY_SCRIPT,
+        {
+          uniprotId: normalizedId,
+          version: normalizeWhitespace(version || "latest") || "latest",
+          domains: Array.isArray(domains) ? domains : [],
+        },
+        { timeoutMs: 240000 }
+      );
+
+      if (normalizeWhitespace(helperResult?.status || "") !== "ok") {
+        throw new Error(normalizeWhitespace(helperResult?.error || "AlphaFold domain pLDDT helper failed."));
+      }
+
+      const requestedRows = Array.isArray(helperResult?.requested_domain_means) ? helperResult.requested_domain_means : [];
+      const domainRows = Array.isArray(helperResult?.domain_means) ? helperResult.domain_means : [];
+      const rowsToReport = requestedRows.length > 0 ? requestedRows : domainRows;
+      const versionLabel = helperResult?.version != null ? `v${helperResult.version}` : String(version || "latest");
+      const keyFields = [
+        `Entry: ${normalizeWhitespace(helperResult?.entry_id || `AF-${normalizedId}-F1`)}`,
+        `UniProt: [${normalizedId}](https://www.uniprot.org/uniprotkb/${normalizedId})`,
+        `Model version: ${versionLabel}`,
+      ];
+      if (helperResult?.global_plddt != null) {
+        keyFields.push(`Global pLDDT (latest API summary): ${Number(helperResult.global_plddt).toFixed(1)}`);
+      }
+      keyFields.push(
+        "\nDomain pLDDT means:",
+        ...rowsToReport.map((row) => {
+          const label = normalizeWhitespace(row?.label || "domain");
+          const description = normalizeWhitespace(row?.description || "");
+          const start = Number(row?.start || 0);
+          const end = Number(row?.end || 0);
+          const meanPlddt = row?.mean_plddt != null ? Number(row.mean_plddt).toFixed(1) : "n/a";
+          const atomMean = row?.all_atom_mean_plddt != null ? Number(row.all_atom_mean_plddt).toFixed(1) : "n/a";
+          const derivedTag = row?.derived ? "derived" : "annotated";
+          return `${label}: ${meanPlddt} pLDDT (all-atom mean ${atomMean}; residues ${start}-${end}; ${derivedTag}${description ? `; ${description}` : ""})`;
+        })
+      );
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Computed AlphaFold domain-level pLDDT values for ${normalizedId} using ${versionLabel}.`,
+            keyFields,
+            sources: [
+              normalizeWhitespace(helperResult?.model_source || ""),
+              `https://alphafold.ebi.ac.uk/entry/${normalizeWhitespace(helperResult?.entry_id || `AF-${normalizedId}-F1`)}`,
+              `https://www.uniprot.org/uniprotkb/${normalizedId}`,
+            ].filter(Boolean),
+            limitations: Array.isArray(helperResult?.notes) && helperResult.notes.length > 0
+              ? helperResult.notes
+              : [
+                  "Domain boundaries come from UniProt feature annotations plus a small number of explicitly labeled derived regions when UniProt indicates a signal-anchor or cleaved alternate chain.",
+                ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_alphafold_domain_plddt.v1",
+          result_status: "ok",
+          uniprot_id: normalizedId,
+          entry_id: normalizeWhitespace(helperResult?.entry_id || `AF-${normalizedId}-F1`) || null,
+          version: helperResult?.version ?? null,
+          latest_version: helperResult?.latest_version ?? null,
+          global_plddt: toNullableNumber(helperResult?.global_plddt),
+          model_source: normalizeWhitespace(helperResult?.model_source || "") || null,
+          requested_domain_means: requestedRows,
+          domain_means: domainRows,
+          notes: Array.isArray(helperResult?.notes) ? helperResult.notes : [],
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error computing AlphaFold domain pLDDT values: ${detail}` }],
+        structuredContent: {
+          schema: "get_alphafold_domain_plddt.v1",
+          result_status: "error",
+          uniprot_id: normalizedId,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
 // ---------------------------------------------------------------------------
 // GWAS Catalog — trait-variant associations from genome-wide association studies
 // ---------------------------------------------------------------------------
+
+function normalizeGwasRiskAlleleName(value) {
+  const normalized = normalizeWhitespace(value || "");
+  if (!normalized) return { variantId: "", allele: "", combined: "" };
+  const match = normalized.match(/^(rs\d+)-([A-Za-z?]+)$/i);
+  if (!match) {
+    return {
+      variantId: normalized,
+      allele: "",
+      combined: normalized.toUpperCase(),
+    };
+  }
+  return {
+    variantId: normalizeWhitespace(match[1]),
+    allele: normalizeWhitespace(match[2]).toUpperCase(),
+    combined: `${normalizeWhitespace(match[1]).toLowerCase()}-${normalizeWhitespace(match[2]).toUpperCase()}`,
+  };
+}
+
+function extractGwasAssociationRiskAlleles(association) {
+  const rows = [];
+  const loci = Array.isArray(association?.loci) ? association.loci : [];
+  for (const locus of loci) {
+    const strongest = Array.isArray(locus?.strongestRiskAlleles) ? locus.strongestRiskAlleles : [];
+    for (const row of strongest) {
+      const parsed = normalizeGwasRiskAlleleName(row?.riskAlleleName || "");
+      if (!parsed.variantId) continue;
+      rows.push({
+        risk_allele_name: normalizeWhitespace(row?.riskAlleleName || ""),
+        variant_id: parsed.variantId,
+        allele: parsed.allele,
+        risk_frequency: normalizeWhitespace(row?.riskFrequency || ""),
+      });
+    }
+  }
+  return rows;
+}
+
+function pickBestGwasStudyVariantAssociation(associations, variantId, riskAllele) {
+  const wantedVariant = normalizeWhitespace(variantId || "").toLowerCase();
+  const wantedAllele = normalizeWhitespace(riskAllele || "").toUpperCase();
+  let best = null;
+  for (const association of Array.isArray(associations) ? associations : []) {
+    const riskAlleles = extractGwasAssociationRiskAlleles(association);
+    for (const risk of riskAlleles) {
+      if (wantedVariant && risk.variant_id.toLowerCase() !== wantedVariant) continue;
+      const hasExactAllele = Boolean(wantedAllele) && risk.allele === wantedAllele;
+      const associationRiskFrequency = normalizeWhitespace(association?.riskFrequency || "");
+      const locusRiskFrequency = normalizeWhitespace(risk.risk_frequency || "");
+      const resolvedRiskFrequency = locusRiskFrequency || associationRiskFrequency;
+      const numericRiskFrequency = toFiniteNumber(resolvedRiskFrequency, Number.NaN);
+      const score =
+        (hasExactAllele ? 1000 : 0) +
+        (Number.isFinite(numericRiskFrequency) ? 100 : 0) +
+        (normalizeWhitespace(association?.pvalueDescription || "") ? 0 : 1);
+      if (!best || score > best.score) {
+        best = {
+          score,
+          association,
+          risk,
+          resolvedRiskFrequency,
+        };
+      }
+    }
+  }
+  return best;
+}
+
+function rankJasparMatrixCandidate(candidate, tfName, speciesTaxId) {
+  const name = normalizeWhitespace(candidate?.name || "");
+  const species = Array.isArray(candidate?.species) ? candidate.species : [];
+  const version = toNonNegativeInt(candidate?.version, 0);
+  const wantedName = normalizeWhitespace(tfName || "");
+  const wantedSpecies = toNonNegativeInt(speciesTaxId, 0);
+  let score = version;
+  if (wantedName && name.localeCompare(wantedName, undefined, { sensitivity: "accent" }) === 0) {
+    score += 1000;
+  } else if (wantedName && name.toLowerCase() === wantedName.toLowerCase()) {
+    score += 900;
+  }
+  if (wantedSpecies > 0 && species.some((entry) => toNonNegativeInt(entry?.tax_id, 0) === wantedSpecies)) {
+    score += 500;
+  }
+  if (normalizeWhitespace(candidate?.collection || "").toUpperCase() === "CORE") {
+    score += 50;
+  }
+  return score;
+}
+
+function computeJasparConsensusAndInformationContent(pfm) {
+  const bases = ["A", "C", "G", "T"];
+  const columns = Math.max(
+    ...bases.map((base) => (Array.isArray(pfm?.[base]) ? pfm[base].length : 0))
+  );
+  if (!Number.isFinite(columns) || columns <= 0) {
+    return {
+      consensus: "",
+      totalInformationContent: Number.NaN,
+      perPositionBits: [],
+    };
+  }
+
+  const consensus = [];
+  const perPositionBits = [];
+  let totalInformationContent = 0;
+
+  for (let idx = 0; idx < columns; idx += 1) {
+    const counts = bases.map((base) => toFiniteNumber(pfm?.[base]?.[idx], 0));
+    const total = counts.reduce((sum, value) => sum + value, 0);
+    if (!(total > 0)) {
+      consensus.push("N");
+      perPositionBits.push(0);
+      continue;
+    }
+    const probs = counts.map((value) => value / total);
+    const bestBaseIndex = probs.reduce((bestIdx, value, currentIdx, arr) => (
+      value > arr[bestIdx] ? currentIdx : bestIdx
+    ), 0);
+    consensus.push(bases[bestBaseIndex]);
+    const entropy = probs.reduce((sum, value) => {
+      if (!(value > 0)) return sum;
+      return sum - (value * Math.log2(value));
+    }, 0);
+    const infoBits = 2 - entropy;
+    perPositionBits.push(infoBits);
+    totalInformationContent += infoBits;
+  }
+
+  return {
+    consensus: consensus.join(""),
+    totalInformationContent,
+    perPositionBits,
+  };
+}
 
 server.registerTool(
   "search_gwas_associations",
@@ -10742,6 +15015,326 @@ server.registerTool(
           limitations: [
             "Results sorted by default API ordering. For strongest associations, filter by p-value.",
             "GWAS Catalog contains curated top associations from published GWAS only.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_gwas_study_variant_association",
+  {
+    description:
+      "Retrieve a specific GWAS Catalog association for one study accession and one variant, including RAF / risk frequency, p-value, effect size, and risk allele details. Prefer this over broad GWAS search when the question names a GCST study and rsID.",
+    inputSchema: {
+      studyAccession: z.string().describe("GWAS Catalog study accession (for example 'GCST011946')."),
+      variantId: z.string().describe("Variant rsID (for example 'rs79043147')."),
+      riskAllele: z.string().optional().describe("Optional effect/risk allele to require (for example 'T')."),
+      trait: z.string().optional().describe("Optional trait label for user-facing context."),
+      pageSize: z.number().int().min(25).max(2000).optional().default(500).describe("How many study associations to scan per page."),
+      maxPages: z.number().int().min(1).max(20).optional().default(8).describe("Maximum pages to scan before giving up."),
+    },
+  },
+  async ({ studyAccession, variantId, riskAllele = "", trait = "", pageSize = 500, maxPages = 8 }) => {
+    const cleanStudy = normalizeWhitespace(studyAccession || "").toUpperCase();
+    const cleanVariant = normalizeWhitespace(variantId || "");
+    const cleanRiskAllele = normalizeWhitespace(riskAllele || "").toUpperCase();
+    const cleanTrait = normalizeWhitespace(trait || "");
+
+    if (!cleanStudy || !cleanVariant) {
+      return {
+        content: [{ type: "text", text: "Provide both `studyAccession` (GCST...) and `variantId` (rs...)." }],
+      };
+    }
+
+    const boundedPageSize = Math.max(25, Math.min(2000, Math.round(pageSize || 500)));
+    const boundedMaxPages = Math.max(1, Math.min(20, Math.round(maxPages || 8)));
+    const scannedUrls = [];
+    const candidateMatches = [];
+    let bestMatch = null;
+
+    for (let pageIndex = 0; pageIndex < boundedMaxPages; pageIndex += 1) {
+      const params = new URLSearchParams({
+        projection: "associationByStudy",
+        size: String(boundedPageSize),
+        page: String(pageIndex),
+      });
+      const url = `${GWAS_CATALOG_LEGACY_API}/studies/${encodeURIComponent(cleanStudy)}/associations?${params}`;
+      scannedUrls.push(url);
+      let data;
+      try {
+        data = await fetchJsonWithRetry(url, {
+          headers: { Accept: "application/json" },
+          retries: 1,
+          timeoutMs: 20000,
+          maxBackoffMs: 2500,
+        });
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: renderStructuredResponse({
+            summary: `GWAS Catalog study-specific lookup failed: ${err.message}`,
+            keyFields: [
+              `Study: ${cleanStudy}`,
+              `Variant: ${cleanVariant}${cleanRiskAllele ? `-${cleanRiskAllele}` : ""}`,
+            ],
+            sources: scannedUrls,
+            limitations: ["The legacy GWAS Catalog study-association endpoint may be temporarily unavailable."],
+          }) }],
+        };
+      }
+
+      const associations = Array.isArray(data?._embedded?.associations) ? data._embedded.associations : [];
+      const match = pickBestGwasStudyVariantAssociation(associations, cleanVariant, cleanRiskAllele);
+      if (match) {
+        bestMatch = match;
+        break;
+      }
+
+      for (const association of associations) {
+        const riskAlleles = extractGwasAssociationRiskAlleles(association)
+          .filter((row) => row.variant_id.toLowerCase() === cleanVariant.toLowerCase())
+          .map((row) => row.risk_allele_name)
+          .filter(Boolean);
+        if (riskAlleles.length > 0) {
+          candidateMatches.push(...riskAlleles);
+        }
+      }
+
+      const totalPages = toNonNegativeInt(data?.page?.totalPages, 0);
+      if (totalPages > 0 && pageIndex + 1 >= totalPages) {
+        break;
+      }
+      if (associations.length < boundedPageSize) {
+        break;
+      }
+    }
+
+    if (!bestMatch) {
+      const variantSummary = candidateMatches.length > 0
+        ? `Risk-allele names seen for ${cleanVariant}: ${dedupeArray(candidateMatches).slice(0, 6).join(", ")}`
+        : `No ${cleanVariant} association rows were recovered from study ${cleanStudy}.`;
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No GWAS Catalog association match was found for ${cleanVariant}${cleanRiskAllele ? `-${cleanRiskAllele}` : ""} in study ${cleanStudy}.`,
+          keyFields: [
+            `Study: ${cleanStudy}`,
+            `Variant: ${cleanVariant}`,
+            cleanRiskAllele ? `Requested risk allele: ${cleanRiskAllele}` : "",
+            variantSummary,
+          ].filter(Boolean),
+          sources: scannedUrls,
+          limitations: [
+            "Study-level association pages were scanned from the legacy GWAS Catalog API because the v2 API does not expose equivalent study+variant association endpoints.",
+          ],
+        }) }],
+      };
+    }
+
+    const association = bestMatch.association || {};
+    const risk = bestMatch.risk || {};
+    const study = association?.study || {};
+    const resolvedTrait = normalizeWhitespace(
+      study?.diseaseTrait?.trait
+      || (Array.isArray(association?.efoTraits) ? association.efoTraits[0]?.trait : "")
+      || cleanTrait
+    );
+    const riskFrequencyRaw = normalizeWhitespace(bestMatch.resolvedRiskFrequency || "");
+    const riskFrequencyNum = toFiniteNumber(riskFrequencyRaw, Number.NaN);
+    const beta = toFiniteNumber(association?.betaNum, Number.NaN);
+    const standardError = toFiniteNumber(association?.standardError, Number.NaN);
+    const oddsRatio = toFiniteNumber(association?.orPerCopyNum, Number.NaN);
+    const pValue = toFiniteNumber(association?.pvalue, Number.NaN);
+    const pubmedId = normalizeWhitespace(study?.publicationInfo?.pubmedId || "");
+    const studyUrl = `${GWAS_CATALOG_LEGACY_API}/studies/${encodeURIComponent(cleanStudy)}`;
+    const associationUrl = normalizeWhitespace(association?._links?.self?.href || "");
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary:
+            `GWAS Catalog study ${cleanStudy} reports ${risk.risk_allele_name || `${cleanVariant}${cleanRiskAllele ? `-${cleanRiskAllele}` : ""}`} ` +
+            `for ${resolvedTrait || "the requested trait"} with RAF ${Number.isFinite(riskFrequencyNum) ? riskFrequencyRaw : "unavailable"}.`,
+          keyFields: [
+            `Study: ${cleanStudy}`,
+            resolvedTrait ? `Trait: ${resolvedTrait}` : "",
+            `Variant: ${cleanVariant}`,
+            `Risk allele: ${risk.allele || cleanRiskAllele || "unavailable"}`,
+            `Risk allele label: ${risk.risk_allele_name || "unavailable"}`,
+            `RAF / risk frequency: ${Number.isFinite(riskFrequencyNum) ? riskFrequencyRaw : "unavailable"}`,
+            Number.isFinite(beta) ? `Beta: ${beta}` : "",
+            Number.isFinite(standardError) ? `Standard error: ${standardError}` : "",
+            Number.isFinite(oddsRatio) ? `Odds ratio: ${oddsRatio}` : "",
+            Number.isFinite(pValue) ? `P-value: ${pValue}` : "",
+            pubmedId ? `PMID: ${pubmedId}` : "",
+          ].filter(Boolean),
+          sources: [associationUrl, studyUrl, ...scannedUrls].filter(Boolean),
+          limitations: [
+            "This uses the study-specific association pages from the legacy GWAS Catalog REST API because those details are not exposed on the v2 search endpoints.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_jaspar_motif_profile",
+  {
+    description:
+      "Retrieve one JASPAR transcription-factor motif profile and compute its consensus sequence plus total information content from the position frequency matrix. Prefer this for JASPAR questions naming a TF or matrix id.",
+    inputSchema: {
+      tfName: z.string().optional().describe("Transcription factor name to search in JASPAR (for example 'SPI1')."),
+      matrixId: z.string().optional().describe("Optional exact JASPAR matrix id (for example 'MA0080.5')."),
+      speciesTaxId: z.number().int().optional().default(9606).describe("NCBI taxonomy id to prefer when searching by TF name (default 9606 for human)."),
+      collection: z.string().optional().default("CORE").describe("JASPAR collection to search (default CORE)."),
+      taxGroup: z.string().optional().default("vertebrates").describe("JASPAR taxonomic group to search (default vertebrates)."),
+    },
+  },
+  async ({ tfName = "", matrixId = "", speciesTaxId = 9606, collection = "CORE", taxGroup = "vertebrates" }) => {
+    const cleanTfName = normalizeWhitespace(tfName || "");
+    const cleanMatrixId = normalizeWhitespace(matrixId || "");
+    const cleanCollection = normalizeWhitespace(collection || "CORE") || "CORE";
+    const cleanTaxGroup = normalizeWhitespace(taxGroup || "vertebrates") || "vertebrates";
+    const cleanSpeciesTaxId = toNonNegativeInt(speciesTaxId, 9606) || 9606;
+
+    if (!cleanTfName && !cleanMatrixId) {
+      return {
+        content: [{ type: "text", text: "Provide either `tfName` or `matrixId` for JASPAR lookup." }],
+      };
+    }
+
+    const sources = [];
+    let selectedMatrix = null;
+
+    if (cleanMatrixId) {
+      const detailUrl = `${JASPAR_API}/matrix/${encodeURIComponent(cleanMatrixId)}/?format=json`;
+      sources.push(detailUrl);
+      try {
+        selectedMatrix = await fetchJsonWithRetry(detailUrl, {
+          headers: { Accept: "application/json" },
+          retries: 1,
+          timeoutMs: 15000,
+          maxBackoffMs: 2500,
+        });
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: renderStructuredResponse({
+            summary: `JASPAR matrix lookup failed: ${err.message}`,
+            keyFields: [`Matrix id: ${cleanMatrixId}`],
+            sources,
+            limitations: ["Check that the JASPAR matrix id exists and is publicly available."],
+          }) }],
+        };
+      }
+    } else {
+      const params = new URLSearchParams({
+        search: cleanTfName,
+        collection: cleanCollection,
+        tax_group: cleanTaxGroup,
+        species: String(cleanSpeciesTaxId),
+        format: "json",
+      });
+      const searchUrl = `${JASPAR_API}/matrix/?${params}`;
+      sources.push(searchUrl);
+      let searchData;
+      try {
+        searchData = await fetchJsonWithRetry(searchUrl, {
+          headers: { Accept: "application/json" },
+          retries: 1,
+          timeoutMs: 15000,
+          maxBackoffMs: 2500,
+        });
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: renderStructuredResponse({
+            summary: `JASPAR search failed: ${err.message}`,
+            keyFields: [`TF name: ${cleanTfName}`],
+            sources,
+            limitations: ["The JASPAR API may be temporarily unavailable."],
+          }) }],
+        };
+      }
+      const results = Array.isArray(searchData?.results) ? searchData.results : [];
+      if (results.length === 0) {
+        return {
+          content: [{ type: "text", text: renderStructuredResponse({
+            summary: `No JASPAR motif matched ${cleanTfName}.`,
+            keyFields: [
+              `TF name: ${cleanTfName}`,
+              `Species tax id: ${cleanSpeciesTaxId}`,
+              `Collection: ${cleanCollection}`,
+            ],
+            sources,
+            limitations: ["Try another TF synonym or query a specific matrix id if known."],
+          }) }],
+        };
+      }
+
+      const ranked = [];
+      for (const result of results) {
+        const url = normalizeWhitespace(result?.url || "");
+        if (!url) continue;
+        const detailUrl = `${url}${url.includes("?") ? "&" : "?"}format=json`;
+        let detail;
+        try {
+          detail = await fetchJsonWithRetry(detailUrl, {
+            headers: { Accept: "application/json" },
+            retries: 1,
+            timeoutMs: 15000,
+            maxBackoffMs: 2500,
+          });
+        } catch (_) {
+          continue;
+        }
+        const score = rankJasparMatrixCandidate(detail, cleanTfName, cleanSpeciesTaxId);
+        ranked.push({ score, detail, detailUrl });
+      }
+
+      ranked.sort((a, b) => b.score - a.score);
+      if (ranked.length === 0) {
+        return {
+          content: [{ type: "text", text: renderStructuredResponse({
+            summary: `JASPAR search found candidate motifs for ${cleanTfName}, but none could be retrieved in detail.`,
+            keyFields: [`TF name: ${cleanTfName}`],
+            sources,
+            limitations: ["The returned candidate matrix detail pages could not be fetched."],
+          }) }],
+        };
+      }
+
+      selectedMatrix = ranked[0].detail;
+      sources.push(ranked[0].detailUrl);
+    }
+
+    const pfm = selectedMatrix?.pfm || {};
+    const computed = computeJasparConsensusAndInformationContent(pfm);
+    const totalBits = computed.totalInformationContent;
+    const roundedBits = Number.isFinite(totalBits) ? totalBits.toFixed(2) : "unavailable";
+    const speciesNames = (Array.isArray(selectedMatrix?.species) ? selectedMatrix.species : [])
+      .map((entry) => normalizeWhitespace(entry?.name || ""))
+      .filter(Boolean);
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary:
+            `JASPAR motif ${normalizeWhitespace(selectedMatrix?.matrix_id || cleanMatrixId || "") || "unavailable"} ` +
+            `for ${normalizeWhitespace(selectedMatrix?.name || cleanTfName || "") || "the requested TF"} has consensus ${computed.consensus || "unavailable"} ` +
+            `and total information content ${roundedBits} bits.`,
+          keyFields: [
+            `Matrix id: ${normalizeWhitespace(selectedMatrix?.matrix_id || cleanMatrixId || "") || "unavailable"}`,
+            `TF name: ${normalizeWhitespace(selectedMatrix?.name || cleanTfName || "") || "unavailable"}`,
+            speciesNames.length > 0 ? `Species: ${speciesNames.join(", ")}` : "",
+            `Collection: ${normalizeWhitespace(selectedMatrix?.collection || cleanCollection || "") || "unavailable"}`,
+            `Consensus recognition sequence: ${computed.consensus || "unavailable"}`,
+            `Total information content (bits): ${roundedBits}`,
+          ].filter(Boolean),
+          sources: dedupeArray(sources),
+          limitations: [
+            "Consensus and total information content are computed directly from the JASPAR position frequency matrix returned by the public API.",
           ],
         }),
       }],
@@ -10985,20 +15578,246 @@ server.registerTool(
 // Human Protein Atlas — protein expression, localization, and single-cell summaries
 // ---------------------------------------------------------------------------
 
+function normalizeHpaReleaseHost(release) {
+  const raw = normalizeWhitespace(release || "").toLowerCase();
+  if (!raw || raw === "latest" || raw === "current") {
+    return HPA_API;
+  }
+  const versionMatch = raw.match(/^v?(\d{2})$/);
+  if (versionMatch) {
+    return `https://v${versionMatch[1]}.proteinatlas.org`;
+  }
+  if (/^https?:\/\//.test(raw)) {
+    return raw.replace(/\/+$/, "");
+  }
+  return HPA_API;
+}
+
+function encodeHpaPathSegment(value) {
+  return encodeURIComponent(normalizeWhitespace(value || "")).replace(/%20/g, "+");
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeHpaDatasetName(value) {
+  const raw = normalizeWhitespace(value || "").toLowerCase().replace(/[\s-]+/g, "_");
+  if (!raw) return "";
+  if (["single_cell_type", "single_cell", "single_cell_non_tabula_sapiens", "non_tabula_sapiens", "non_tabula"].includes(raw)) {
+    return "single_cell_type";
+  }
+  if (["ts_single_cell_type", "tabula_sapiens", "tabula"].includes(raw)) {
+    return "ts_single_cell_type";
+  }
+  if (["tissue_cell_type", "tissue"].includes(raw)) {
+    return "tissue_cell_type";
+  }
+  return raw;
+}
+
+function classifyHpaSingleCellSection(html, position) {
+  const before = html.slice(0, Math.max(0, position));
+  const anchors = [
+    { name: "single_cell_type", patterns: ['id="single_cell_type"', "id='single_cell_type'"] },
+    { name: "ts_single_cell_type", patterns: ['id="ts_single_cell_type"', "id='ts_single_cell_type'"] },
+    { name: "tissue_cell_type", patterns: ['id="tissue_cell_type"', "id='tissue_cell_type'"] },
+  ];
+
+  let bestName = "";
+  let bestIndex = -1;
+  for (const anchor of anchors) {
+    for (const pattern of anchor.patterns) {
+      const idx = before.lastIndexOf(pattern);
+      if (idx > bestIndex) {
+        bestIndex = idx;
+        bestName = anchor.name;
+      }
+    }
+  }
+  return bestName || "single_cell_type";
+}
+
+function normalizeHpaCellTypeLabel(value) {
+  return normalizeWhitespace(String(value || "").replace(/\s+c-\d+\b/gi, "")).toLowerCase();
+}
+
+function scoreHpaCellTypeMatch(candidateLabel, requestedLabel) {
+  const candidate = normalizeHpaCellTypeLabel(candidateLabel);
+  const requested = normalizeHpaCellTypeLabel(requestedLabel);
+  if (!candidate || !requested) return -1;
+  if (candidate === requested) return 100;
+  if (candidate.includes(requested) || requested.includes(candidate)) return 80;
+  const candidateTokens = candidate.split(/\s+/).filter(Boolean);
+  const requestedTokens = requested.split(/\s+/).filter(Boolean);
+  const overlap = requestedTokens.filter((token) => candidateTokens.includes(token)).length;
+  if (overlap === requestedTokens.length) return 70;
+  if (overlap > 0) return overlap;
+  return -1;
+}
+
+function groupHpaMarkerEntriesByCellType(entries) {
+  const groups = new Map();
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const rawLabel = normalizeWhitespace(entry?.label || "");
+    const baseLabel = normalizeWhitespace(rawLabel.replace(/\s+c-\d+\b/gi, ""));
+    const value = toFiniteNumber(entry?.value, Number.NaN);
+    if (!baseLabel || !Number.isFinite(value)) continue;
+    const unitMatch = normalizeWhitespace(stripHtmlToText(entry?.tooltip || "")).match(/\b(n[CT]PM)\b/i);
+    const cellCount = Math.max(0, toFiniteNumber(entry?.cell_count, 0));
+    const group = groups.get(baseLabel) || {
+      label: baseLabel,
+      unit: unitMatch ? unitMatch[1] : "",
+      entries: [],
+      weightedSum: 0,
+      weightTotal: 0,
+      simpleSum: 0,
+      valueCount: 0,
+    };
+    group.entries.push({
+      label: rawLabel || baseLabel,
+      value,
+      cellCount,
+      tooltip: normalizeWhitespace(stripHtmlToText(entry?.tooltip || "")),
+      group: normalizeWhitespace(entry?.group || ""),
+    });
+    if (!group.unit && unitMatch) {
+      group.unit = unitMatch[1];
+    }
+    if (cellCount > 0) {
+      group.weightedSum += value * cellCount;
+      group.weightTotal += cellCount;
+    }
+    group.simpleSum += value;
+    group.valueCount += 1;
+    groups.set(baseLabel, group);
+  }
+
+  return Array.from(groups.values()).map((group) => {
+    const representativeValue = group.weightTotal > 0
+      ? group.weightedSum / group.weightTotal
+      : group.valueCount > 0
+        ? group.simpleSum / group.valueCount
+        : Number.NaN;
+    return {
+      label: group.label,
+      unit: group.unit || "",
+      representativeValue,
+      entryCount: group.valueCount,
+      weightedByCellCount: group.weightTotal > 0,
+      totalCellCount: group.weightTotal,
+      entries: group.entries,
+    };
+  });
+}
+
+function extractJsonAssignmentsFromHtml(html, variableName) {
+  const text = String(html || "");
+  const needle = `var ${String(variableName || "").trim()} = `;
+  if (!text || !needle.trim()) return [];
+
+  const assignments = [];
+  let searchStart = 0;
+  while (searchStart < text.length) {
+    const statementStart = text.indexOf(needle, searchStart);
+    if (statementStart === -1) break;
+    const jsonStart = text.indexOf("{", statementStart + needle.length);
+    if (jsonStart === -1) break;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let jsonEnd = -1;
+
+    for (let idx = jsonStart; idx < text.length; idx += 1) {
+      const char = text[idx];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === "\"") {
+        inString = true;
+        continue;
+      }
+      if (char === "{") {
+        depth += 1;
+      } else if (char === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          jsonEnd = idx;
+          break;
+        }
+      }
+    }
+
+    if (jsonEnd === -1) break;
+    try {
+      assignments.push({
+        start: statementStart,
+        value: JSON.parse(text.slice(jsonStart, jsonEnd + 1)),
+      });
+    } catch (_) {
+      // Ignore malformed blocks and continue scanning for later assignments.
+    }
+    searchStart = jsonEnd + 1;
+  }
+
+  return assignments;
+}
+
+function extractHpaCurrentGeneMarkerBlocks(html, geneSymbol) {
+  const symbol = normalizeWhitespace(geneSymbol || "");
+  if (!html || !symbol) return [];
+  const blocks = [];
+  for (const assignment of extractJsonAssignmentsFromHtml(html, "marker_tpm")) {
+    try {
+      const parsed = assignment.value && typeof assignment.value === "object" ? assignment.value : {};
+      const payload = parsed[symbol] || null;
+      if (!payload || normalizeWhitespace(payload?.cell_type_name || "").toLowerCase() !== "current gene") {
+        continue;
+      }
+      blocks.push({
+        section: classifyHpaSingleCellSection(html, assignment.start || 0),
+        geneSymbol: symbol,
+        entries: Array.isArray(payload?.data) ? payload.data : [],
+        url: normalizeWhitespace(payload?.url || ""),
+      });
+    } catch (_) {
+      continue;
+    }
+  }
+  return blocks;
+}
+
 server.registerTool(
   "get_human_protein_atlas_gene",
   {
     description:
       "Retrieves a Human Protein Atlas gene summary including tissue specificity, single-cell specificity, " +
-      "subcellular localization, protein class, and disease involvement. Accepts a gene symbol or Ensembl gene ID.",
+      "subcellular localization, protein class, disease involvement, and optional exact tissue/cell-type single-cell lookups. " +
+      "Accepts a gene symbol or Ensembl gene ID.",
     inputSchema: {
       gene: z.string().optional().describe("Human gene symbol or alias to resolve via MyGene.info (e.g. 'TP53')."),
       ensemblGeneId: z.string().optional().describe("Ensembl gene ID (e.g. 'ENSG00000141510')."),
+      singleCellTissue: z.string().optional().describe("Optional HPA single-cell tissue page to inspect exactly (for example 'prostate')."),
+      singleCellCellType: z.string().optional().describe("Optional single-cell cell type label to resolve within the requested HPA tissue page (for example 'Basal prostatic cells')."),
+      singleCellDataset: z.string().optional().describe("Optional HPA single-cell dataset selector: 'single_cell_type', 'tabula_sapiens', or 'tissue_cell_type'."),
+      release: z.string().optional().describe("Optional Human Protein Atlas release such as 'v24' or 'latest'. Defaults to the current public release."),
     },
   },
-  async ({ gene = "", ensemblGeneId = "" }) => {
+  async ({ gene = "", ensemblGeneId = "", singleCellTissue = "", singleCellCellType = "", singleCellDataset = "", release = "" }) => {
     const normalizedEnsembl = normalizeWhitespace(ensemblGeneId || "");
     const normalizedGene = normalizeWhitespace(gene || "").toUpperCase();
+    const normalizedSingleCellTissue = normalizeWhitespace(singleCellTissue || "");
+    const normalizedSingleCellCellType = normalizeWhitespace(singleCellCellType || "");
+    const normalizedSingleCellDataset = normalizeHpaDatasetName(singleCellDataset || "");
+    const normalizedRelease = normalizeWhitespace(release || "");
     if (!normalizedEnsembl && !normalizedGene) {
       return { content: [{ type: "text", text: "Provide either `gene` or `ensemblGeneId`." }] };
     }
@@ -11031,7 +15850,8 @@ server.registerTool(
         limitations.push(`Resolved ${normalizedGene} to ${resolvedEnsembl} via MyGene.info.`);
       }
 
-      const dataUrl = `${HPA_API}/${encodeURIComponent(resolvedEnsembl)}.json`;
+      const hpaHost = normalizeHpaReleaseHost(normalizedRelease);
+      const dataUrl = `${hpaHost}/${encodeURIComponent(resolvedEnsembl)}.json`;
       const record = await fetchJsonWithRetry(dataUrl, { retries: 1, timeoutMs: 15000, maxBackoffMs: 2500 });
       const pageSymbol = normalizeWhitespace(record?.Gene || resolvedSymbol || "");
       const pageEnsembl = normalizeWhitespace(record?.Ensembl || resolvedEnsembl);
@@ -11063,6 +15883,7 @@ server.registerTool(
 
       const keyFields = [
         `Gene: ${pageSymbol || normalizedGene || resolvedEnsembl} (${pageEnsembl})`,
+        `Release: ${normalizedRelease || "latest"}`,
         `Description: ${normalizeWhitespace(record?.["Gene description"] || "No description available.")}`,
         `Evidence level: ${normalizeWhitespace(record?.Evidence || record?.["HPA evidence"] || "unknown")}`,
         `RNA tissue specificity: ${normalizeWhitespace(record?.["RNA tissue specificity"] || "unknown")} | Distribution: ${normalizeWhitespace(record?.["RNA tissue distribution"] || "unknown")}`,
@@ -11078,15 +15899,100 @@ server.registerTool(
       if (topSingleCell.length > 0) keyFields.push(`Top single-cell signals: ${topSingleCell.join(", ")}`);
       if (topBrainCellTypes.length > 0) keyFields.push(`Top brain cell-type signals: ${topBrainCellTypes.join(", ")}`);
 
-      const hpaPageUrl = `${HPA_API}/${encodeURIComponent(pageEnsembl)}-${encodeURIComponent(pageSymbol || resolvedSymbol || "")}`;
+      const hpaPageUrl = `${hpaHost}/${encodeURIComponent(pageEnsembl)}-${encodeURIComponent(pageSymbol || resolvedSymbol || "")}`;
       sources.push(dataUrl, hpaPageUrl);
       limitations.push("The MCP integration uses the Human Protein Atlas gene summary JSON endpoint, which emphasizes atlas-level summaries rather than per-image inspection.");
 
+      let singleCellLookup = null;
+      if (normalizedSingleCellTissue || normalizedSingleCellCellType || normalizedSingleCellDataset) {
+        const detailPath = normalizedSingleCellTissue
+          ? `/single+cell/${encodeHpaPathSegment(normalizedSingleCellTissue)}`
+          : "/single+cell";
+        const detailUrl = `${hpaPageUrl}${detailPath}`;
+        try {
+          const detailResponse = await fetchWithRetry(detailUrl, { retries: 1, timeoutMs: 20000, maxBackoffMs: 2500 });
+          const detailHtml = await detailResponse.text();
+          const markerBlocks = extractHpaCurrentGeneMarkerBlocks(detailHtml, pageSymbol || resolvedSymbol || normalizedGene);
+          const matchingBlocks = normalizedSingleCellDataset
+            ? markerBlocks.filter((block) => block.section === normalizedSingleCellDataset)
+            : markerBlocks;
+          const selectedBlock = matchingBlocks[0] || markerBlocks[0] || null;
+
+          if (selectedBlock) {
+            const groupedCellTypes = groupHpaMarkerEntriesByCellType(selectedBlock.entries);
+            let matchedGroup = null;
+            if (normalizedSingleCellCellType) {
+              const rankedGroups = groupedCellTypes
+                .map((group) => ({ group, score: scoreHpaCellTypeMatch(group.label, normalizedSingleCellCellType) }))
+                .filter((item) => item.score >= 0)
+                .sort((a, b) => b.score - a.score || b.group.entryCount - a.group.entryCount);
+              matchedGroup = rankedGroups[0]?.group || null;
+            }
+
+            if (matchedGroup) {
+              const displayValue = Number.isFinite(matchedGroup.representativeValue)
+                ? matchedGroup.representativeValue.toFixed(1)
+                : "unknown";
+              const clusterSummaries = matchedGroup.entries
+                .slice(0, 8)
+                .map((entry) =>
+                  `${entry.label} (${entry.value.toFixed(1)} ${matchedGroup.unit || "expression units"}${entry.cellCount > 0 ? `; n=${entry.cellCount}` : ""})`
+                );
+              keyFields.push(`Detailed single-cell tissue page: ${normalizedSingleCellTissue || "global single-cell"} | Dataset: ${selectedBlock.section}`);
+              keyFields.push(`Matched cell type: ${matchedGroup.label}`);
+              keyFields.push(`Exact single-cell expression: ${displayValue} ${matchedGroup.unit || "expression units"}`);
+              if (clusterSummaries.length > 0) {
+                keyFields.push(`Supporting clusters: ${clusterSummaries.join(", ")}`);
+              }
+              sources.push(detailUrl);
+              limitations.push("Detailed single-cell values are parsed from the Human Protein Atlas single-cell tissue page rather than the summary JSON endpoint.");
+              singleCellLookup = {
+                tissue: normalizedSingleCellTissue || null,
+                dataset: selectedBlock.section,
+                cellTypeQuery: normalizedSingleCellCellType || null,
+                matchedCellType: matchedGroup.label,
+                value: displayValue,
+                unit: matchedGroup.unit || null,
+                weightedByCellCount: matchedGroup.weightedByCellCount,
+                representativeValue: matchedGroup.representativeValue,
+                clusters: matchedGroup.entries.map((entry) => ({
+                  label: entry.label,
+                  value: entry.value,
+                  unit: matchedGroup.unit || null,
+                  cellCount: entry.cellCount || null,
+                })),
+              };
+            } else if (normalizedSingleCellCellType) {
+              keyFields.push(`Detailed single-cell tissue page: ${normalizedSingleCellTissue || "global single-cell"} | Dataset: ${selectedBlock.section}`);
+              keyFields.push(`No exact single-cell cell-type match found for: ${normalizedSingleCellCellType}`);
+              const availableCellTypes = groupedCellTypes.slice(0, 8).map((group) => group.label);
+              if (availableCellTypes.length > 0) {
+                keyFields.push(`Available cell types on page: ${availableCellTypes.join(", ")}`);
+              }
+              sources.push(detailUrl);
+              limitations.push("Requested exact single-cell cell type was not found on the selected Human Protein Atlas page.");
+            }
+          }
+        } catch (detailError) {
+          limitations.push(`Detailed single-cell page lookup failed: ${normalizeWhitespace(detailError?.message || String(detailError))}`);
+        }
+      }
+
       return {
+        structuredContent: {
+          identifier: {
+            gene: pageSymbol || normalizedGene || resolvedEnsembl,
+            ensemblGeneId: pageEnsembl,
+          },
+          release: normalizedRelease || "latest",
+          singleCellLookup,
+        },
         content: [{
           type: "text",
           text: renderStructuredResponse({
-            summary: `Human Protein Atlas profile for ${pageSymbol || resolvedSymbol || resolvedEnsembl}.`,
+            summary: singleCellLookup
+              ? `Human Protein Atlas single-cell profile for ${pageSymbol || resolvedSymbol || resolvedEnsembl}: ${singleCellLookup.matchedCellType} in ${singleCellLookup.tissue || "the selected tissue"} is ${singleCellLookup.value} ${singleCellLookup.unit || "expression units"} (${singleCellLookup.dataset}).`
+              : `Human Protein Atlas profile for ${pageSymbol || resolvedSymbol || resolvedEnsembl}.`,
             keyFields,
             sources,
             limitations,
@@ -11239,6 +16145,125 @@ server.registerTool(
 // ---------------------------------------------------------------------------
 // cBioPortal — cancer mutation profiles across TCGA studies
 // ---------------------------------------------------------------------------
+
+server.registerTool(
+  "get_tcga_project_data_availability",
+  {
+    description:
+      "Count how many TCGA cases in a project have files for a specified data category, data type, or experimental strategy using the Genomic Data Commons (GDC) cases endpoint. Prefer this for TCGA project-level availability questions such as proteome profiling counts.",
+    inputSchema: {
+      projectId: z.string().describe("TCGA project id such as 'TCGA-BRCA'."),
+      dataCategory: z.string().optional().default("Proteome Profiling").describe("GDC data category to require (default 'Proteome Profiling')."),
+      dataType: z.string().optional().describe("Optional GDC data type filter such as 'Protein Expression Quantification'."),
+      experimentalStrategy: z.string().optional().describe("Optional GDC experimental strategy such as 'Reverse Phase Protein Array'."),
+    },
+  },
+  async ({ projectId, dataCategory = "Proteome Profiling", dataType = "", experimentalStrategy = "" }) => {
+    const cleanProjectId = normalizeWhitespace(projectId || "").toUpperCase();
+    const cleanDataCategory = normalizeWhitespace(dataCategory || "");
+    const cleanDataType = normalizeWhitespace(dataType || "");
+    const cleanExperimentalStrategy = normalizeWhitespace(experimentalStrategy || "");
+
+    if (!cleanProjectId) {
+      return { content: [{ type: "text", text: "Provide a TCGA project id such as `TCGA-BRCA`." }] };
+    }
+
+    const filterClauses = [
+      {
+        op: "in",
+        content: {
+          field: "project.project_id",
+          value: [cleanProjectId],
+        },
+      },
+    ];
+    if (cleanDataCategory) {
+      filterClauses.push({
+        op: "in",
+        content: {
+          field: "files.data_category",
+          value: [cleanDataCategory],
+        },
+      });
+    }
+    if (cleanDataType) {
+      filterClauses.push({
+        op: "in",
+        content: {
+          field: "files.data_type",
+          value: [cleanDataType],
+        },
+      });
+    }
+    if (cleanExperimentalStrategy) {
+      filterClauses.push({
+        op: "in",
+        content: {
+          field: "files.experimental_strategy",
+          value: [cleanExperimentalStrategy],
+        },
+      });
+    }
+
+    const filters = {
+      op: "and",
+      content: filterClauses,
+    };
+    const params = new URLSearchParams({
+      filters: JSON.stringify(filters),
+      format: "JSON",
+      size: "0",
+    });
+    const url = `${GDC_API}/cases?${params}`;
+    let data;
+    try {
+      data = await fetchJsonWithRetry(url, {
+        headers: { Accept: "application/json" },
+        retries: 1,
+        timeoutMs: 20000,
+        maxBackoffMs: 2500,
+      });
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `GDC project-level availability query failed: ${err.message}`,
+          keyFields: [
+            `Project: ${cleanProjectId}`,
+            cleanDataCategory ? `Data category: ${cleanDataCategory}` : "",
+            cleanDataType ? `Data type: ${cleanDataType}` : "",
+            cleanExperimentalStrategy ? `Experimental strategy: ${cleanExperimentalStrategy}` : "",
+          ].filter(Boolean),
+          sources: [url],
+          limitations: ["The GDC API may be temporarily unavailable."],
+        }) }],
+      };
+    }
+
+    const totalCases = toNonNegativeInt(data?.data?.pagination?.total, 0);
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary:
+            `${totalCases.toLocaleString()} ${cleanProjectId} cases have associated ${cleanDataCategory || "requested"} files` +
+            `${cleanDataType ? ` (${cleanDataType})` : ""}${cleanExperimentalStrategy ? ` via ${cleanExperimentalStrategy}` : ""}.`,
+          keyFields: [
+            `Project: ${cleanProjectId}`,
+            cleanDataCategory ? `Data category: ${cleanDataCategory}` : "",
+            cleanDataType ? `Data type: ${cleanDataType}` : "",
+            cleanExperimentalStrategy ? `Experimental strategy: ${cleanExperimentalStrategy}` : "",
+            `Matching cases: ${totalCases.toLocaleString()}`,
+          ].filter(Boolean),
+          sources: [url, `https://portal.gdc.cancer.gov/projects/${encodeURIComponent(cleanProjectId)}`],
+          limitations: [
+            "Counts come from the GDC cases endpoint and represent cases with at least one matching file, not raw file totals.",
+          ],
+        }),
+      }],
+    };
+  }
+);
 
 const TCGA_PAN_CANCER_STUDIES = [
   "acc_tcga_pan_can_atlas_2018", "blca_tcga_pan_can_atlas_2018", "brca_tcga_pan_can_atlas_2018",
@@ -11531,6 +16556,228 @@ server.registerTool(
       };
     } catch (error) {
       return { content: [{ type: "text", text: `Error in get_depmap_gene_dependency: ${error.message}` }] };
+    }
+  }
+);
+
+server.registerTool(
+  "get_depmap_expression_subset_mean",
+  {
+    description:
+      "Computes the mean log2(TPM+1) expression for one gene across a named DepMap model subset or molecular subtype " +
+      "from a public release (for example RB1Loss / RB1_LoF in DepMap Public 25Q3). " +
+      "Uses the public SubtypeMatrix plus DepMap expression downloads instead of BigQuery.",
+    inputSchema: {
+      geneSymbol: z.string().describe("Gene symbol to summarize in the DepMap expression matrix (for example 'MT-CO2')."),
+      subtype: z.string().describe("DepMap subtype code or human-readable alias (for example 'RB1Loss' or 'RB1_LoF')."),
+      release: z.string().optional().default("25Q3").describe("DepMap public release tag or label (for example '25Q3' or 'DepMap Public 25Q3')."),
+      expressionDataset: z.enum(["protein_coding_stranded", "protein_coding", "all_genes_stranded", "all_genes"]).optional().default("protein_coding_stranded")
+        .describe("Which DepMap public expression matrix to query. Defaults to the stranded protein-coding log2(TPM+1) matrix."),
+      defaultProfileOnly: z.boolean().optional().default(true)
+        .describe("Whether to restrict to rows marked IsDefaultEntryForModel in the public expression matrix."),
+    },
+  },
+  async ({
+    geneSymbol,
+    subtype,
+    release = "25Q3",
+    expressionDataset = "protein_coding_stranded",
+    defaultProfileOnly = true,
+  }) => {
+    const normalizedGene = normalizeWhitespace(geneSymbol || "").toUpperCase();
+    const normalizedSubtype = normalizeWhitespace(subtype || "");
+    const normalizedRelease = normalizeDepMapReleaseQuery(release || "") || "25Q3";
+    const selectedDataset = DEPMAP_EXPRESSION_DATASET_FILES[expressionDataset] ? expressionDataset : "protein_coding_stranded";
+
+    if (!normalizedGene || !normalizedSubtype) {
+      return {
+        content: [{
+          type: "text",
+          text: "Provide both a DepMap gene symbol and a subtype or model-subset label (for example MT-CO2 and RB1Loss).",
+        }],
+      };
+    }
+
+    try {
+      const [catalogRows, subtypeTree, subtypeMatrix] = await Promise.all([
+        fetchDepMapDownloadCatalog(),
+        fetchDepMapSubtypeTree(normalizedRelease),
+        fetchDepMapSubtypeMatrix(normalizedRelease),
+      ]);
+      const resolvedSubtype = resolveDepMapSubtypeCode(
+        normalizedSubtype,
+        subtypeTree.rows,
+        subtypeMatrix.header
+      );
+      const subtypeCode = resolvedSubtype.code;
+      if (!subtypeCode) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `DepMap subtype "${normalizedSubtype}" could not be resolved in release ${subtypeMatrix.release}.`,
+              keyFields: [
+                `Requested subtype: ${normalizedSubtype}`,
+                `Release: ${subtypeMatrix.release}`,
+              ],
+              sources: [subtypeTree.sourceUrl, subtypeMatrix.sourceUrl].filter(Boolean),
+              limitations: [
+                "Subtype resolution uses the public DepMap subtype tree and matrix aliases.",
+                "Try the exact subtype code from SubtypeTree, for example RB1_LoF.",
+              ],
+            }),
+          }],
+        };
+      }
+
+      const subtypeIndex = subtypeMatrix.header.findIndex(
+        (value) => normalizeWhitespace(value) === subtypeCode
+      );
+      if (subtypeIndex < 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Subtype ${subtypeCode} was not present in the DepMap subtype matrix for release ${subtypeMatrix.release}.`,
+              keyFields: [
+                `Requested subtype: ${normalizedSubtype}`,
+                `Resolved subtype code: ${subtypeCode}`,
+                `Release: ${subtypeMatrix.release}`,
+              ],
+              sources: [subtypeTree.sourceUrl, subtypeMatrix.sourceUrl].filter(Boolean),
+              limitations: ["Subtype availability depends on the public DepMap subtype matrix for the selected release."],
+            }),
+          }],
+        };
+      }
+
+      const modelIds = new Set();
+      for (const line of subtypeMatrix.lines.slice(1)) {
+        const cols = parseCsvLine(line);
+        const modelId = normalizeWhitespace(cols[0] || "");
+        const membership = normalizeWhitespace(cols[subtypeIndex] || "");
+        if (!modelId) continue;
+        if (membership === "1" || membership === "1.0" || membership.toLowerCase() === "true") {
+          modelIds.add(modelId);
+        }
+      }
+
+      if (modelIds.size === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Subtype ${subtypeCode} resolved in DepMap ${subtypeMatrix.release}, but no model memberships were found in the public subtype matrix.`,
+              keyFields: [
+                `Requested subtype: ${normalizedSubtype}`,
+                `Resolved subtype code: ${subtypeCode}`,
+                `Release: ${subtypeMatrix.release}`,
+              ],
+              sources: [subtypeTree.sourceUrl, subtypeMatrix.sourceUrl].filter(Boolean),
+              limitations: ["The public subtype matrix did not contain any models marked for the resolved subtype."],
+            }),
+          }],
+        };
+      }
+
+      const cacheKey = buildDepMapExpressionSubsetMeanCacheKey({
+        geneSymbol: normalizedGene,
+        subtypeCode,
+        release: normalizedRelease,
+        expressionDataset: selectedDataset,
+        defaultProfileOnly,
+      });
+      const cached = getFreshCacheValue(depMapExpressionSubsetMeanCache.get(cacheKey), 6 * 60 * 60 * 1000);
+      if (cached) {
+        return cached;
+      }
+
+      const expressionFilename = DEPMAP_EXPRESSION_DATASET_FILES[selectedDataset];
+      const expressionCatalogRow = findDepMapCatalogRow(catalogRows, expressionFilename, normalizedRelease);
+      if (!expressionCatalogRow?.url) {
+        throw new Error(`No DepMap expression file "${expressionFilename}" was found for release "${normalizedRelease}".`);
+      }
+
+      const response = await fetchWithRetry(expressionCatalogRow.url, {
+        retries: 1,
+        timeoutMs: 120000,
+        maxBackoffMs: 6000,
+        headers: {
+          Accept: "text/csv",
+          "User-Agent": "Mozilla/5.0 research-mcp",
+        },
+      });
+      const { geneColumn, valueCount, valueSum, matchedModelCount } =
+        await computeDepMapExpressionSubsetMeanFromResponse(response, {
+          modelIds,
+          geneSymbol: normalizedGene,
+          defaultProfileOnly,
+        });
+
+      if (valueCount === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `DepMap ${expressionCatalogRow.release || normalizedRelease}: no finite ${geneColumn.label} expression values were found for subtype ${subtypeCode}.`,
+              keyFields: [
+                `Gene: ${normalizedGene}`,
+                `Resolved subtype code: ${subtypeCode}`,
+                `Expression file: ${expressionFilename}`,
+                `Default model profiles only: ${defaultProfileOnly ? "yes" : "no"}`,
+              ],
+              sources: [subtypeTree.sourceUrl, subtypeMatrix.sourceUrl, expressionCatalogRow.url].filter(Boolean),
+              limitations: [
+                "The selected release and expression matrix did not yield any finite values after applying the subtype/model filters.",
+              ],
+            }),
+          }],
+        };
+      }
+
+      const meanValue = valueSum / valueCount;
+      const payload = {
+        structuredContent: {
+          gene: normalizedGene,
+          matchedGeneColumn: geneColumn.label,
+          subtypeQuery: normalizedSubtype,
+          subtypeCode,
+          release: normalizeWhitespace(expressionCatalogRow.release || subtypeMatrix.release || normalizedRelease),
+          expressionDataset: selectedDataset,
+          defaultProfileOnly,
+          subsetModelCount: modelIds.size,
+          matchedExpressionRows: valueCount,
+          matchedModelCount,
+          meanLog2TpmPlus1: meanValue,
+        },
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary:
+              `DepMap ${normalizeWhitespace(expressionCatalogRow.release || subtypeMatrix.release || normalizedRelease)}: ` +
+              `${normalizedGene} mean log2(TPM+1) across ${matchedModelCount.toLocaleString()} ${subtypeCode} model(s) is ${meanValue.toFixed(5)}.`,
+            keyFields: [
+              `Gene: ${normalizedGene} | Matched expression column: ${geneColumn.label}`,
+              `Requested subtype: ${normalizedSubtype} | Resolved subtype code: ${subtypeCode}`,
+              `Release: ${normalizeWhitespace(expressionCatalogRow.release || subtypeMatrix.release || normalizedRelease)}`,
+              `Expression file: ${expressionFilename}`,
+              `Subtype matrix memberships: ${modelIds.size.toLocaleString()} model(s)`,
+              `Matched expression rows: ${valueCount.toLocaleString()} | Matched models with values: ${matchedModelCount.toLocaleString()}`,
+              `Mean log2(TPM+1): ${meanValue.toFixed(5)}`,
+              `Default model profiles only: ${defaultProfileOnly ? "yes" : "no"}`,
+            ],
+            sources: [subtypeTree.sourceUrl, subtypeMatrix.sourceUrl, expressionCatalogRow.url].filter(Boolean),
+            limitations: [
+              "Subtype aliases are resolved against the public DepMap subtype tree; RB1Loss maps to RB1_LoF in the public 25Q3 subtype tree.",
+              "Expression means are computed from the selected public expression matrix and may differ from internal portal aggregations if a different profile-selection rule is used.",
+            ],
+          }),
+        }],
+      };
+      depMapExpressionSubsetMeanCache.set(cacheKey, storeCacheValue(null, payload));
+      return payload;
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error in get_depmap_expression_subset_mean: ${error.message}` }] };
     }
   }
 );
