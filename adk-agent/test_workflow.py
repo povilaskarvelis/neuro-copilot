@@ -191,30 +191,65 @@ def test_create_workflow_agent_benchmark_mode_returns_single_tool_enabled_agent(
 
 def test_known_mcp_tools_and_benchmark_instruction_cover_ensembl_tss_lookup():
     assert "get_ensembl_canonical_transcript" in workflow.KNOWN_MCP_TOOLS
+    assert "get_ensembl_transcripts_by_protein_length" in workflow.KNOWN_MCP_TOOLS
     assert "get_gwas_study_variant_association" in workflow.KNOWN_MCP_TOOLS
+    assert "get_gwas_study_top_risk_allele" in workflow.KNOWN_MCP_TOOLS
     assert "get_jaspar_motif_profile" in workflow.KNOWN_MCP_TOOLS
+    assert "get_gnomad_gene_constraint" in workflow.KNOWN_MCP_TOOLS
+    assert "get_gnomad_transcript_highest_af_region" in workflow.KNOWN_MCP_TOOLS
+    assert "get_regulomedb_variant_summary" in workflow.KNOWN_MCP_TOOLS
+    assert "get_dbsnp_population_frequency" in workflow.KNOWN_MCP_TOOLS
+    assert "get_screen_nearest_ccre_assay" in workflow.KNOWN_MCP_TOOLS
+    assert "get_screen_ccre_top_celltype_assay" in workflow.KNOWN_MCP_TOOLS
     assert "get_tcga_project_data_availability" in workflow.KNOWN_MCP_TOOLS
     assert "get_cellxgene_marker_genes" in workflow.KNOWN_MCP_TOOLS
     assert "get_depmap_expression_subset_mean" in workflow.KNOWN_MCP_TOOLS
+    assert "get_depmap_sample_top_expression_gene" in workflow.KNOWN_MCP_TOOLS
     assert "get_geo_cell_type_proportions" in workflow.KNOWN_MCP_TOOLS
     assert "get_alphafold_domain_plddt" in workflow.KNOWN_MCP_TOOLS
+    assert "get_ena_experiment_profile" in workflow.KNOWN_MCP_TOOLS
+    assert "get_emdb_entry_metadata" in workflow.KNOWN_MCP_TOOLS
+    assert "get_gtopdb_ligand_reference" in workflow.KNOWN_MCP_TOOLS
     assert "get_ensembl_canonical_transcript" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_ensembl_transcripts_by_protein_length" in workflow.BENCHMARK_QA_INSTRUCTION
     assert "get_gwas_study_variant_association" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_gwas_study_top_risk_allele" in workflow.BENCHMARK_QA_INSTRUCTION
     assert "get_jaspar_motif_profile" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_gnomad_gene_constraint" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_gnomad_transcript_highest_af_region" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_regulomedb_variant_summary" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_dbsnp_population_frequency" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_screen_nearest_ccre_assay" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_screen_ccre_top_celltype_assay" in workflow.BENCHMARK_QA_INSTRUCTION
     assert "get_tcga_project_data_availability" in workflow.BENCHMARK_QA_INSTRUCTION
     assert "get_cellxgene_marker_genes" in workflow.BENCHMARK_QA_INSTRUCTION
     assert "get_depmap_expression_subset_mean" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_depmap_sample_top_expression_gene" in workflow.BENCHMARK_QA_INSTRUCTION
     assert "get_geo_cell_type_proportions" in workflow.BENCHMARK_QA_INSTRUCTION
     assert "get_alphafold_domain_plddt" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_ena_experiment_profile" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_emdb_entry_metadata" in workflow.BENCHMARK_QA_INSTRUCTION
+    assert "get_gtopdb_ligand_reference" in workflow.BENCHMARK_QA_INSTRUCTION
     assert "get_ensembl_canonical_transcript" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_ensembl_transcripts_by_protein_length" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_gnomad_gene_constraint" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_gnomad_transcript_highest_af_region" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_regulomedb_variant_summary" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_dbsnp_population_frequency" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_screen_nearest_ccre_assay" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_screen_ccre_top_celltype_assay" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
     assert 'release="25.09"' in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
     assert "get_uniprot_protein_profile" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
     assert "singleCellDataset" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
     assert 'release="v24"' in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
     assert "get_cellxgene_marker_genes" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
     assert "get_depmap_expression_subset_mean" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_depmap_sample_top_expression_gene" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
     assert "get_geo_cell_type_proportions" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
     assert "get_alphafold_domain_plddt" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_ena_experiment_profile" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_emdb_entry_metadata" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "get_gtopdb_ligand_reference" in workflow.BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE
 
 
 def test_benchmark_specialized_hints_cover_hpa_single_cell_release_pinning():
@@ -247,6 +282,54 @@ def test_benchmark_specialized_hints_cover_jaspar_and_tcga_and_open_targets_l2g_
     assert "get_jaspar_motif_profile" in "\n".join(jaspar_hints)
     assert 'tfName="SPI1"' in "\n".join(jaspar_hints)
 
+    gnomad_constraint_hints = workflow._benchmark_specialized_hints(
+        "What are the probability of Loss-of-function Intolerance (pLI) values for the human genes APOE, APOC1, and APOC2, according to GnomAD?"
+    )
+    joined_gnomad_constraint = "\n".join(gnomad_constraint_hints)
+    assert "get_gnomad_gene_constraint" in joined_gnomad_constraint
+    assert '"APOE"' in joined_gnomad_constraint
+    assert '"APOC1"' in joined_gnomad_constraint
+    assert '"APOC2"' in joined_gnomad_constraint
+
+    gnomad_region_hints = workflow._benchmark_specialized_hints(
+        "In what portion of the RNA transcript of the CDKN2A gene does the variant with the highest allele frequency occur, according to gnomAD?"
+    )
+    joined_gnomad_region = "\n".join(gnomad_region_hints)
+    assert "get_gnomad_transcript_highest_af_region" in joined_gnomad_region
+    assert 'geneIdentifier="CDKN2A"' in joined_gnomad_region
+
+    regulomedb_hints = workflow._benchmark_specialized_hints(
+        "How many motifs are annotated in RegulomeDB v2.2 for the region defined by rs17583618?"
+    )
+    joined_regulomedb = "\n".join(regulomedb_hints)
+    assert "get_regulomedb_variant_summary" in joined_regulomedb
+    assert 'query="rs17583618"' in joined_regulomedb
+
+    dbsnp_hints = workflow._benchmark_specialized_hints(
+        "What is the ALFA reference allele frequency for African populations for rs356182, according to dbSNP build 151?"
+    )
+    joined_dbsnp = "\n".join(dbsnp_hints)
+    assert "get_dbsnp_population_frequency" in joined_dbsnp
+    assert 'rsId="rs356182"' in joined_dbsnp
+    assert 'populationName="African"' in joined_dbsnp
+
+    screen_nearest_hints = workflow._benchmark_specialized_hints(
+        "What is the DNase value for the nearest proximal enhancer peak to human HTRA1, as annotated in SCREEN?"
+    )
+    joined_screen_nearest = "\n".join(screen_nearest_hints)
+    assert "get_screen_nearest_ccre_assay" in joined_screen_nearest
+    assert 'geneIdentifier="HTRA1"' in joined_screen_nearest
+    assert 'ccreClass="pELS"' in joined_screen_nearest
+    assert 'assay="DNase"' in joined_screen_nearest
+
+    screen_top_ct_hints = workflow._benchmark_specialized_hints(
+        "Which cell type has the highest H3K4me3 Z-score for the gene EH38E1864119, in the SCREEN database?"
+    )
+    joined_screen_top_ct = "\n".join(screen_top_ct_hints)
+    assert "get_screen_ccre_top_celltype_assay" in joined_screen_top_ct
+    assert 'accession="EH38E1864119"' in joined_screen_top_ct
+    assert 'assay="H3K4me3"' in joined_screen_top_ct
+
     tcga_hints = workflow._benchmark_specialized_hints(
         "How many of the cases within the Breast Invasive Carcinoma project within The Cancer Genome Atlas (TCGA-BRCA) have associated proteome profiling?"
     )
@@ -277,6 +360,14 @@ def test_benchmark_specialized_hints_cover_jaspar_and_tcga_and_open_targets_l2g_
     assert 'subtype="RB1Loss"' in joined_depmap
     assert 'release="25Q3"' in joined_depmap
 
+    depmap_sample_hints = workflow._benchmark_specialized_hints(
+        "What gene shows the highest log2-normalized expression in the 1156QE8 Sample, in DepMap (Expression Public 25Q3)?"
+    )
+    joined_depmap_sample = "\n".join(depmap_sample_hints)
+    assert "get_depmap_sample_top_expression_gene" in joined_depmap_sample
+    assert 'sampleQuery="1156QE8 Sample"' in joined_depmap_sample
+    assert 'release="25Q3"' in joined_depmap_sample
+
     geo_hints = workflow._benchmark_specialized_hints(
         "What are the proportions of beta and ductal cells in human pancreatic islets for type 2 diabetic donors in GEO dataset GSE84133?"
     )
@@ -293,6 +384,40 @@ def test_benchmark_specialized_hints_cover_jaspar_and_tcga_and_open_targets_l2g_
     assert "get_alphafold_domain_plddt" in joined_alphafold
     assert 'uniprotId="P02786"' in joined_alphafold
     assert 'version="4"' in joined_alphafold
+
+    gwas_extreme_hints = workflow._benchmark_specialized_hints(
+        "What was the risk allele identified with the highest p-value in the GCST005528 GWAS catalog study?"
+    )
+    joined_gwas_extreme = "\n".join(gwas_extreme_hints)
+    assert "get_gwas_study_top_risk_allele" in joined_gwas_extreme
+    assert 'studyAccession="GCST005528"' in joined_gwas_extreme
+    assert 'rankBy="lowest_pvalue"' in joined_gwas_extreme
+
+    ensembl_length_hints = workflow._benchmark_specialized_hints(
+        "What are the Ensembl IDs of the ENSG00000069424 transcripts, that encode 200-350aa?"
+    )
+    joined_ensembl_length = "\n".join(ensembl_length_hints)
+    assert "get_ensembl_transcripts_by_protein_length" in joined_ensembl_length
+    assert 'identifier="ENSG00000069424"' in joined_ensembl_length
+    assert "minProteinLengthAa=200" in joined_ensembl_length
+    assert "maxProteinLengthAa=350" in joined_ensembl_length
+
+    ena_hints = workflow._benchmark_specialized_hints(
+        "What technique and instrument were used to execute experiment ERX2290523 in the ENA database?"
+    )
+    assert 'get_ena_experiment_profile(experimentAccession="ERX2290523")' in "\n".join(ena_hints)
+
+    emdb_hints = workflow._benchmark_specialized_hints(
+        "What was the cryopreservative used to store EMD-48324, documented in the EMDB database"
+    )
+    assert 'get_emdb_entry_metadata(accession="EMD-48324")' in "\n".join(emdb_hints)
+
+    gtopdb_hints = workflow._benchmark_specialized_hints(
+        "What is the title of the earliest cited reference for Ligand 11429 in GtoPdb?"
+    )
+    joined_gtopdb = "\n".join(gtopdb_hints)
+    assert "get_gtopdb_ligand_reference" in joined_gtopdb
+    assert 'ligandId="11429"' in joined_gtopdb
 
 
 def test_sanitize_benchmark_final_answer_prefers_non_scratch_suffix_for_named_items():
@@ -344,6 +469,31 @@ def test_benchmark_missing_field_retry_feedback_detects_partial_jaspar_answer():
     )
 
     assert "both requested JASPAR outputs" in feedback
+
+
+def test_benchmark_required_tool_retry_feedback_corrects_gwas_highest_pvalue_convention():
+    class DummyContext:
+        def __init__(self) -> None:
+            self.state = {}
+
+    callback_context = DummyContext()
+    workflow._set_tool_log(callback_context, [{
+        "raw_tool": "get_gwas_study_top_risk_allele",
+        "status": "done",
+        "evidence_text": (
+            "Study: GCST005528\n"
+            "Ranking mode: highest_pvalue\n"
+            "Risk allele label: rs2476491-?\n"
+            "P-value: 0.000001"
+        ),
+    }])
+
+    feedback = workflow._benchmark_required_tool_retry_feedback(
+        "What was the risk allele identified with the highest p-value in the GCST005528 GWAS catalog study?",
+        callback_context,
+    )
+
+    assert 'rankBy="lowest_pvalue"' in feedback
 
 
 def test_sanitize_benchmark_final_answer_keeps_jaspar_sequence_and_bits():

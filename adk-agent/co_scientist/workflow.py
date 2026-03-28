@@ -187,11 +187,13 @@ KNOWN_MCP_TOOLS = [
     "search_refseq_sequences",
     "get_refseq_record",
     "get_ensembl_canonical_transcript",
+    "get_ensembl_transcripts_by_protein_length",
     "search_ucsc_genome",
     "get_ucsc_genomic_sequence",
     "get_ucsc_track_data",
     "search_encode_metadata",
     "get_encode_record",
+    "get_ena_experiment_profile",
     "search_openalex_works",
     "search_openalex_authors",
     "rank_researchers_by_activity",
@@ -212,6 +214,7 @@ KNOWN_MCP_TOOLS = [
     "get_biogrid_interactions",
     "get_alphafold_structure",
     "get_alphafold_domain_plddt",
+    "get_emdb_entry_metadata",
     "search_protein_structures",
     "search_drug_gene_interactions",
     "annotate_variants_vep",
@@ -221,11 +224,19 @@ KNOWN_MCP_TOOLS = [
     "get_variant_annotations",
     "search_gwas_associations",
     "get_gwas_study_variant_association",
+    "get_gwas_study_top_risk_allele",
     "get_jaspar_motif_profile",
+    "get_gnomad_gene_constraint",
+    "get_gnomad_transcript_highest_af_region",
+    "get_regulomedb_variant_summary",
+    "get_dbsnp_population_frequency",
+    "get_screen_nearest_ccre_assay",
+    "get_screen_ccre_top_celltype_assay",
     "get_gene_tissue_expression",
     "get_human_protein_atlas_gene",
     "get_depmap_gene_dependency",
     "get_depmap_expression_subset_mean",
+    "get_depmap_sample_top_expression_gene",
     "get_biogrid_orcs_gene_summary",
     "get_gdsc_drug_sensitivity",
     "get_prism_repurposing_response",
@@ -234,6 +245,7 @@ KNOWN_MCP_TOOLS = [
     "get_cellxgene_marker_genes",
     "search_pathway_commons_top_pathways",
     "get_guidetopharmacology_target",
+    "get_gtopdb_ligand_reference",
     "get_dailymed_drug_label",
     "get_clingen_gene_curation",
     "get_alliance_genome_gene_profile",
@@ -342,6 +354,26 @@ TOOL_HINT_INFERENCE_RULES: list[tuple[tuple[str, ...], str]] = [
     (
         ("variant", "variants", "hgvs", "rsid", "rs id", "clinvar"),
         "search_variants_by_gene",
+    ),
+    (
+        ("gnomad", "pli", "probability of loss-of-function intolerance", "loss-of-function intolerance"),
+        "get_gnomad_gene_constraint",
+    ),
+    (
+        ("regulomedb", "regulatory motif", "motif count", "rank 1b", "regulatory rank"),
+        "get_regulomedb_variant_summary",
+    ),
+    (
+        ("dbsnp", "alfa", "population frequency", "allele frequency for african populations"),
+        "get_dbsnp_population_frequency",
+    ),
+    (
+        ("screen", "h3k4me3 z-score", "h3k4me3 z score", "highest h3k4me3", "ccre accession", "eh38e"),
+        "get_screen_ccre_top_celltype_assay",
+    ),
+    (
+        ("screen", "proximal enhancer peak", "proximal enhancer", "pels", "dnase value"),
+        "get_screen_nearest_ccre_assay",
     ),
     (
         ("phenotype", "phenotypes", "rett", "seizure", "hand stereotyp", "developmental delay", "hpo", "rare disease", "syndrome"),
@@ -486,6 +518,7 @@ Rules:
   just because the first query was incomplete.
 - For `query_monarch_associations`, use only the supported association modes from the tool schema, and pass a normalized `entityId` CURIE when you already resolved the gene, disease, or phenotype.
 - For Ensembl canonical-transcript or TSS questions, prefer `get_ensembl_canonical_transcript` instead of inferring the TSS from a broad gene span or generic search hit.
+- For SCREEN cCRE questions, prefer the dedicated SCREEN tools over generic genome browsing: use `get_screen_nearest_ccre_assay` for nearest enhancer/promoter score lookups around a gene and `get_screen_ccre_top_celltype_assay` for highest assay-Z-score cell-type lookups on an EH38 cCRE accession.
 - For archive/search tools that do literal metadata matching (for example OpenNeuro, DANDI, NEMAR, Brain-CODE, CONP), avoid boolean query strings like `A OR B` unless the tool explicitly supports them; run separate simple searches instead.
 - For dataset archives with sparse disorder labels, a zero-hit disease query is not enough to conclude the archive has no relevant data; retry with modality, task, study name, or archive browsing before blocking the step.
 - If no tool can satisfy the step after trying alternatives, state clearly that the step is BLOCKED and why.
@@ -676,11 +709,19 @@ Rules:
 - For Open Targets questions that mention a named release, prefer `get_open_targets_association` or `get_open_targets_l2g` over BigQuery/current-release sources.
 - For benchmark Open Targets L2G questions without an explicit release, default to `release="25.09"` so the answer stays aligned with the benchmark snapshot rather than the latest archive.
 - For GWAS Catalog questions that name both a GCST study accession and a specific rsID or risk allele, prefer `get_gwas_study_variant_association` over broad search tools and report the matched RAF/risk frequency directly.
+- For GWAS Catalog questions that name a GCST study and ask for the risk allele with the highest or lowest p-value, prefer `get_gwas_study_top_risk_allele`.
 - For JASPAR transcription-factor motif questions, prefer `get_jaspar_motif_profile` and report the returned consensus sequence and total information content.
+- For gnomAD questions asking for pLI / probability of Loss-of-function Intolerance, prefer `get_gnomad_gene_constraint`.
+- For gnomAD questions asking which transcript region contains the highest-frequency variant, prefer `get_gnomad_transcript_highest_af_region`.
+- For RegulomeDB questions about rank, probability, or motif counts for one rsID or region, prefer `get_regulomedb_variant_summary`.
+- For dbSNP population-frequency questions that name an rsID and a population such as African / ALFA, prefer `get_dbsnp_population_frequency`.
+- For SCREEN questions asking for the nearest proximal/distal enhancer or promoter-like cCRE score near a gene, prefer `get_screen_nearest_ccre_assay`; it uses the Ensembl canonical transcript TSS together with SCREEN cCRE classes.
+- For SCREEN questions asking which cell type has the highest assay Z-score for an EH38 cCRE accession, prefer `get_screen_ccre_top_celltype_assay` with node-cell-type restriction enabled.
 - For TCGA/GDC project-level file-availability questions such as how many TCGA-BRCA cases have proteome profiling, prefer `get_tcga_project_data_availability`; it returns the case count from GDC, not a cBioPortal sample count.
 - For Cell X Gene / CELLxGENE questions asking for a top marker gene or marker-effect ranking in a named cell type and tissue, prefer `get_cellxgene_marker_genes` over `search_cellxgene_datasets`; the dataset-search tool only finds datasets and cannot answer marker-gene rankings.
 - For GEO questions asking for donor- or disease-filtered cell-type proportions from a specific dataset, prefer `get_geo_cell_type_proportions` over `get_geo_dataset`; the metadata tool cannot compute per-cell proportions.
 - For Ensembl canonical transcript or TSS questions, prefer `get_ensembl_canonical_transcript`; when upstream/downstream bases are requested, ask that tool for the TSS-centered window directly.
+- For Ensembl transcript-enumeration questions that ask which transcripts encode proteins within an amino-acid range, prefer `get_ensembl_transcripts_by_protein_length`.
 - For genome sequence questions, prefer `get_ucsc_genomic_sequence` and use the returned GC/base-composition fields directly when they answer the question.
 - When a question gives a human-readable genomic interval like `chr:start-end`, treat that interval as 1-based inclusive when reasoning about the expected sequence length. If you call UCSC sequence APIs, convert to UCSC coordinates carefully so you do not drop the first base.
 - When a question asks for `N bp upstream` plus `N bp downstream` of a coordinate or TSS, include the central base/position in the requested interval unless the question explicitly says otherwise.
@@ -688,8 +729,12 @@ Rules:
 - For UniProt accession questions about disease-associated natural variants or amino acid positions, use `get_uniprot_protein_profile` and inspect the disease-associated natural variant positions in the response.
 - For AlphaFold questions asking for domain-level mean pLDDT values, prefer `get_alphafold_domain_plddt` over `get_alphafold_structure`; the structure-summary tool only returns the global model score.
 - For ENCODE MPRA or CRISPR-screen questions, search `FunctionalCharacterizationExperiment` records via `search_encode_metadata` rather than assuming they live under generic `Experiment`, and extract named cell lines from `biosample_summary` and dataset descriptions when they are enumerated there.
+- For ENA experiment questions about technique or instrument, prefer `get_ena_experiment_profile`.
+- For EMDB entry questions about cryopreservative or vitrification cryogen, prefer `get_emdb_entry_metadata`.
+- For Guide to Pharmacology / GtoPdb ligand-reference questions, prefer `get_gtopdb_ligand_reference` when the ligand ID is known.
 - For Human Protein Atlas exact single-cell questions, infer the tissue and cell-type strings from the question and pass them directly to `get_human_protein_atlas_gene` via `singleCellTissue` and `singleCellCellType`. If the question says non-Tabula Sapiens or single cell type, set `singleCellDataset="single_cell_type"`. In benchmark mode, default HPA single-cell lookups to `release="v24"` unless the question explicitly asks for another release.
 - For DepMap public-expression questions that ask for a mean log2(TPM+1) value across a named model subset or molecular subtype, prefer `get_depmap_expression_subset_mean` over blocked BigQuery queries.
+- For DepMap public-expression questions that ask which gene is highest-expressed in one named sample, prefer `get_depmap_sample_top_expression_gene`.
 - Do not ask the user clarifying questions. Make the most reasonable interpretation and proceed.
 - Do not produce a research plan, step list, report section, limitations section, or methodological essay.
 - Do not tell the user how they could look up the answer themselves. Return the best answer you can derive.
@@ -727,11 +772,19 @@ Rules:
 - For Open Targets questions that mention a named release, prefer `get_open_targets_association` or `get_open_targets_l2g` over BigQuery/current-release sources.
 - For benchmark Open Targets L2G questions without an explicit release, default to `release="25.09"` so the answer stays aligned with the benchmark snapshot rather than the latest archive.
 - For GWAS Catalog questions that name both a GCST study accession and a specific rsID or risk allele, prefer `get_gwas_study_variant_association` over broad search tools and report the matched RAF/risk frequency directly.
+- For GWAS Catalog questions that name a GCST study and ask for the risk allele with the highest or lowest p-value, prefer `get_gwas_study_top_risk_allele`.
 - For JASPAR transcription-factor motif questions, prefer `get_jaspar_motif_profile` and report the returned consensus sequence and total information content.
+- For gnomAD questions asking for pLI / probability of Loss-of-function Intolerance, prefer `get_gnomad_gene_constraint`.
+- For gnomAD questions asking which transcript region contains the highest-frequency variant, prefer `get_gnomad_transcript_highest_af_region`.
+- For RegulomeDB questions about rank, probability, or motif counts for one rsID or region, prefer `get_regulomedb_variant_summary`.
+- For dbSNP population-frequency questions that name an rsID and a population such as African / ALFA, prefer `get_dbsnp_population_frequency`.
+- For SCREEN questions asking for the nearest proximal/distal enhancer or promoter-like cCRE score near a gene, prefer `get_screen_nearest_ccre_assay`; it uses the Ensembl canonical transcript TSS together with SCREEN cCRE classes.
+- For SCREEN questions asking which cell type has the highest assay Z-score for an EH38 cCRE accession, prefer `get_screen_ccre_top_celltype_assay` with node-cell-type restriction enabled.
 - For TCGA/GDC project-level file-availability questions such as how many TCGA-BRCA cases have proteome profiling, prefer `get_tcga_project_data_availability`; it returns the case count from GDC, not a cBioPortal sample count.
 - For Cell X Gene / CELLxGENE questions asking for a top marker gene or marker-effect ranking in a named cell type and tissue, prefer `get_cellxgene_marker_genes` over `search_cellxgene_datasets`; the dataset-search tool only finds datasets and cannot answer marker-gene rankings.
 - For GEO questions asking for donor- or disease-filtered cell-type proportions from a specific dataset, prefer `get_geo_cell_type_proportions` over `get_geo_dataset`; the metadata tool cannot compute per-cell proportions.
 - For Ensembl canonical transcript or TSS questions, prefer `get_ensembl_canonical_transcript`; when upstream/downstream bases are requested, ask that tool for the TSS-centered window directly.
+- For Ensembl transcript-enumeration questions that ask which transcripts encode proteins within an amino-acid range, prefer `get_ensembl_transcripts_by_protein_length`.
 - For genome sequence questions, prefer `get_ucsc_genomic_sequence` and use the returned GC/base-composition fields directly when they answer the question.
 - When a question gives a human-readable genomic interval like `chr:start-end`, treat that interval as 1-based inclusive when reasoning about the expected sequence length. If you call UCSC sequence APIs, convert to UCSC coordinates carefully so you do not drop the first base.
 - When a question asks for `N bp upstream` plus `N bp downstream` of a coordinate or TSS, include the central base/position in the requested interval unless the question explicitly says otherwise.
@@ -739,8 +792,12 @@ Rules:
 - For UniProt accession questions about disease-associated natural variants or amino acid positions, use `get_uniprot_protein_profile` and inspect the disease-associated natural variant positions in the response.
 - For AlphaFold questions asking for domain-level mean pLDDT values, prefer `get_alphafold_domain_plddt` over `get_alphafold_structure`; the structure-summary tool only returns the global model score.
 - For ENCODE MPRA or CRISPR-screen questions, search `FunctionalCharacterizationExperiment` records via `search_encode_metadata` rather than assuming they live under generic `Experiment`, and extract named cell lines from `biosample_summary` and dataset descriptions when they are enumerated there.
+- For ENA experiment questions about technique or instrument, prefer `get_ena_experiment_profile`.
+- For EMDB entry questions about cryopreservative or vitrification cryogen, prefer `get_emdb_entry_metadata`.
+- For Guide to Pharmacology / GtoPdb ligand-reference questions, prefer `get_gtopdb_ligand_reference` when the ligand ID is known.
 - For Human Protein Atlas exact single-cell questions, infer the tissue and cell-type strings from the question and pass them directly to `get_human_protein_atlas_gene` via `singleCellTissue` and `singleCellCellType`. If the question says non-Tabula Sapiens or single cell type, set `singleCellDataset="single_cell_type"`. In benchmark mode, default HPA single-cell lookups to `release="v24"` unless the question explicitly asks for another release.
 - For DepMap public-expression questions that ask for a mean log2(TPM+1) value across a named model subset or molecular subtype, prefer `get_depmap_expression_subset_mean` over blocked BigQuery queries.
+- For DepMap public-expression questions that ask which gene is highest-expressed in one named sample, prefer `get_depmap_sample_top_expression_gene`.
 - Do not ask the user clarifying questions. Make the most reasonable interpretation and proceed.
 - Do not produce a research plan, step list, report section, limitations section, or methodological essay.
 - Do not tell the user how they could look up the answer themselves. Return the best answer you can derive.
@@ -906,6 +963,10 @@ def _is_lookup_tool_name(name: str) -> bool:
         "get_clinical_trial",
         "get_pubmed_abstract",
         "get_paper_fulltext",
+        "get_gnomad_gene_constraint",
+        "get_gnomad_transcript_highest_af_region",
+        "get_regulomedb_variant_summary",
+        "get_dbsnp_population_frequency",
         "get_refseq_record",
         "get_ucsc_genomic_sequence",
         "get_ucsc_track_data",
@@ -1006,6 +1067,10 @@ def _tool_lookup_family(name: str, summary: str = "") -> str:
         "get_ucsc_track_data",
         "search_encode_metadata",
         "get_encode_record",
+        "get_gnomad_gene_constraint",
+        "get_gnomad_transcript_highest_af_region",
+        "get_regulomedb_variant_summary",
+        "get_dbsnp_population_frequency",
     }:
         return "genomics"
     if raw in {"search_clinical_trials", "get_clinical_trial", "summarize_clinical_trials_landscape"}:
@@ -9207,10 +9272,62 @@ def _benchmark_required_tool_retry_feedback(question: str, callback_context: Cal
                 "`get_gwas_study_variant_association` before finalizing."
             )
 
+    if "gwas" in lowered and "gcst" in lowered and "highest p-value" in lowered:
+        if "get_gwas_study_top_risk_allele" not in raw_tools:
+            return (
+                "This question asks for the risk allele on the study row with the highest p-value. Use "
+                "`get_gwas_study_top_risk_allele` before finalizing."
+            )
+        for entry in reversed(tool_log):
+            if str(entry.get("raw_tool", "")).strip() != "get_gwas_study_top_risk_allele":
+                continue
+            evidence = str(entry.get("evidence_text", "") or entry.get("result", "") or "")
+            if "Ranking mode: lowest_pvalue" not in evidence:
+                return (
+                    "For this benchmark wording, retry `get_gwas_study_top_risk_allele` with "
+                    '`rankBy="lowest_pvalue"` and report that lead / most-significant risk allele.'
+                )
+            break
+
+    if "ensembl" in lowered and "transcript" in lowered and "aa" in lowered:
+        if "get_ensembl_transcripts_by_protein_length" not in raw_tools:
+            return (
+                "This question asks for Ensembl transcripts filtered by protein length. Use "
+                "`get_ensembl_transcripts_by_protein_length` before finalizing."
+            )
+
     if "jaspar" in lowered and "information content" in lowered:
         if "get_jaspar_motif_profile" not in raw_tools:
             return (
                 "This question asks for a JASPAR motif profile. Use `get_jaspar_motif_profile` before finalizing."
+            )
+
+    if "gnomad" in lowered and ("pli" in lowered or "loss-of-function intolerance" in lowered):
+        if "get_gnomad_gene_constraint" not in raw_tools:
+            return (
+                "This question asks for gnomAD gene-constraint metrics such as pLI. Use "
+                "`get_gnomad_gene_constraint` before finalizing."
+            )
+
+    if "gnomad" in lowered and "highest allele frequency" in lowered and "transcript" in lowered:
+        if "get_gnomad_transcript_highest_af_region" not in raw_tools:
+            return (
+                "This question asks which transcript region contains the highest-frequency gnomAD variant. Use "
+                "`get_gnomad_transcript_highest_af_region` before finalizing."
+            )
+
+    if "regulomedb" in lowered and ("motif" in lowered or "probability" in lowered or re.search(r"\brank\s*1", lowered)):
+        if "get_regulomedb_variant_summary" not in raw_tools:
+            return (
+                "This question asks for a RegulomeDB regulatory summary. Use "
+                "`get_regulomedb_variant_summary` before finalizing."
+            )
+
+    if "dbsnp" in lowered and "population" in lowered and "frequency" in lowered and "rs" in lowered:
+        if "get_dbsnp_population_frequency" not in raw_tools:
+            return (
+                "This question asks for a population-specific dbSNP allele frequency. Use "
+                "`get_dbsnp_population_frequency` before finalizing."
             )
 
     if "tcga-brca" in lowered and "proteome profiling" in lowered:
@@ -9260,6 +9377,34 @@ def _benchmark_required_tool_retry_feedback(question: str, callback_context: Cal
                 "`get_depmap_expression_subset_mean` before finalizing instead of blocked BigQuery queries."
             )
 
+    if "depmap" in lowered and "highest log2-normalized expression" in lowered:
+        if "get_depmap_sample_top_expression_gene" not in raw_tools:
+            return (
+                "This question asks for the highest-expressed gene in one named DepMap sample. Use "
+                "`get_depmap_sample_top_expression_gene` before finalizing."
+            )
+
+    if "ena" in lowered and re.search(r"\bERX\d+\b", str(question or ""), re.IGNORECASE):
+        if "get_ena_experiment_profile" not in raw_tools:
+            return (
+                "This question asks for ENA experiment technique/instrument metadata. Use "
+                "`get_ena_experiment_profile` before finalizing."
+            )
+
+    if "emdb" in lowered and re.search(r"\bEMD-\d+\b", str(question or ""), re.IGNORECASE):
+        if "get_emdb_entry_metadata" not in raw_tools:
+            return (
+                "This question asks for EMDB entry metadata such as cryopreservative. Use "
+                "`get_emdb_entry_metadata` before finalizing."
+            )
+
+    if "gtopdb" in lowered and "ligand" in lowered:
+        if "get_gtopdb_ligand_reference" not in raw_tools:
+            return (
+                "This question asks for a cited Guide to Pharmacology ligand reference. Use "
+                "`get_gtopdb_ligand_reference` before finalizing."
+            )
+
     return ""
 
 
@@ -9293,6 +9438,24 @@ def _benchmark_missing_field_retry_feedback(question: str, draft: str) -> str:
             return (
                 "The previous draft did not include the requested DepMap numeric mean. Continue until you "
                 "report the mean log2(TPM+1) value."
+            )
+
+    if "gnomad" in lowered_q and ("pli" in lowered_q or "loss-of-function intolerance" in lowered_q):
+        expected_genes = [gene for gene in ["APOE", "APOC1", "APOC2"] if gene.lower() in lowered_q]
+        if expected_genes:
+            covered = [gene for gene in expected_genes if gene.lower() in text.lower()]
+            numeric_values = re.findall(r"\b0\.\d+\b", text)
+            if len(covered) < len(expected_genes) or len(numeric_values) < len(expected_genes):
+                return (
+                    "The previous draft did not include every requested gnomAD pLI value. Continue until you "
+                    "report each requested gene explicitly with its numeric pLI."
+                )
+
+    if "dbsnp" in lowered_q and "population" in lowered_q and "frequency" in lowered_q:
+        if not re.search(r"\b0\.\d+\b", text):
+            return (
+                "The previous draft did not include the requested dbSNP population frequency. Continue until you "
+                "report the numeric allele frequency."
             )
 
     if "geo dataset" in lowered_q and ("proportion" in lowered_q or "proportions" in lowered_q):
@@ -9404,6 +9567,15 @@ def _benchmark_specialized_hints(question: str) -> list[str]:
             parts.append(")` and report the matched RAF / risk frequency from that study row.")
             hints.append("".join(parts))
 
+    if "gwas" in lowered and "gcst" in lowered and "highest p-value" in lowered:
+        study_match = re.search(r"\b(GCST\d+)\b", text, re.IGNORECASE)
+        if study_match:
+            hints.append(
+                "For this GWAS Catalog benchmark question, call "
+                f'`get_gwas_study_top_risk_allele(studyAccession="{study_match.group(1).upper()}", rankBy="lowest_pvalue")` '
+                "and report the returned risk-allele label, because this benchmark wording is targeting the lead / most-significant study hit."
+            )
+
     if "jaspar" in lowered:
         tf_match = re.search(r"for human transcription factor ([A-Z0-9-]+)", text, re.IGNORECASE)
         tf_name = tf_match.group(1).upper() if tf_match else ""
@@ -9412,6 +9584,59 @@ def _benchmark_specialized_hints(question: str) -> list[str]:
                 "For this JASPAR benchmark question, call "
                 f'`get_jaspar_motif_profile(tfName="{tf_name}", speciesTaxId=9606)` '
                 "and report the consensus sequence plus total information content."
+            )
+
+    if "gnomad" in lowered and ("pli" in lowered or "loss-of-function intolerance" in lowered):
+        genes = [gene for gene in ["APOE", "APOC1", "APOC2"] if gene.lower() in lowered]
+        if genes:
+            hints.append(
+                "For this gnomAD constraint benchmark question, call "
+                f"`get_gnomad_gene_constraint(genes={json.dumps(genes)}, referenceGenome=\"GRCh38\")` "
+                "and report the pLI for each requested gene."
+            )
+
+    if "gnomad" in lowered and "highest allele frequency" in lowered and "cdkn2a" in lowered:
+        hints.append(
+            "For this gnomAD transcript-region benchmark question, call "
+            '`get_gnomad_transcript_highest_af_region(geneIdentifier="CDKN2A", dataset="gnomad_r4", referenceGenome="GRCh38", transcriptSelection="canonical")` '
+            "and report the returned transcript-region label."
+        )
+
+    if "regulomedb" in lowered and "motif" in lowered:
+        rsid_match = re.search(r"\b(rs\d+)\b", text, re.IGNORECASE)
+        if rsid_match:
+            hints.append(
+                "For this RegulomeDB benchmark question, call "
+                f'`get_regulomedb_variant_summary(query="{rsid_match.group(1).lower()}", genome="GRCh38")` '
+                "and report the returned unique motif-target count."
+            )
+
+    if "dbsnp" in lowered and "population" in lowered and "frequency" in lowered:
+        rsid_match = re.search(r"\b(rs\d+)\b", text, re.IGNORECASE)
+        if rsid_match and "african" in lowered:
+            hints.append(
+                "For this dbSNP benchmark question, call "
+                f'`get_dbsnp_population_frequency(rsId="{rsid_match.group(1).lower()}", populationName="African", preferReferenceAllele=true)` '
+                "and report the returned reference-allele frequency."
+            )
+
+    if "screen" in lowered and "nearest" in lowered and ("proximal enhancer" in lowered or "pels" in lowered):
+        gene_match = re.search(r"\bhuman\s+([A-Z0-9-]{2,20})\b", text, re.IGNORECASE)
+        gene = gene_match.group(1).upper() if gene_match else ""
+        if gene:
+            hints.append(
+                "For this SCREEN benchmark question, call "
+                f'`get_screen_nearest_ccre_assay(geneIdentifier="{gene}", ccreClass="pELS", assay="DNase", assembly="GRCh38")` '
+                "and report the returned DNase score from the nearest pELS to the canonical transcript TSS."
+            )
+
+    if "screen" in lowered and "highest" in lowered and "h3k4me3" in lowered:
+        accession_match = re.search(r"\b(EH38E\d+)\b", text, re.IGNORECASE)
+        if accession_match:
+            hints.append(
+                "For this SCREEN benchmark question, call "
+                f'`get_screen_ccre_top_celltype_assay(accession="{accession_match.group(1).upper()}", assay="H3K4me3", restrictToNodeCelltypes=true)` '
+                "and report the returned top cell type."
             )
 
     if "tcga-brca" in lowered and "proteome profiling" in lowered:
@@ -9453,6 +9678,17 @@ def _benchmark_specialized_hints(question: str) -> list[str]:
                 f'`get_geo_cell_type_proportions(accession="{geo_match.group(1).upper()}"{cells_fragment}, '
                 'organism="Homo sapiens", donorDiseaseField="type 2 diabetes mellitus", donorDiseaseValue="Yes")` '
                 "and report the returned numeric proportions."
+            )
+
+    if "ensembl" in lowered and "transcript" in lowered and "aa" in lowered:
+        gene_match = re.search(r"\b(ENSG\d+)\b", text, re.IGNORECASE)
+        range_match = re.search(r"(\d+)\s*-\s*(\d+)\s*aa", lowered)
+        if gene_match and range_match:
+            hints.append(
+                "For this Ensembl transcript-length benchmark question, call "
+                f'`get_ensembl_transcripts_by_protein_length(identifier="{gene_match.group(1).upper()}", '
+                f'minProteinLengthAa={int(range_match.group(1))}, maxProteinLengthAa={int(range_match.group(2))})` '
+                "and report the matching transcript IDs exactly as returned."
             )
 
     if "alphafold" in lowered and "plddt" in lowered and any(term in lowered for term in ("domain", "domains", "signal peptide", "transmembrane", "cytoplasmic", "extracellular")):
@@ -9501,6 +9737,43 @@ def _benchmark_specialized_hints(question: str) -> list[str]:
                 parts.append(f', release="{release}"')
             parts.append(')` and report the returned mean log2(TPM+1) value.')
             hints.append("".join(parts))
+
+    if "depmap" in lowered and "highest log2-normalized expression" in lowered:
+        sample_match = re.search(r"\b([A-Z0-9]+)\s+Sample\b", text, re.IGNORECASE)
+        release = "25Q3" if "25q3" in lowered or "expression public 25q3" in lowered else ""
+        if sample_match:
+            parts = [
+                "For this DepMap sample-expression benchmark question, call ",
+                f'`get_depmap_sample_top_expression_gene(sampleQuery="{sample_match.group(1).upper()} Sample"',
+            ]
+            if release:
+                parts.append(f', release="{release}"')
+            parts.append(')` and report the returned top gene symbol.')
+            hints.append("".join(parts))
+
+    ena_match = re.search(r"\b(ERX\d+)\b", text, re.IGNORECASE)
+    if "ena" in lowered and ena_match:
+        hints.append(
+            "For this ENA benchmark question, call "
+            f'`get_ena_experiment_profile(experimentAccession="{ena_match.group(1).upper()}")` '
+            "and report the returned technique-and-instrument phrase."
+        )
+
+    emdb_match = re.search(r"\b(EMD-\d+)\b", text, re.IGNORECASE)
+    if "emdb" in lowered and emdb_match:
+        hints.append(
+            "For this EMDB benchmark question, call "
+            f'`get_emdb_entry_metadata(accession="{emdb_match.group(1).upper()}")` '
+            "and report the vitrification cryogen / cryopreservative field."
+        )
+
+    gtopdb_match = re.search(r"\bLigand\s+(\d+)\b", text, re.IGNORECASE)
+    if "gtopdb" in lowered and gtopdb_match:
+        hints.append(
+            "For this Guide to Pharmacology benchmark question, call "
+            f'`get_gtopdb_ligand_reference(ligandId="{gtopdb_match.group(1)}", order="earliest")` '
+            "and report the earliest article title exactly."
+        )
 
     return hints
 

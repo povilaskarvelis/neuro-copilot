@@ -40,12 +40,17 @@ const QUICKGO_API = "https://www.ebi.ac.uk/QuickGO/services";
 const MONARCH_API = "https://monarchinitiative.org/v3/api";
 const ALLIANCE_GENOME_API = "https://www.alliancegenome.org/api";
 const GTOPDB_API = "https://www.guidetopharmacology.org/services";
+const ENA_PORTAL_API = "https://www.ebi.ac.uk/ena/portal/api";
+const EMDB_API = "https://www.ebi.ac.uk/emdb/api";
 const ALPHAFOLD_API = "https://alphafold.ebi.ac.uk/api";
 const ALPHAFOLD_FTP_ROOT = "https://ftp.ebi.ac.uk/pub/databases/alphafold";
+const GNOMAD_GRAPHQL_API = "https://gnomad.broadinstitute.org/api";
 const GWAS_CATALOG_API = "https://www.ebi.ac.uk/gwas/rest/api/v2";
 const GWAS_CATALOG_LEGACY_API = "https://www.ebi.ac.uk/gwas/rest/api";
 const JASPAR_API = "https://jaspar.elixir.no/api/v1";
 const DGIDB_GRAPHQL_API = "https://dgidb.org/api/graphql";
+const REGULOMEDB_BASE_URL = "https://regulomedb.org";
+const SCREEN_GRAPHQL_API = "https://screen.api.wenglab.org/graphql";
 const GTEX_API = "https://gtexportal.org/api/v2";
 const HPA_API = "https://www.proteinatlas.org";
 const DAILYMED_API = "https://dailymed.nlm.nih.gov/dailymed/services/v2";
@@ -76,6 +81,7 @@ const HF_DATASETS_SERVER_API = "https://datasets-server.huggingface.co";
 const GITHUB_API = "https://api.github.com";
 const CONP_GITHUB_ORG = "conpdatasets";
 const NEMAR_GITHUB_ORG = "nemarDatasets";
+const DBSNP_WEB_BASE = "https://www.ncbi.nlm.nih.gov/snp";
 const NEMAR_DATAEXPLORER_API = "https://nemar.org/dataexplorer";
 const NEMAR_DATAEXPLORER_VIEW_API = `${NEMAR_DATAEXPLORER_API}/viewapi`;
 const BRAINCODE_CONP_QUERY = "braincode";
@@ -192,7 +198,9 @@ let depMapSummaryCache = null;
 let depMapDownloadCatalogCache = null;
 const depMapSubtypeTreeCache = new Map();
 const depMapSubtypeMatrixCache = new Map();
+const depMapOmicsProfilesCache = new Map();
 const depMapExpressionSubsetMeanCache = new Map();
+const depMapSampleTopExpressionCache = new Map();
 const geoSupplementaryArchiveCache = new Map();
 const geoSampleQuickMetadataCache = new Map();
 let cellxgeneDatasetCache = null;
@@ -1609,6 +1617,184 @@ function requireGraphQLData(responsePayload, providerName = "GraphQL") {
   return responsePayload?.data ?? null;
 }
 
+function sanitizeGnomadDataset(rawValue) {
+  const clean = normalizeWhitespace(rawValue || "gnomad_r4");
+  return /^[A-Za-z0-9_]+$/.test(clean) ? clean : "gnomad_r4";
+}
+
+function sanitizeGnomadReferenceGenome(rawValue) {
+  const clean = normalizeWhitespace(rawValue || "GRCh38").toUpperCase();
+  return clean === "GRCH37" ? "GRCh37" : "GRCh38";
+}
+
+function mapGnomadConsequenceToTranscriptRegion(rawConsequence) {
+  const clean = normalizeWhitespace(rawConsequence || "").toLowerCase();
+  if (!clean) return "unavailable";
+  if (clean.includes("3_prime_utr")) return "3' UTR";
+  if (clean.includes("5_prime_utr")) return "5' UTR";
+  if (clean.includes("intron")) return "intron";
+  if (clean.includes("upstream_gene")) return "upstream region";
+  if (clean.includes("downstream_gene")) return "downstream region";
+  if (clean.includes("splice")) return "splice region";
+  if (clean.includes("missense") || clean.includes("synonymous") || clean.includes("stop") || clean.includes("start_") || clean.includes("frameshift")) {
+    return "coding region";
+  }
+  return clean.replace(/_/g, " ");
+}
+
+async function fetchGnomadGraphQL(query, variables = {}, { timeoutMs = 30000 } = {}) {
+  const payload = await fetchJsonWithRetry(GNOMAD_GRAPHQL_API, {
+    retries: 1,
+    timeoutMs,
+    maxBackoffMs: 2500,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  return requireGraphQLData(payload, "gnomAD");
+}
+
+async function fetchScreenGraphQL(query, variables = {}, { timeoutMs = 30000 } = {}) {
+  const payload = await fetchJsonWithRetry(SCREEN_GRAPHQL_API, {
+    retries: 1,
+    timeoutMs,
+    maxBackoffMs: 2500,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  return requireGraphQLData(payload, "SCREEN");
+}
+
+function normalizeScreenAssembly(rawValue) {
+  const clean = normalizeWhitespace(rawValue || "GRCh38").toLowerCase();
+  if (!clean || clean === "grch38" || clean === "hg38") return "GRCh38";
+  if (clean === "mm10") return "mm10";
+  return clean.toUpperCase() === "GRCH38" ? "GRCh38" : normalizeWhitespace(rawValue || "GRCh38");
+}
+
+function normalizeScreenBiosampleAssembly(rawValue) {
+  const normalized = normalizeScreenAssembly(rawValue);
+  return normalized === "GRCh38" ? "grch38" : normalized;
+}
+
+function normalizeScreenChromosome(rawValue) {
+  const clean = normalizeWhitespace(rawValue || "");
+  if (!clean) return "";
+  return clean.toLowerCase().startsWith("chr") ? clean : `chr${clean}`;
+}
+
+function normalizeScreenElementClass(rawValue) {
+  const clean = normalizeWhitespace(rawValue || "").toLowerCase();
+  if (!clean) return "";
+  if (clean.includes("pels") || clean.includes("proximal enhancer")) return "pELS";
+  if (clean.includes("dels") || clean.includes("distal enhancer")) return "dELS";
+  if (clean.includes("pls") || clean.includes("promoter")) return "PLS";
+  if (clean.includes("ctcf")) return "CTCF-only";
+  return clean.toUpperCase();
+}
+
+function normalizeScreenAssay(rawValue) {
+  const clean = normalizeWhitespace(rawValue || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  switch (clean) {
+    case "dnase":
+    case "dnasezscore":
+      return { label: "DNase", searchField: "dnase_zscore", biosampleAssay: "dnase" };
+    case "enhancer":
+    case "enhancerzscore":
+      return { label: "enhancer", searchField: "enhancer_zscore", biosampleAssay: "" };
+    case "promoter":
+    case "promoterzscore":
+      return { label: "promoter", searchField: "promoter_zscore", biosampleAssay: "" };
+    case "atac":
+    case "ataczscore":
+      return { label: "ATAC", searchField: "atac_zscore", biosampleAssay: "atac" };
+    case "ctcf":
+    case "ctcfzscore":
+      return { label: "CTCF", searchField: "ctcf_zscore", biosampleAssay: "ctcf" };
+    case "h3k4me3":
+    case "h3k4me3zscore":
+      return { label: "H3K4me3", searchField: "", biosampleAssay: "h3k4me3" };
+    case "h3k27ac":
+    case "h3k27aczscore":
+      return { label: "H3K27ac", searchField: "", biosampleAssay: "h3k27ac" };
+    default:
+      return null;
+  }
+}
+
+function screenDistanceToPoint(start, end, point) {
+  const left = Number(start);
+  const right = Number(end);
+  const anchor = Number(point);
+  if (!Number.isFinite(left) || !Number.isFinite(right) || !Number.isFinite(anchor)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const minCoord = Math.min(left, right);
+  const maxCoord = Math.max(left, right);
+  if (minCoord <= anchor && anchor <= maxCoord) return 0;
+  const middle = Math.floor((minCoord + maxCoord) / 2);
+  return Math.min(Math.abs(minCoord - anchor), Math.abs(maxCoord - anchor), Math.abs(middle - anchor));
+}
+
+function screenNearestGeneMatch(row, geneSymbol, geneId) {
+  const cleanSymbol = normalizeWhitespace(geneSymbol || "").toUpperCase();
+  const cleanGeneId = stripEnsemblVersion(geneId || "");
+  return asArray(row?.nearestgenes).some((entry) => {
+    const gene = normalizeWhitespace(entry?.gene || "");
+    if (!gene) return false;
+    return gene.toUpperCase() === cleanSymbol || stripEnsemblVersion(gene) === cleanGeneId;
+  });
+}
+
+function normalizeScreenCelltypeKey(value) {
+  return normalizeWhitespace(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function screenDisplaynameMatchesNodeCelltype(displayname, nodeCelltypes) {
+  const displayKey = normalizeScreenCelltypeKey(displayname);
+  if (!displayKey) return false;
+  return asArray(nodeCelltypes).some((celltype) => {
+    const nodeKey = normalizeScreenCelltypeKey(celltype);
+    if (!nodeKey) return false;
+    return displayKey === nodeKey || displayKey.startsWith(nodeKey) || nodeKey.startsWith(displayKey);
+  });
+}
+
+function countRegulomeDbUniqueMotifTargets(graphRows) {
+  return dedupeArray(
+    (graphRows || [])
+      .filter((row) => {
+        const method = normalizeWhitespace(row?.method || "");
+        return method === "PWMs" || method === "footprints";
+      })
+      .map((row) => normalizeWhitespace(row?.target_label || ""))
+      .filter(Boolean)
+  );
+}
+
+function extractDbSnpPopulationFrequencyRows(html) {
+  const rows = [];
+  const rowRegex = /<tr class="chi_row">([\s\S]*?)<\/tr>/gi;
+  let match;
+  while ((match = rowRegex.exec(String(html || ""))) !== null) {
+    const rowHtml = match[1];
+    const populationMatch = rowHtml.match(/<a[^>]*>([^<]+)<\/a>/i);
+    const refMatch = rowHtml.match(/class="popfreq_ref_allele">([^<]+)=([0-9.]+)/i);
+    const altMatch = rowHtml.match(/class="popfreq_alt_allele">([^<]+)=([0-9.]+)/i);
+    const population = normalizeWhitespace(decodeHtmlEntities(populationMatch?.[1] || ""));
+    if (!population) continue;
+    rows.push({
+      population,
+      refAllele: normalizeWhitespace(refMatch?.[1] || ""),
+      refAlleleFrequency: toFiniteNumber(refMatch?.[2], Number.NaN),
+      altAllele: normalizeWhitespace(altMatch?.[1] || ""),
+      altAlleleFrequency: toFiniteNumber(altMatch?.[2], Number.NaN),
+    });
+  }
+  return rows;
+}
+
 function renderStructuredResponse({ summary, keyFields = [], sources = [], limitations = [] }) {
   const fields =
     keyFields.length > 0
@@ -2424,6 +2610,43 @@ async function fetchDepMapSubtypeMatrix(releaseQuery = "") {
   return payload;
 }
 
+async function fetchDepMapOmicsProfiles(releaseQuery = "") {
+  const cacheKey = normalizeDepMapReleaseQuery(releaseQuery) || "LATEST";
+  const cached = getFreshCacheValue(depMapOmicsProfilesCache.get(cacheKey), 6 * 60 * 60 * 1000);
+  if (cached) return cached;
+
+  const catalogRows = await fetchDepMapDownloadCatalog();
+  const catalogRow = findDepMapCatalogRow(catalogRows, "OmicsProfiles.csv", releaseQuery);
+  if (!catalogRow?.url) {
+    throw new Error(`No DepMap OmicsProfiles.csv file was found for release "${releaseQuery || "latest"}".`);
+  }
+
+  const response = await fetchWithRetry(catalogRow.url, {
+    retries: 1,
+    timeoutMs: 45000,
+    maxBackoffMs: 5000,
+    headers: {
+      Accept: "text/csv",
+      "User-Agent": "Mozilla/5.0 research-mcp",
+    },
+  });
+  const rows = parseCsvObjects(await response.text());
+  const payload = {
+    rows,
+    release: normalizeWhitespace(catalogRow.release || cacheKey || "latest"),
+    sourceUrl: catalogRow.url,
+  };
+  depMapOmicsProfilesCache.set(cacheKey, storeCacheValue(null, payload));
+  return payload;
+}
+
+function normalizeDepMapSampleLookupToken(value) {
+  return normalizeWhitespace(value || "")
+    .replace(/\bSample\b/gi, "")
+    .replace(/[^A-Za-z0-9]+/g, "")
+    .toUpperCase();
+}
+
 function normalizeDepMapSubtypeLookupToken(value) {
   return normalizeWhitespace(value || "")
     .toLowerCase()
@@ -2521,6 +2744,12 @@ function resolveDepMapExpressionGeneColumn(headers, geneSymbol) {
   return candidates[0] || null;
 }
 
+function normalizeDepMapExpressionGeneLabel(label) {
+  const cleaned = normalizeWhitespace(label || "");
+  if (!cleaned) return "";
+  return cleaned.replace(/\s*\([^)]*\)\s*$/, "").trim();
+}
+
 async function computeDepMapExpressionSubsetMeanFromResponse(response, {
   modelIds,
   geneSymbol,
@@ -2606,6 +2835,100 @@ async function computeDepMapExpressionSubsetMeanFromResponse(response, {
   };
 }
 
+async function computeDepMapTopExpressionGeneFromResponse(response, {
+  modelId,
+  defaultProfileOnly = true,
+}) {
+  const reader = response?.body?.getReader?.();
+  if (!reader) {
+    throw new Error("DepMap expression response body is not stream-readable.");
+  }
+
+  const wantedModelId = normalizeWhitespace(modelId || "");
+  if (!wantedModelId) {
+    throw new Error("A DepMap ModelID is required to compute the top-expression gene.");
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let header = null;
+  let modelIndex = -1;
+  let defaultModelIndex = -1;
+  let geneStartIndex = 6;
+  let topGeneLabel = "";
+  let topGeneSymbol = "";
+  let topValue = Number.NEGATIVE_INFINITY;
+  let matched = false;
+
+  const processLine = (rawLine) => {
+    let line = String(rawLine || "");
+    if (!line) return;
+    if (line.endsWith("\r")) line = line.slice(0, -1);
+    if (!header) {
+      header = parseCsvLine(line).map((value) => normalizeWhitespace(value));
+      modelIndex = header.indexOf("ModelID");
+      defaultModelIndex = header.indexOf("IsDefaultEntryForModel");
+      const defaultMcIndex = header.indexOf("IsDefaultEntryForMC");
+      geneStartIndex = defaultMcIndex >= 0 ? defaultMcIndex + 1 : 6;
+      if (modelIndex < 0) {
+        throw new Error("Could not resolve ModelID in the selected DepMap expression file.");
+      }
+      return;
+    }
+
+    if (matched) return;
+    const cols = parseCsvLine(line);
+    const currentModelId = normalizeWhitespace(cols[modelIndex] || "");
+    if (currentModelId !== wantedModelId) {
+      return;
+    }
+    if (defaultProfileOnly && defaultModelIndex >= 0) {
+      const isDefault = ["1", "1.0", "true", "yes"].includes(String(cols[defaultModelIndex] || "").trim().toLowerCase());
+      if (!isDefault) {
+        return;
+      }
+    }
+
+    matched = true;
+    for (let index = geneStartIndex; index < cols.length && index < header.length; index += 1) {
+      const value = toFiniteNumber(cols[index], Number.NaN);
+      if (!Number.isFinite(value) || value <= topValue) continue;
+      topValue = value;
+      topGeneLabel = header[index] || "";
+      topGeneSymbol = normalizeDepMapExpressionGeneLabel(header[index] || "");
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex >= 0) {
+      processLine(buffer.slice(0, newlineIndex));
+      buffer = buffer.slice(newlineIndex + 1);
+      newlineIndex = buffer.indexOf("\n");
+    }
+
+    if (done) {
+      const tail = decoder.decode();
+      if (tail) buffer += tail;
+      break;
+    }
+  }
+
+  if (buffer.trim().length > 0) {
+    processLine(buffer);
+  }
+
+  return {
+    matched,
+    topGeneLabel,
+    topGeneSymbol,
+    topValue,
+  };
+}
+
 function buildDepMapExpressionSubsetMeanCacheKey({
   geneSymbol,
   subtypeCode,
@@ -2616,6 +2939,20 @@ function buildDepMapExpressionSubsetMeanCacheKey({
   return [
     normalizeWhitespace(geneSymbol || "").toUpperCase(),
     normalizeWhitespace(subtypeCode || ""),
+    normalizeDepMapReleaseQuery(release || "") || "LATEST",
+    normalizeWhitespace(expressionDataset || ""),
+    defaultProfileOnly ? "default" : "all",
+  ].join("::");
+}
+
+function buildDepMapSampleTopExpressionCacheKey({
+  sampleToken,
+  release,
+  expressionDataset,
+  defaultProfileOnly,
+}) {
+  return [
+    normalizeWhitespace(sampleToken || ""),
     normalizeDepMapReleaseQuery(release || "") || "LATEST",
     normalizeWhitespace(expressionDataset || ""),
     defaultProfileOnly ? "default" : "all",
@@ -9181,6 +9518,588 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "get_ensembl_transcripts_by_protein_length",
+  {
+    description:
+      "Resolve a gene symbol or Ensembl gene ID to transcript models and filter them by translated protein length. " +
+      "By default, excludes Havana-only transcript models so results stay aligned with the main Ensembl transcript set.",
+    inputSchema: {
+      identifier: z.string().describe("Gene symbol or Ensembl gene ID, e.g. 'KCNAB2' or 'ENSG00000069424'."),
+      species: z.string().optional().describe("Ensembl species name, e.g. 'human', 'homo_sapiens', or 'mouse'. Default human."),
+      assembly: z.enum(["GRCh38", "GRCh37"]).optional().describe("Human Ensembl assembly. Default GRCh38."),
+      minProteinLengthAa: z.number().int().min(1).describe("Minimum translated protein length in amino acids."),
+      maxProteinLengthAa: z.number().int().min(1).describe("Maximum translated protein length in amino acids."),
+      proteinCodingOnly: z.boolean().optional().default(true).describe("Restrict to protein_coding transcripts only."),
+      excludeHavanaOnly: z.boolean().optional().default(true).describe("Exclude transcript models whose source is exactly 'havana'."),
+    },
+  },
+  async ({
+    identifier,
+    species,
+    assembly,
+    minProteinLengthAa,
+    maxProteinLengthAa,
+    proteinCodingOnly = true,
+    excludeHavanaOnly = true,
+  }) => {
+    const rawIdentifier = normalizeWhitespace(identifier || "");
+    if (!rawIdentifier) {
+      return { content: [{ type: "text", text: "Provide a gene symbol or Ensembl gene ID." }] };
+    }
+
+    const normalizedSpecies = normalizeEnsemblSpecies(species);
+    const normalizedAssembly = normalizeWhitespace(assembly || "") || "GRCh38";
+    const minAa = Math.max(1, Math.round(Number(minProteinLengthAa || 0)));
+    const maxAa = Math.max(1, Math.round(Number(maxProteinLengthAa || 0)));
+    if (!Number.isFinite(minAa) || !Number.isFinite(maxAa) || minAa > maxAa) {
+      return {
+        content: [{
+          type: "text",
+          text: "Provide valid `minProteinLengthAa` and `maxProteinLengthAa` values, with minProteinLengthAa <= maxProteinLengthAa.",
+        }],
+      };
+    }
+
+    const lookupUrl = buildEnsemblLookupUrl({
+      identifier: rawIdentifier,
+      species: normalizedSpecies,
+      assembly: normalizedAssembly,
+    });
+
+    try {
+      const geneRecord = await fetchJsonWithRetry(lookupUrl, {
+        retries: 2,
+        timeoutMs: 20000,
+        maxBackoffMs: 3000,
+      });
+      const transcripts = Array.isArray(geneRecord?.Transcript) ? geneRecord.Transcript : [];
+      const geneId = normalizeWhitespace(geneRecord?.id || "") || rawIdentifier;
+      const geneSymbol = normalizeWhitespace(geneRecord?.display_name || rawIdentifier) || rawIdentifier;
+
+      const matches = transcripts
+        .map((tx) => {
+          const translation = tx?.Translation || null;
+          const proteinLengthAa = toNonNegativeInt(translation?.length, 0);
+          const source = normalizeWhitespace(tx?.source || "");
+          const transcriptId = normalizeWhitespace(tx?.id || "");
+          const version = toNonNegativeInt(tx?.version, 0);
+          return {
+            transcriptId,
+            transcriptVersion: version > 0 ? `${transcriptId}.${version}` : transcriptId,
+            displayName: normalizeWhitespace(tx?.display_name || ""),
+            biotype: normalizeWhitespace(tx?.biotype || ""),
+            source,
+            proteinLengthAa,
+          };
+        })
+        .filter((tx) => tx.transcriptId && tx.proteinLengthAa >= minAa && tx.proteinLengthAa <= maxAa)
+        .filter((tx) => !proteinCodingOnly || tx.biotype === "protein_coding")
+        .filter((tx) => !excludeHavanaOnly || tx.source !== "havana")
+        .sort((a, b) =>
+          a.proteinLengthAa - b.proteinLengthAa
+          || a.transcriptVersion.localeCompare(b.transcriptVersion, undefined, { numeric: true, sensitivity: "base" })
+        );
+
+      if (matches.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No Ensembl transcripts for ${geneSymbol} matched the requested ${minAa}-${maxAa} aa protein-length range.`,
+              keyFields: [
+                `Identifier: ${rawIdentifier}`,
+                `Gene: ${geneSymbol} (${geneId})`,
+                `Assembly: ${normalizedAssembly}`,
+                `Species: ${normalizedSpecies}`,
+                `Protein length filter: ${minAa}-${maxAa} aa`,
+                `Protein-coding only: ${proteinCodingOnly ? "yes" : "no"}`,
+                `Exclude Havana-only: ${excludeHavanaOnly ? "yes" : "no"}`,
+              ],
+              sources: [lookupUrl],
+              limitations: [
+                "Protein lengths come from transcript Translation.length in the Ensembl REST expanded gene record.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_ensembl_transcripts_by_protein_length.v1",
+            result_status: "not_found_or_empty",
+            identifier: rawIdentifier,
+            gene_id: geneId,
+            gene_symbol: geneSymbol,
+            species: normalizedSpecies,
+            assembly: normalizedAssembly,
+            min_protein_length_aa: minAa,
+            max_protein_length_aa: maxAa,
+            protein_coding_only: Boolean(proteinCodingOnly),
+            exclude_havana_only: Boolean(excludeHavanaOnly),
+            transcripts: [],
+            lookup_url: lookupUrl,
+          },
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Found ${matches.length} Ensembl transcript(s) for ${geneSymbol} with translated proteins in the ${minAa}-${maxAa} aa range.`,
+            keyFields: [
+              `Identifier: ${rawIdentifier}`,
+              `Gene: ${geneSymbol} (${geneId})`,
+              `Assembly: ${normalizedAssembly}`,
+              `Species: ${normalizedSpecies}`,
+              `Protein length filter: ${minAa}-${maxAa} aa`,
+              `Protein-coding only: ${proteinCodingOnly ? "yes" : "no"}`,
+              `Exclude Havana-only: ${excludeHavanaOnly ? "yes" : "no"}`,
+              ...matches.map(
+                (tx, idx) =>
+                  `${idx + 1}. ${tx.transcriptVersion}${tx.displayName ? ` (${tx.displayName})` : ""} | `
+                  + `Protein length: ${tx.proteinLengthAa} aa | Biotype: ${tx.biotype || "n/a"} | Source: ${tx.source || "n/a"}`
+              ),
+            ],
+            sources: [lookupUrl],
+            limitations: [
+              "Protein lengths come from transcript Translation.length in the Ensembl REST expanded gene record.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_ensembl_transcripts_by_protein_length.v1",
+          result_status: "ok",
+          identifier: rawIdentifier,
+          gene_id: geneId,
+          gene_symbol: geneSymbol,
+          species: normalizedSpecies,
+          assembly: normalizedAssembly,
+          min_protein_length_aa: minAa,
+          max_protein_length_aa: maxAa,
+          protein_coding_only: Boolean(proteinCodingOnly),
+          exclude_havana_only: Boolean(excludeHavanaOnly),
+          transcript_ids: matches.map((tx) => tx.transcriptVersion),
+          transcripts: matches.map((tx) => ({
+            transcript_id: tx.transcriptId,
+            transcript: tx.transcriptVersion,
+            display_name: tx.displayName || null,
+            biotype: tx.biotype || null,
+            source: tx.source || null,
+            protein_length_aa: tx.proteinLengthAa,
+          })),
+          lookup_url: lookupUrl,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error fetching Ensembl transcript lengths: ${detail}` }],
+        structuredContent: {
+          schema: "get_ensembl_transcripts_by_protein_length.v1",
+          result_status: "error",
+          identifier: rawIdentifier,
+          species: normalizedSpecies,
+          assembly: normalizedAssembly,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "get_screen_nearest_ccre_assay",
+  {
+    description:
+      "For a human gene, find the nearest SCREEN cCRE of a requested class to the Ensembl canonical transcript TSS and return the requested SCREEN score field. " +
+      "Prefer this for questions like the DNase value of the nearest proximal enhancer (pELS) peak for a gene.",
+    inputSchema: {
+      geneIdentifier: z.string().describe("Gene symbol or Ensembl gene ID, e.g. 'HTRA1' or 'ENSG00000166033'."),
+      ccreClass: z.string().describe("Requested SCREEN cCRE class, e.g. 'pELS', 'proximal enhancer', 'PLS', or 'dELS'."),
+      assay: z.enum(["DNase", "enhancer", "promoter", "ATAC", "CTCF"]).describe("SCREEN score field to report from cCRESCREENSearch."),
+      assembly: z.enum(["GRCh38"]).optional().default("GRCh38").describe("SCREEN human assembly (default GRCh38)."),
+      species: z.string().optional().default("human").describe("Species for Ensembl gene resolution (default human)."),
+      searchRadiusBp: z.number().int().min(100).max(100000).optional().default(10000).describe("Window around the canonical TSS to scan for SCREEN cCREs (default 10000 bp)."),
+    },
+  },
+  async ({ geneIdentifier, ccreClass, assay, assembly = "GRCh38", species = "human", searchRadiusBp = 10000 }) => {
+    const cleanIdentifier = normalizeWhitespace(geneIdentifier || "");
+    const normalizedClass = normalizeScreenElementClass(ccreClass);
+    const assayInfo = normalizeScreenAssay(assay);
+    const normalizedAssembly = normalizeScreenAssembly(assembly);
+    const normalizedSpecies = normalizeEnsemblSpecies(species);
+    const radius = Math.max(100, Math.min(100000, Math.round(Number(searchRadiusBp || 10000))));
+
+    if (!cleanIdentifier || !normalizedClass || !assayInfo?.searchField) {
+      return {
+        content: [{ type: "text", text: "Provide `geneIdentifier`, a SCREEN cCRE class such as `pELS`, and an assay of DNase/enhancer/promoter/ATAC/CTCF." }],
+      };
+    }
+
+    try {
+      const lookupUrl = buildEnsemblLookupUrl({
+        identifier: cleanIdentifier,
+        species: normalizedSpecies,
+        assembly: normalizedAssembly,
+      });
+      const geneRecord = await fetchJsonWithRetry(lookupUrl, {
+        retries: 2,
+        timeoutMs: 20000,
+        maxBackoffMs: 3000,
+      });
+      const canonicalTranscript = resolveCanonicalTranscript(geneRecord);
+      if (!canonicalTranscript) {
+        return {
+          content: [{ type: "text", text: `Ensembl did not return a canonical transcript for ${cleanIdentifier}.` }],
+          structuredContent: {
+            schema: "get_screen_nearest_ccre_assay.v1",
+            result_status: "not_found_or_empty",
+            gene_identifier: cleanIdentifier,
+            assembly: normalizedAssembly,
+          },
+        };
+      }
+
+      const transcriptStart = Number(canonicalTranscript?.start);
+      const transcriptEnd = Number(canonicalTranscript?.end);
+      const transcriptStrand = Number(canonicalTranscript?.strand);
+      const chromosome = normalizeScreenChromosome(canonicalTranscript?.seq_region_name || geneRecord?.seq_region_name || "");
+      const canonicalTss = transcriptStrand >= 0 ? transcriptStart : transcriptEnd;
+      const geneSymbol = normalizeWhitespace(geneRecord?.display_name || cleanIdentifier) || cleanIdentifier;
+      const geneId = normalizeWhitespace(geneRecord?.id || "") || null;
+      const canonicalTranscriptId = normalizeWhitespace(geneRecord?.canonical_transcript || canonicalTranscript?.id || "") || null;
+      if (!chromosome || !Number.isFinite(canonicalTss)) {
+        throw new Error("Canonical transcript coordinates were incomplete.");
+      }
+
+      const coordinates = [{
+        chromosome,
+        start: Math.max(0, canonicalTss - radius),
+        end: canonicalTss + radius,
+      }];
+      const searchQuery = `
+        query ScreenGeneNearbyQuery($assembly: String!, $coordinates: [GenomicRangeInput]) {
+          cCRESCREENSearch(assembly: $assembly, coordinates: $coordinates, nearbygeneslimit: 3) {
+            chrom
+            start
+            len
+            pct
+            dnase_zscore
+            enhancer_zscore
+            promoter_zscore
+            ctcf_zscore
+            atac_zscore
+            info {
+              accession
+              isproximal
+              concordant
+            }
+            nearestgenes {
+              gene
+              distance
+            }
+          }
+        }
+      `;
+      const screenData = await fetchScreenGraphQL(searchQuery, {
+        assembly: normalizedAssembly,
+        coordinates,
+      }, { timeoutMs: 30000 });
+      const rows = asArray(screenData?.cCRESCREENSearch)
+        .map((row) => {
+          const start = Number(row?.start);
+          const len = Number(row?.len);
+          const end = Number.isFinite(start) && Number.isFinite(len) ? start + len : Number.NaN;
+          const assayValue = toFiniteNumber(row?.[assayInfo.searchField], Number.NaN);
+          return {
+            accession: normalizeWhitespace(row?.info?.accession || ""),
+            classLabel: normalizeWhitespace(row?.pct || ""),
+            chrom: normalizeWhitespace(row?.chrom || ""),
+            start,
+            end,
+            assayValue,
+            assayLabel: assayInfo.label,
+            isProximal: Boolean(row?.info?.isproximal),
+            concordant: Boolean(row?.info?.concordant),
+            nearestgenes: asArray(row?.nearestgenes),
+          };
+        })
+        .filter((row) => row.accession && row.classLabel === normalizedClass && Number.isFinite(row.assayValue))
+        .filter((row) => screenNearestGeneMatch(row, geneSymbol, geneId))
+        .map((row) => ({
+          ...row,
+          distance_to_canonical_tss: screenDistanceToPoint(row.start, row.end, canonicalTss),
+        }))
+        .sort((a, b) =>
+          a.distance_to_canonical_tss - b.distance_to_canonical_tss
+          || a.start - b.start
+          || a.accession.localeCompare(b.accession, undefined, { numeric: true, sensitivity: "base" })
+        );
+
+      const top = rows[0] || null;
+      if (!top) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `SCREEN did not return a ${normalizedClass} cCRE linked to ${geneSymbol} within ${radius} bp of the canonical TSS.`,
+              keyFields: [
+                `Gene: ${geneSymbol}${geneId ? ` (${geneId})` : ""}`,
+                canonicalTranscriptId ? `Canonical transcript: ${canonicalTranscriptId}` : "",
+                `Canonical TSS: ${chromosome}:${canonicalTss}`,
+                `Requested cCRE class: ${normalizedClass}`,
+                `Requested assay: ${assayInfo.label}`,
+                `Search radius: ${radius} bp`,
+              ],
+              sources: [lookupUrl, SCREEN_GRAPHQL_API],
+              limitations: [
+                "This lookup uses the Ensembl canonical transcript TSS and filters SCREEN nearby cCREs to the requested class.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_screen_nearest_ccre_assay.v1",
+            result_status: "not_found_or_empty",
+            gene_identifier: cleanIdentifier,
+            gene_symbol: geneSymbol,
+            gene_id: geneId,
+            canonical_transcript: canonicalTranscriptId,
+            canonical_tss_1based: canonicalTss,
+            chromosome,
+            ccre_class: normalizedClass,
+            assay: assayInfo.label,
+            search_radius_bp: radius,
+            candidates: [],
+            lookup_url: lookupUrl,
+            source_url: SCREEN_GRAPHQL_API,
+          },
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Nearest ${normalizedClass} SCREEN cCRE to the canonical ${geneSymbol} TSS is ${top.accession}, with ${assayInfo.label} score ${top.assayValue}.`,
+            keyFields: [
+              `Gene: ${geneSymbol}${geneId ? ` (${geneId})` : ""}`,
+              canonicalTranscriptId ? `Canonical transcript: ${canonicalTranscriptId}` : "",
+              `Canonical TSS: ${chromosome}:${canonicalTss}`,
+              `Nearest ${normalizedClass}: ${top.accession}`,
+              `Coordinates: ${top.chrom}:${top.start}-${top.end}`,
+              `${assayInfo.label} score: ${top.assayValue}`,
+              `Distance to canonical TSS: ${top.distance_to_canonical_tss} bp`,
+              `Search radius: ${radius} bp`,
+            ],
+            sources: [lookupUrl, SCREEN_GRAPHQL_API],
+            limitations: [
+              "Distance is computed to the Ensembl canonical transcript TSS using the same interval-to-TSS heuristic SCREEN uses on nearby-cCRE views (closest of start, end, or midpoint).",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_screen_nearest_ccre_assay.v1",
+          result_status: "ok",
+          gene_identifier: cleanIdentifier,
+          gene_symbol: geneSymbol,
+          gene_id: geneId,
+          canonical_transcript: canonicalTranscriptId,
+          canonical_tss_1based: canonicalTss,
+          chromosome,
+          ccre_class: normalizedClass,
+          assay: assayInfo.label,
+          search_radius_bp: radius,
+          nearest_ccre: {
+            accession: top.accession,
+            class_label: top.classLabel,
+            chrom: top.chrom,
+            start: top.start,
+            end: top.end,
+            assay_score: top.assayValue,
+            distance_to_canonical_tss: top.distance_to_canonical_tss,
+            is_proximal: top.isProximal,
+            concordant: top.concordant,
+          },
+          candidates: rows.slice(0, 10),
+          lookup_url: lookupUrl,
+          source_url: SCREEN_GRAPHQL_API,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error in get_screen_nearest_ccre_assay: ${detail}` }],
+        structuredContent: {
+          schema: "get_screen_nearest_ccre_assay.v1",
+          result_status: "error",
+          gene_identifier: cleanIdentifier,
+          ccre_class: normalizedClass || null,
+          assay: assayInfo?.label || assay,
+          assembly: normalizedAssembly,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "get_screen_ccre_top_celltype_assay",
+  {
+    description:
+      "For a human SCREEN cCRE accession, find the cell type with the highest requested assay Z-score from SCREEN biosample data. " +
+      "By default, restricts to the cCRE's node cell types from `getcCRENodeCelltypes`, which matches the main SCREEN cCRE detail view.",
+    inputSchema: {
+      accession: z.string().describe("SCREEN cCRE accession such as 'EH38E1864119'."),
+      assay: z.enum(["DNase", "H3K4me3", "H3K27ac", "ATAC", "CTCF"]).describe("Assay whose SCREEN biosample Z-score should be ranked."),
+      assembly: z.enum(["GRCh38"]).optional().default("GRCh38").describe("SCREEN human assembly (default GRCh38)."),
+      restrictToNodeCelltypes: z.boolean().optional().default(true).describe("Restrict ranking to SCREEN node cell types for this cCRE (default true)."),
+    },
+  },
+  async ({ accession, assay, assembly = "GRCh38", restrictToNodeCelltypes = true }) => {
+    const cleanAccession = normalizeWhitespace(accession || "");
+    const assayInfo = normalizeScreenAssay(assay);
+    const biosampleAssembly = normalizeScreenBiosampleAssembly(assembly);
+    if (!cleanAccession || !assayInfo?.biosampleAssay) {
+      return {
+        content: [{ type: "text", text: "Provide a SCREEN cCRE accession and one assay from DNase/H3K4me3/H3K27ac/ATAC/CTCF." }],
+      };
+    }
+
+    try {
+      const [nodeCelltypeData, biosampleData] = await Promise.all([
+        fetchScreenGraphQL(
+          `query ScreenNodeCelltypes($accession: String!) {
+            getcCRENodeCelltypes(accession: $accession)
+          }`,
+          { accession: cleanAccession },
+          { timeoutMs: 20000 },
+        ).catch(() => ({ getcCRENodeCelltypes: [] })),
+        fetchScreenGraphQL(
+          `query ScreenBiosampleScores($assembly: String!, $accession: [String!]) {
+            ccREBiosampleQuery(assembly: $assembly) {
+              biosamples {
+                sampleType
+                displayname
+                lifeStage
+                name
+                ontology
+                cCREZScores(accession: $accession) {
+                  score
+                  assay
+                  experiment_accession
+                }
+              }
+            }
+          }`,
+          { assembly: biosampleAssembly, accession: [cleanAccession] },
+          { timeoutMs: 120000 },
+        ),
+      ]);
+
+      const nodeCelltypes = asArray(nodeCelltypeData?.getcCRENodeCelltypes).map((value) => normalizeWhitespace(value)).filter(Boolean);
+      const candidates = asArray(biosampleData?.ccREBiosampleQuery?.biosamples)
+        .map((row) => {
+          const scoreRow = asArray(row?.cCREZScores).find((entry) => normalizeWhitespace(entry?.assay || "").toLowerCase() === assayInfo.biosampleAssay);
+          const score = toFiniteNumber(scoreRow?.score, Number.NaN);
+          return {
+            displayname: normalizeWhitespace(row?.displayname || ""),
+            biosample_name: normalizeWhitespace(row?.name || ""),
+            ontology: normalizeWhitespace(row?.ontology || "") || null,
+            sample_type: normalizeWhitespace(row?.sampleType || "") || null,
+            life_stage: normalizeWhitespace(row?.lifeStage || "") || null,
+            assay: assayInfo.label,
+            score,
+            experiment_accession: normalizeWhitespace(scoreRow?.experiment_accession || "") || null,
+          };
+        })
+        .filter((row) => row.displayname && Number.isFinite(row.score))
+        .filter((row) => !restrictToNodeCelltypes || nodeCelltypes.length === 0 || screenDisplaynameMatchesNodeCelltype(row.displayname, nodeCelltypes))
+        .sort((a, b) =>
+          b.score - a.score
+          || a.displayname.localeCompare(b.displayname, undefined, { sensitivity: "base", numeric: true })
+        );
+
+      const top = candidates[0] || null;
+      if (!top) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `SCREEN did not return a ${assayInfo.label} biosample score for ${cleanAccession}.`,
+              keyFields: [
+                `cCRE accession: ${cleanAccession}`,
+                `Assay: ${assayInfo.label}`,
+                `Assembly: ${biosampleAssembly}`,
+                restrictToNodeCelltypes ? `Node cell types: ${nodeCelltypes.length > 0 ? nodeCelltypes.join(", ") : "none reported"}` : "Node-cell-type restriction: disabled",
+              ],
+              sources: [SCREEN_GRAPHQL_API],
+              limitations: [
+                "This lookup uses `ccREBiosampleQuery` with assembly `grch38`; uppercase assembly strings currently fail on the public SCREEN API.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_screen_ccre_top_celltype_assay.v1",
+            result_status: "not_found_or_empty",
+            accession: cleanAccession,
+            assay: assayInfo.label,
+            restrict_to_node_celltypes: Boolean(restrictToNodeCelltypes),
+            node_celltypes: nodeCelltypes,
+            candidates: [],
+            source_url: SCREEN_GRAPHQL_API,
+          },
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Highest ${assayInfo.label} SCREEN cell type for ${cleanAccession} is ${top.displayname} with score ${top.score}.`,
+            keyFields: [
+              `cCRE accession: ${cleanAccession}`,
+              `Assay: ${assayInfo.label}`,
+              `Top cell type: ${top.displayname}`,
+              `Score: ${top.score}`,
+              top.experiment_accession ? `Experiment accession: ${top.experiment_accession}` : null,
+              top.ontology ? `Ontology / tissue: ${top.ontology}` : null,
+              top.sample_type ? `Sample type: ${top.sample_type}` : null,
+              restrictToNodeCelltypes ? `Node cell types: ${nodeCelltypes.join(", ")}` : "Node-cell-type restriction: disabled",
+            ].filter(Boolean),
+            sources: [SCREEN_GRAPHQL_API],
+            limitations: [
+              "When node-cell-type restriction is enabled, ranking is limited to biosamples whose display names match SCREEN's cCRE node cell types.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_screen_ccre_top_celltype_assay.v1",
+          result_status: "ok",
+          accession: cleanAccession,
+          assay: assayInfo.label,
+          restrict_to_node_celltypes: Boolean(restrictToNodeCelltypes),
+          node_celltypes: nodeCelltypes,
+          top_celltype: top,
+          candidates: candidates.slice(0, 25),
+          source_url: SCREEN_GRAPHQL_API,
+        },
+      };
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown error", 220);
+      return {
+        content: [{ type: "text", text: `Error in get_screen_ccre_top_celltype_assay: ${detail}` }],
+        structuredContent: {
+          schema: "get_screen_ccre_top_celltype_assay.v1",
+          result_status: "error",
+          accession: cleanAccession,
+          assay: assayInfo?.label || assay,
+          error: detail,
+        },
+      };
+    }
+  }
+);
+
 // ============================================
 // ENCODE Portal REST API (www.encodeproject.org)
 // ============================================
@@ -10195,6 +11114,193 @@ server.registerTool(
       return {
         content: [{ type: "text", text: `Error in advanced PubMed search: ${formatPubmedToolError(error)}` }],
       };
+    }
+  }
+);
+
+server.registerTool(
+  "get_ena_experiment_profile",
+  {
+    description:
+      "Fetch ENA experiment metadata for one experiment accession (ERX...), including sequencing strategy, layout, and instrument model. " +
+      "Prefer this for ENA questions about technique and instrument.",
+    inputSchema: {
+      experimentAccession: z.string().describe("ENA experiment accession, e.g. 'ERX2290523'."),
+    },
+  },
+  async ({ experimentAccession }) => {
+    const accession = normalizeWhitespace(experimentAccession || "").toUpperCase();
+    if (!accession) {
+      return { content: [{ type: "text", text: "Provide an ENA experiment accession such as ERX2290523." }] };
+    }
+
+    const params = new URLSearchParams({
+      accession,
+      result: "read_experiment",
+      fields: [
+        "experiment_accession",
+        "run_accession",
+        "instrument_platform",
+        "instrument_model",
+        "library_strategy",
+        "library_source",
+        "library_selection",
+        "library_layout",
+      ].join(","),
+      format: "json",
+    });
+    const url = `${ENA_PORTAL_API}/filereport?${params.toString()}`;
+
+    try {
+      const rows = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 15000, maxBackoffMs: 2500 });
+      const row = Array.isArray(rows) ? rows[0] : null;
+      if (!row) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `ENA returned no experiment metadata for ${accession}.`,
+              keyFields: [`Experiment accession: ${accession}`],
+              sources: [url],
+              limitations: ["Confirm that the accession is an ENA experiment accession (ERX...)."],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_ena_experiment_profile.v1",
+            result_status: "not_found_or_empty",
+            experiment_accession: accession,
+            source_url: url,
+          },
+        };
+      }
+
+      const instrumentModel = normalizeWhitespace(row?.instrument_model || "");
+      const layout = normalizeWhitespace(row?.library_layout || "").toUpperCase();
+      const strategy = normalizeWhitespace(row?.library_strategy || "");
+      const layoutText = layout === "PAIRED" ? "paired end sequencing" : layout === "SINGLE" ? "single end sequencing" : "";
+      const techniqueAndInstrument = [instrumentModel, layoutText].filter(Boolean).join(" ").trim()
+        || [strategy, instrumentModel].filter(Boolean).join(" on ").trim()
+        || instrumentModel
+        || strategy;
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `ENA experiment ${accession}: ${techniqueAndInstrument || "experiment metadata retrieved"}.`,
+            keyFields: [
+              `Experiment accession: ${accession}`,
+              normalizeWhitespace(row?.run_accession || "") ? `Run accession: ${normalizeWhitespace(row.run_accession)}` : "",
+              strategy ? `Library strategy: ${strategy}` : "",
+              normalizeWhitespace(row?.library_source || "") ? `Library source: ${normalizeWhitespace(row.library_source)}` : "",
+              normalizeWhitespace(row?.library_selection || "") ? `Library selection: ${normalizeWhitespace(row.library_selection)}` : "",
+              layout ? `Library layout: ${layout}` : "",
+              instrumentModel ? `Instrument model: ${instrumentModel}` : "",
+              normalizeWhitespace(row?.instrument_platform || "") ? `Instrument platform: ${normalizeWhitespace(row.instrument_platform)}` : "",
+              techniqueAndInstrument ? `Technique and instrument: ${techniqueAndInstrument}` : "",
+            ].filter(Boolean),
+            sources: [url],
+            limitations: [
+              "Technique-and-instrument phrasing is synthesized from ENA library strategy/layout plus instrument model.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_ena_experiment_profile.v1",
+          result_status: "ok",
+          experiment_accession: accession,
+          run_accession: normalizeWhitespace(row?.run_accession || "") || null,
+          instrument_platform: normalizeWhitespace(row?.instrument_platform || "") || null,
+          instrument_model: instrumentModel || null,
+          library_strategy: strategy || null,
+          library_source: normalizeWhitespace(row?.library_source || "") || null,
+          library_selection: normalizeWhitespace(row?.library_selection || "") || null,
+          library_layout: layout || null,
+          technique_and_instrument: techniqueAndInstrument || null,
+          source_url: url,
+        },
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error in get_ena_experiment_profile: ${error.message}` }] };
+    }
+  }
+);
+
+server.registerTool(
+  "get_emdb_entry_metadata",
+  {
+    description:
+      "Fetch EMDB entry metadata for one accession (EMD-...), including vitrification cryogen and related specimen-preparation details when available.",
+    inputSchema: {
+      accession: z.string().describe("EMDB accession, e.g. 'EMD-48324'."),
+    },
+  },
+  async ({ accession }) => {
+    const normalizedAccession = normalizeWhitespace(accession || "").toUpperCase();
+    if (!normalizedAccession) {
+      return { content: [{ type: "text", text: "Provide an EMDB accession such as EMD-48324." }] };
+    }
+
+    const url = `${EMDB_API}/entry/${encodeURIComponent(normalizedAccession)}`;
+    try {
+      const data = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 20000, maxBackoffMs: 3000 });
+      const specimenPreparation =
+        data?.structure_determination_list?.structure_determination?.[0]?.specimen_preparation_list?.specimen_preparation?.[0]
+        || null;
+      const microscopy =
+        data?.structure_determination_list?.structure_determination?.[0]?.microscopy_list?.microscopy?.[0]
+        || null;
+      const vitrificationCryogen = normalizeWhitespace(specimenPreparation?.vitrification?.cryogen_name || "");
+      const holderCryogen = normalizeWhitespace(microscopy?.cooling_holder_cryogen || "");
+
+      if (!vitrificationCryogen && !holderCryogen) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `EMDB entry ${normalizedAccession} was retrieved, but no cryogen metadata was exposed in the parsed specimen-preparation fields.`,
+              keyFields: [`Accession: ${normalizedAccession}`],
+              sources: [url],
+              limitations: ["Not every EMDB entry exposes vitrification or holder cryogen fields in the public API."],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_emdb_entry_metadata.v1",
+            result_status: "degraded",
+            accession: normalizedAccession,
+            source_url: url,
+          },
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `EMDB entry ${normalizedAccession}: vitrification cryogen ${vitrificationCryogen || "n/a"}.`,
+            keyFields: [
+              `Accession: ${normalizedAccession}`,
+              vitrificationCryogen ? `Cryopreservative / vitrification cryogen: ${vitrificationCryogen}` : "",
+              holderCryogen ? `Microscopy cooling-holder cryogen: ${holderCryogen}` : "",
+            ].filter(Boolean),
+            sources: [url],
+            limitations: [
+              "EMDB exposes multiple cryogen-related fields; vitrification cryogen is the most direct storage/preservation field when present.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_emdb_entry_metadata.v1",
+          result_status: "ok",
+          accession: normalizedAccession,
+          cryopreservative: vitrificationCryogen || null,
+          vitrification_cryogen: vitrificationCryogen || null,
+          cooling_holder_cryogen: holderCryogen || null,
+          source_url: url,
+        },
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error in get_emdb_entry_metadata: ${error.message}` }] };
     }
   }
 );
@@ -11956,6 +13062,117 @@ server.registerTool(
       };
     } catch (error) {
       return { content: [{ type: "text", text: `Error in get_guidetopharmacology_target: ${error.message}` }] };
+    }
+  }
+);
+
+server.registerTool(
+  "get_gtopdb_ligand_reference",
+  {
+    description:
+      "Fetch Guide to Pharmacology (GtoPdb) interaction references for one ligand and return the earliest or latest cited reference title. " +
+      "Prefer this for questions about cited references for a known ligand ID.",
+    inputSchema: {
+      ligandId: z.string().describe("Guide to Pharmacology ligand ID, e.g. '11429'."),
+      order: z.enum(["earliest", "latest"]).optional().default("earliest")
+        .describe("Whether to return the earliest or latest cited reference by publication year."),
+    },
+  },
+  async ({ ligandId, order = "earliest" }) => {
+    const cleanLigandId = normalizeWhitespace(ligandId || "");
+    if (!cleanLigandId) {
+      return { content: [{ type: "text", text: "Provide a Guide to Pharmacology ligand ID such as 11429." }] };
+    }
+
+    const url = `${GTOPDB_API}/ligands/${encodeURIComponent(cleanLigandId)}/interactions`;
+    try {
+      const interactions = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 15000, maxBackoffMs: 2500 });
+      const refs = [];
+      for (const row of Array.isArray(interactions) ? interactions : []) {
+        for (const ref of Array.isArray(row?.refs) ? row.refs : []) {
+          const referenceId = toNonNegativeInt(ref?.referenceId, 0);
+          const articleTitle = normalizeWhitespace(ref?.articleTitle || "");
+          const year = toNonNegativeInt(ref?.year, 0);
+          if (!referenceId || !articleTitle) continue;
+          refs.push({
+            referenceId,
+            articleTitle,
+            year,
+            journal: normalizeWhitespace(ref?.title || ""),
+            pmid: normalizeWhitespace(ref?.pmid || ""),
+          });
+        }
+      }
+
+      const uniqueRefs = Array.from(new Map(
+        refs.map((ref) => [`${ref.referenceId}|${ref.articleTitle}`, ref])
+      ).values());
+      uniqueRefs.sort((a, b) => {
+        const yearA = a.year || (order === "earliest" ? Number.MAX_SAFE_INTEGER : 0);
+        const yearB = b.year || (order === "earliest" ? Number.MAX_SAFE_INTEGER : 0);
+        if (yearA !== yearB) {
+          return order === "earliest" ? yearA - yearB : yearB - yearA;
+        }
+        return order === "earliest" ? a.referenceId - b.referenceId : b.referenceId - a.referenceId;
+      });
+
+      const chosen = uniqueRefs[0] || null;
+      if (!chosen) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Guide to Pharmacology returned no cited references for ligand ${cleanLigandId}.`,
+              keyFields: [`Ligand ID: ${cleanLigandId}`],
+              sources: [url],
+              limitations: ["Some ligands may not have interaction-linked references in the Guide to Pharmacology API."],
+            }),
+          }],
+          structuredContent: {
+            schema: "get_gtopdb_ligand_reference.v1",
+            result_status: "not_found_or_empty",
+            ligand_id: cleanLigandId,
+            order,
+            source_url: url,
+          },
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Guide to Pharmacology ligand ${cleanLigandId}: ${order} cited reference is "${chosen.articleTitle}".`,
+            keyFields: [
+              `Ligand ID: ${cleanLigandId}`,
+              `Selected order: ${order}`,
+              `Reference ID: ${chosen.referenceId}`,
+              chosen.year ? `Year: ${chosen.year}` : "",
+              chosen.pmid ? `PMID: ${chosen.pmid}` : "",
+              chosen.journal ? `Journal: ${chosen.journal}` : "",
+              `Article title: ${chosen.articleTitle}`,
+            ].filter(Boolean),
+            sources: [url],
+            limitations: [
+              "Reference ordering is based on publication year first, then Guide to Pharmacology reference ID as a deterministic tie-breaker.",
+            ],
+          }),
+        }],
+        structuredContent: {
+          schema: "get_gtopdb_ligand_reference.v1",
+          result_status: "ok",
+          ligand_id: cleanLigandId,
+          order,
+          reference_id: chosen.referenceId,
+          publication_year: chosen.year || null,
+          pmid: chosen.pmid || null,
+          journal: chosen.journal || null,
+          article_title: chosen.articleTitle,
+          source_url: url,
+        },
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error in get_gtopdb_ligand_reference: ${error.message}` }] };
     }
   }
 );
@@ -14859,6 +16076,29 @@ function pickBestGwasStudyVariantAssociation(associations, variantId, riskAllele
   return best;
 }
 
+function pickExtremeGwasStudyRiskAllele(associations, mode = "highest_pvalue") {
+  const candidates = [];
+  for (const association of Array.isArray(associations) ? associations : []) {
+    const pValue = toFiniteNumber(association?.pvalue, Number.NaN);
+    if (!Number.isFinite(pValue)) continue;
+    for (const risk of extractGwasAssociationRiskAlleles(association)) {
+      candidates.push({
+        association,
+        risk,
+        pValue,
+      });
+    }
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => {
+    if (a.pValue !== b.pValue) {
+      return mode === "lowest_pvalue" ? a.pValue - b.pValue : b.pValue - a.pValue;
+    }
+    return a.risk.risk_allele_name.localeCompare(b.risk.risk_allele_name, undefined, { numeric: true, sensitivity: "base" });
+  });
+  return candidates[0] || null;
+}
+
 function rankJasparMatrixCandidate(candidate, tfName, speciesTaxId) {
   const name = normalizeWhitespace(candidate?.name || "");
   const species = Array.isArray(candidate?.species) ? candidate.species : [];
@@ -15180,6 +16420,148 @@ server.registerTool(
 );
 
 server.registerTool(
+  "get_gwas_study_top_risk_allele",
+  {
+    description:
+      "Scan one GWAS Catalog study accession and return the risk allele from the association row with the highest or lowest numeric p-value. " +
+      "Defaults to the lowest numeric p-value (the lead / most-significant association) unless `rankBy` is overridden.",
+    inputSchema: {
+      studyAccession: z.string().describe("GWAS Catalog study accession (for example 'GCST005528')."),
+      rankBy: z.enum(["highest_pvalue", "lowest_pvalue"]).optional().default("lowest_pvalue")
+        .describe("Whether to return the risk allele from the row with the highest or lowest numeric p-value."),
+      pageSize: z.number().int().min(25).max(2000).optional().default(500).describe("How many study associations to scan per page."),
+      maxPages: z.number().int().min(1).max(20).optional().default(8).describe("Maximum pages to scan before giving up."),
+    },
+  },
+  async ({ studyAccession, rankBy = "lowest_pvalue", pageSize = 500, maxPages = 8 }) => {
+    const cleanStudy = normalizeWhitespace(studyAccession || "").toUpperCase();
+    if (!cleanStudy) {
+      return { content: [{ type: "text", text: "Provide a GWAS Catalog study accession such as GCST005528." }] };
+    }
+
+    const boundedPageSize = Math.max(25, Math.min(2000, Math.round(pageSize || 500)));
+    const boundedMaxPages = Math.max(1, Math.min(20, Math.round(maxPages || 8)));
+    const scannedUrls = [];
+    let best = null;
+
+    for (let pageIndex = 0; pageIndex < boundedMaxPages; pageIndex += 1) {
+      const params = new URLSearchParams({
+        projection: "associationByStudy",
+        size: String(boundedPageSize),
+        page: String(pageIndex),
+      });
+      const url = `${GWAS_CATALOG_LEGACY_API}/studies/${encodeURIComponent(cleanStudy)}/associations?${params}`;
+      scannedUrls.push(url);
+
+      let data;
+      try {
+        data = await fetchJsonWithRetry(url, {
+          headers: { Accept: "application/json" },
+          retries: 1,
+          timeoutMs: 20000,
+          maxBackoffMs: 2500,
+        });
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: renderStructuredResponse({
+            summary: `GWAS Catalog study scan failed: ${err.message}`,
+            keyFields: [`Study: ${cleanStudy}`],
+            sources: scannedUrls,
+            limitations: ["The legacy GWAS Catalog study-association endpoint may be temporarily unavailable."],
+          }) }],
+        };
+      }
+
+      const associations = Array.isArray(data?._embedded?.associations) ? data._embedded.associations : [];
+      const pageBest = pickExtremeGwasStudyRiskAllele(associations, rankBy);
+      if (pageBest) {
+        if (!best) {
+          best = pageBest;
+        } else if (
+          (rankBy === "lowest_pvalue" && pageBest.pValue < best.pValue)
+          || (rankBy !== "lowest_pvalue" && pageBest.pValue > best.pValue)
+          || (
+            pageBest.pValue === best.pValue
+            && pageBest.risk.risk_allele_name.localeCompare(best.risk.risk_allele_name, undefined, { numeric: true, sensitivity: "base" }) < 0
+          )
+        ) {
+          best = pageBest;
+        }
+      }
+
+      const totalPages = toNonNegativeInt(data?.page?.totalPages, 0);
+      if (totalPages > 0 && pageIndex + 1 >= totalPages) {
+        break;
+      }
+      if (associations.length < boundedPageSize) {
+        break;
+      }
+    }
+
+    if (!best) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No GWAS Catalog association rows with numeric p-values were recovered for study ${cleanStudy}.`,
+          keyFields: [`Study: ${cleanStudy}`],
+          sources: scannedUrls,
+          limitations: [
+            "Study-level association pages were scanned from the legacy GWAS Catalog API because equivalent study+row details are not exposed by the v2 search endpoints.",
+          ],
+        }) }],
+      };
+    }
+
+    const association = best.association || {};
+    const risk = best.risk || {};
+    const study = association?.study || {};
+    const resolvedTrait = normalizeWhitespace(
+      study?.diseaseTrait?.trait
+      || (Array.isArray(association?.efoTraits) ? association.efoTraits[0]?.trait : "")
+    );
+    const studyUrl = `${GWAS_CATALOG_LEGACY_API}/studies/${encodeURIComponent(cleanStudy)}`;
+    const associationUrl = normalizeWhitespace(association?._links?.self?.href || "");
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary:
+            `GWAS Catalog study ${cleanStudy}: ${rankBy === "lowest_pvalue" ? "lowest" : "highest"} p-value row ` +
+            `has risk allele ${risk.risk_allele_name || "unavailable"} (p=${best.pValue}).`,
+          keyFields: [
+            `Study: ${cleanStudy}`,
+            resolvedTrait ? `Trait: ${resolvedTrait}` : "",
+            `Ranking mode: ${rankBy}`,
+            `Risk allele label: ${risk.risk_allele_name || "unavailable"}`,
+            `Variant: ${risk.variant_id || "unavailable"}`,
+            `Allele: ${risk.allele || "unavailable"}`,
+            `P-value: ${best.pValue}`,
+            normalizeWhitespace(risk?.risk_frequency || "") ? `Risk frequency: ${normalizeWhitespace(risk.risk_frequency)}` : "",
+          ].filter(Boolean),
+          sources: [associationUrl, studyUrl, ...scannedUrls].filter(Boolean),
+          limitations: [
+            "Rows are ranked by numeric p-value only; ties are broken deterministically by risk-allele label.",
+          ],
+        }),
+      }],
+      structuredContent: {
+        schema: "get_gwas_study_top_risk_allele.v1",
+        result_status: "ok",
+        study_accession: cleanStudy,
+        rank_by: rankBy,
+        trait: resolvedTrait || null,
+        risk_allele_name: risk.risk_allele_name || null,
+        variant_id: risk.variant_id || null,
+        allele: risk.allele || null,
+        risk_frequency: normalizeWhitespace(risk?.risk_frequency || "") || null,
+        p_value: best.pValue,
+        source_urls: [associationUrl, studyUrl, ...scannedUrls].filter(Boolean),
+      },
+    };
+  }
+);
+
+server.registerTool(
   "get_jaspar_motif_profile",
   {
     description:
@@ -15338,6 +16720,434 @@ server.registerTool(
           ],
         }),
       }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_gnomad_gene_constraint",
+  {
+    description:
+      "Retrieve gene-level gnomAD constraint metrics, including pLI, directly from the public gnomAD GraphQL API. " +
+      "Prefer this for questions about pLI / probability of Loss-of-function Intolerance for one or more genes.",
+    inputSchema: {
+      genes: z.array(z.string()).min(1).max(10).describe('Gene symbols or Ensembl gene IDs (for example ["APOE", "APOC1"]).'),
+      referenceGenome: z.enum(["GRCh38", "GRCh37"]).optional().default("GRCh38").describe("Reference genome context for the gnomAD gene lookup (default GRCh38)."),
+    },
+  },
+  async ({ genes, referenceGenome = "GRCh38" }) => {
+    const cleanGenes = dedupeArray((genes || []).map((value) => normalizeWhitespace(value).toUpperCase()).filter(Boolean)).slice(0, 10);
+    const cleanGenome = sanitizeGnomadReferenceGenome(referenceGenome);
+    if (cleanGenes.length === 0) {
+      return { content: [{ type: "text", text: "Provide at least one gene symbol or Ensembl gene ID." }] };
+    }
+
+    const queryBySymbol = `
+      query GnomadGeneConstraintBySymbol($geneSymbol: String!) {
+        gene(gene_symbol: $geneSymbol, reference_genome: ${cleanGenome}) {
+          gene_id
+          symbol
+          canonical_transcript_id
+          gnomad_constraint {
+            pLI
+            pli
+            oe_lof
+            oe_lof_lower
+            oe_lof_upper
+          }
+        }
+      }
+    `;
+    const queryById = `
+      query GnomadGeneConstraintById($geneId: String!) {
+        gene(gene_id: $geneId, reference_genome: ${cleanGenome}) {
+          gene_id
+          symbol
+          canonical_transcript_id
+          gnomad_constraint {
+            pLI
+            pli
+            oe_lof
+            oe_lof_lower
+            oe_lof_upper
+          }
+        }
+      }
+    `;
+
+    const records = [];
+    for (const gene of cleanGenes) {
+      const looksEnsembl = /^ENSG\d+/i.test(gene);
+      const gqlData = await fetchGnomadGraphQL(
+        looksEnsembl ? queryById : queryBySymbol,
+        looksEnsembl ? { geneId: gene } : { geneSymbol: gene },
+      );
+      const record = gqlData?.gene || null;
+      if (!record) {
+        records.push({ query: gene, found: false });
+        continue;
+      }
+      const constraint = record?.gnomad_constraint || {};
+      const pLi = constraint?.pLI ?? constraint?.pli;
+      records.push({
+        query: gene,
+        found: true,
+        geneId: normalizeWhitespace(record?.gene_id || ""),
+        symbol: normalizeWhitespace(record?.symbol || gene),
+        canonicalTranscriptId: normalizeWhitespace(record?.canonical_transcript_id || ""),
+        pLi: Number.isFinite(toFiniteNumber(pLi, Number.NaN)) ? toFiniteNumber(pLi, Number.NaN) : null,
+        oeLof: Number.isFinite(toFiniteNumber(constraint?.oe_lof, Number.NaN)) ? toFiniteNumber(constraint?.oe_lof, Number.NaN) : null,
+        oeLofLower: Number.isFinite(toFiniteNumber(constraint?.oe_lof_lower, Number.NaN)) ? toFiniteNumber(constraint?.oe_lof_lower, Number.NaN) : null,
+        oeLofUpper: Number.isFinite(toFiniteNumber(constraint?.oe_lof_upper, Number.NaN)) ? toFiniteNumber(constraint?.oe_lof_upper, Number.NaN) : null,
+      });
+    }
+
+    const resolved = records.filter((row) => row.found);
+    if (resolved.length === 0) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No gnomAD gene-constraint records were found for ${cleanGenes.join(", ")}.`,
+          keyFields: [`Genes: ${cleanGenes.join(", ")}`],
+          sources: [GNOMAD_GRAPHQL_API],
+          limitations: ["Check the gene symbols / Ensembl gene IDs and the requested reference genome."],
+        }) }],
+      };
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `Retrieved gnomAD constraint metrics for ${resolved.length} gene${resolved.length === 1 ? "" : "s"}.`,
+          keyFields: records.map((row) => {
+            if (!row.found) return `${row.query}: not found`;
+            return [
+              `${row.symbol}: pLI ${row.pLi != null ? row.pLi.toFixed(6) : "unavailable"}`,
+              row.geneId ? `gene ${row.geneId}` : "",
+              row.canonicalTranscriptId ? `canonical transcript ${row.canonicalTranscriptId}` : "",
+              row.oeLof != null ? `LOF OE ${row.oeLof.toFixed(4)}${row.oeLofLower != null && row.oeLofUpper != null ? ` (${row.oeLofLower.toFixed(4)}-${row.oeLofUpper.toFixed(4)})` : ""}` : "",
+            ].filter(Boolean).join(" | ");
+          }),
+          sources: [GNOMAD_GRAPHQL_API],
+          limitations: [
+            "Constraint values come from the currently served public gnomAD GraphQL API for the requested reference genome.",
+          ],
+        }),
+      }],
+      structuredContent: {
+        schema: "get_gnomad_gene_constraint.v1",
+        result_status: "ok",
+        reference_genome: cleanGenome,
+        genes: records,
+      },
+    };
+  }
+);
+
+server.registerTool(
+  "get_gnomad_transcript_highest_af_region",
+  {
+    description:
+      "Find the transcript region containing the highest-allele-frequency variant for a gene in gnomAD, typically on the canonical transcript. " +
+      "Prefer this for questions such as where the highest-AF CDKN2A transcript variant occurs (for example 3' UTR vs coding region).",
+    inputSchema: {
+      geneIdentifier: z.string().describe("Gene symbol or Ensembl gene ID (for example 'CDKN2A' or 'ENSG00000147889')."),
+      dataset: z.string().optional().default("gnomad_r4").describe("gnomAD dataset enum to query (default gnomad_r4)."),
+      referenceGenome: z.enum(["GRCh38", "GRCh37"]).optional().default("GRCh38").describe("Reference genome context for the gene lookup (default GRCh38)."),
+      transcriptSelection: z.enum(["canonical", "all"]).optional().default("canonical").describe("Whether to rank variants only on the canonical transcript or across all transcript consequences."),
+    },
+  },
+  async ({ geneIdentifier, dataset = "gnomad_r4", referenceGenome = "GRCh38", transcriptSelection = "canonical" }) => {
+    const cleanIdentifier = normalizeWhitespace(geneIdentifier || "");
+    const cleanDataset = sanitizeGnomadDataset(dataset);
+    const cleanGenome = sanitizeGnomadReferenceGenome(referenceGenome);
+    if (!cleanIdentifier) {
+      return { content: [{ type: "text", text: "Provide a gene symbol or Ensembl gene ID." }] };
+    }
+
+    const geneField = /^ENSG\d+/i.test(cleanIdentifier) ? "gene_id" : "gene_symbol";
+    const query = `
+      query GnomadHighestAfTranscriptRegion($geneIdentifier: String!) {
+        gene(${geneField}: $geneIdentifier, reference_genome: ${cleanGenome}) {
+          gene_id
+          symbol
+          canonical_transcript_id
+          variants(dataset: ${cleanDataset}) {
+            variant_id
+            transcript_consequence {
+              transcript_id
+              major_consequence
+              is_canonical
+              canonical
+            }
+            genome { af }
+            exome { af }
+          }
+        }
+      }
+    `;
+
+    const gqlData = await fetchGnomadGraphQL(query, { geneIdentifier: cleanIdentifier }, { timeoutMs: 45000 });
+    const gene = gqlData?.gene || null;
+    if (!gene) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `gnomAD did not return a gene record for ${cleanIdentifier}.`,
+          keyFields: [`Gene: ${cleanIdentifier}`],
+          sources: [GNOMAD_GRAPHQL_API],
+          limitations: ["Check the gene symbol / Ensembl gene ID and the requested reference genome."],
+        }) }],
+      };
+    }
+
+    const canonicalTranscriptId = normalizeWhitespace(gene?.canonical_transcript_id || "");
+    const candidates = [];
+    for (const variant of asArray(gene?.variants)) {
+      const consequence = variant?.transcript_consequence || {};
+      const transcriptId = normalizeWhitespace(consequence?.transcript_id || "");
+      const isCanonical = Boolean(consequence?.is_canonical || consequence?.canonical || (canonicalTranscriptId && transcriptId === canonicalTranscriptId));
+      if (transcriptSelection === "canonical" && !isCanonical) {
+        continue;
+      }
+      const genomeAf = toFiniteNumber(variant?.genome?.af, Number.NaN);
+      const exomeAf = toFiniteNumber(variant?.exome?.af, Number.NaN);
+      const af = Math.max(
+        Number.isFinite(genomeAf) ? genomeAf : Number.NaN,
+        Number.isFinite(exomeAf) ? exomeAf : Number.NaN,
+      );
+      if (!Number.isFinite(af)) {
+        continue;
+      }
+      candidates.push({
+        variantId: normalizeWhitespace(variant?.variant_id || ""),
+        af,
+        transcriptId,
+        isCanonical,
+        majorConsequence: normalizeWhitespace(consequence?.major_consequence || ""),
+        transcriptRegion: mapGnomadConsequenceToTranscriptRegion(consequence?.major_consequence || ""),
+      });
+    }
+
+    candidates.sort((a, b) => (
+      b.af - a.af
+      || (a.isCanonical === b.isCanonical ? 0 : a.isCanonical ? -1 : 1)
+      || a.variantId.localeCompare(b.variantId, undefined, { numeric: true, sensitivity: "base" })
+    ));
+    const top = candidates[0] || null;
+    if (!top) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `gnomAD returned gene ${normalizeWhitespace(gene?.symbol || cleanIdentifier)}, but no variant frequencies were available for the requested transcript selection.`,
+          keyFields: [
+            `Gene: ${normalizeWhitespace(gene?.symbol || cleanIdentifier)}`,
+            canonicalTranscriptId ? `Canonical transcript: ${canonicalTranscriptId}` : "",
+            `Transcript selection: ${transcriptSelection}`,
+          ].filter(Boolean),
+          sources: [GNOMAD_GRAPHQL_API],
+          limitations: ["Some genes or transcript views may not have frequency-bearing variants in the requested gnomAD dataset."],
+        }) }],
+      };
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary:
+            `For ${normalizeWhitespace(gene?.symbol || cleanIdentifier)}, the highest-frequency ${transcriptSelection === "canonical" ? "canonical-transcript " : ""}` +
+            `variant in gnomAD falls in the ${top.transcriptRegion}.`,
+          keyFields: [
+            `Gene: ${normalizeWhitespace(gene?.symbol || cleanIdentifier)}`,
+            canonicalTranscriptId ? `Canonical transcript: ${canonicalTranscriptId}` : "",
+            `Transcript selection: ${transcriptSelection}`,
+            `Top variant: ${top.variantId}`,
+            `Highest allele frequency: ${top.af}`,
+            `Transcript consequence: ${top.majorConsequence || "unavailable"}`,
+            `Transcript region: ${top.transcriptRegion}`,
+          ],
+          sources: [GNOMAD_GRAPHQL_API],
+          limitations: [
+            "Variant ranking uses the larger of the exome and genome AF values returned by the public gnomAD API for each candidate transcript consequence.",
+          ],
+        }),
+      }],
+      structuredContent: {
+        schema: "get_gnomad_transcript_highest_af_region.v1",
+        result_status: "ok",
+        gene_symbol: normalizeWhitespace(gene?.symbol || cleanIdentifier),
+        gene_id: normalizeWhitespace(gene?.gene_id || ""),
+        canonical_transcript_id: canonicalTranscriptId || null,
+        transcript_selection: transcriptSelection,
+        dataset: cleanDataset,
+        reference_genome: cleanGenome,
+        highest_af_variant: top,
+      },
+    };
+  }
+);
+
+server.registerTool(
+  "get_regulomedb_variant_summary",
+  {
+    description:
+      "Summarize RegulomeDB v2.2 evidence for one rsID or genomic region using the public JSON endpoints. " +
+      "Returns rank/probability when available and counts unique motif targets from PWM/footprint rows.",
+    inputSchema: {
+      query: z.string().describe("RegulomeDB query string, such as an rsID (`rs17583618`) or genomic region (`chr13:32315086-32400268`)."),
+      genome: z.enum(["GRCh38", "hg19"]).optional().default("GRCh38").describe("Genome build understood by RegulomeDB (default GRCh38)."),
+    },
+  },
+  async ({ query, genome = "GRCh38" }) => {
+    const cleanQuery = normalizeWhitespace(query || "");
+    const cleanGenome = normalizeWhitespace(genome || "GRCh38") || "GRCh38";
+    if (!cleanQuery) {
+      return { content: [{ type: "text", text: "Provide an rsID or genomic region for RegulomeDB lookup." }] };
+    }
+
+    const summaryUrl = `${REGULOMEDB_BASE_URL}/regulome-summary/?regions=${encodeURIComponent(cleanQuery)}&genome=${encodeURIComponent(cleanGenome)}&maf=0&format=json`;
+    const searchUrl = `${REGULOMEDB_BASE_URL}/regulome-search/?regions=${encodeURIComponent(cleanQuery)}&genome=${encodeURIComponent(cleanGenome)}&maf=0&format=json`;
+
+    const [summaryData, searchData] = await Promise.all([
+      fetchJsonWithRetry(summaryUrl, { headers: { Accept: "application/json" }, retries: 1, timeoutMs: 20000, maxBackoffMs: 2500 }).catch(() => null),
+      fetchJsonWithRetry(searchUrl, { headers: { Accept: "application/json" }, retries: 1, timeoutMs: /^rs\d+$/i.test(cleanQuery) ? 20000 : 45000, maxBackoffMs: 2500 }).catch(() => null),
+    ]);
+
+    const regulomeScore = summaryData?.regulome_score || null;
+    const ranking = normalizeWhitespace(regulomeScore?.ranking || "");
+    const probability = regulomeScore?.probability != null ? String(regulomeScore.probability) : "";
+    const motifTargets = countRegulomeDbUniqueMotifTargets(searchData?.["@graph"] || []);
+    const variantIds = dedupeArray(
+      asArray(summaryData?.variants)
+        .flatMap((row) => asArray(row?.rsids))
+        .map((value) => normalizeWhitespace(value))
+        .filter(Boolean)
+    );
+
+    if (!ranking && motifTargets.length === 0 && variantIds.length === 0) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No RegulomeDB summary could be recovered for ${cleanQuery}.`,
+          keyFields: [`Query: ${cleanQuery}`, `Genome: ${cleanGenome}`],
+          sources: [summaryUrl, searchUrl],
+          limitations: ["The public RegulomeDB JSON endpoints may time out for large regions or unsupported queries."],
+        }) }],
+      };
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary:
+            `RegulomeDB summary for ${cleanQuery}: rank ${ranking || "unavailable"}${probability ? ` (probability ${probability})` : ""}` +
+            `${motifTargets.length > 0 ? ` with ${motifTargets.length} unique motif target${motifTargets.length === 1 ? "" : "s"}` : ""}.`,
+          keyFields: [
+            `Query: ${cleanQuery}`,
+            `Genome: ${cleanGenome}`,
+            ranking ? `Rank: ${ranking}` : "",
+            probability ? `Probability: ${probability}` : "",
+            variantIds.length > 0 ? `Variant IDs: ${variantIds.join(", ")}` : "",
+            motifTargets.length > 0 ? `Unique motif targets: ${motifTargets.join(", ")}` : "",
+          ].filter(Boolean),
+          sources: [summaryUrl, searchUrl],
+          limitations: [
+            "Motif targets are counted as unique `target_label` values across RegulomeDB PWM and footprint rows in the public JSON search results.",
+          ],
+        }),
+      }],
+      structuredContent: {
+        schema: "get_regulomedb_variant_summary.v1",
+        result_status: "ok",
+        query: cleanQuery,
+        genome: cleanGenome,
+        regulome_rank: ranking || null,
+        regulome_probability: probability || null,
+        variant_ids: variantIds,
+        motif_target_count: motifTargets.length,
+        motif_targets: motifTargets,
+      },
+    };
+  }
+);
+
+server.registerTool(
+  "get_dbsnp_population_frequency",
+  {
+    description:
+      "Extract population-specific dbSNP allele frequencies from the public NCBI SNP page, including named subpopulation rows such as ALFA African populations for one rsID.",
+    inputSchema: {
+      rsId: z.string().describe("dbSNP rsID (for example 'rs356182')."),
+      populationName: z.string().describe("Population label to match on the dbSNP population-frequency table (for example 'African')."),
+      preferReferenceAllele: z.boolean().optional().default(true).describe("Whether to return the reference-allele frequency rather than the alternate-allele frequency (default true)."),
+    },
+  },
+  async ({ rsId, populationName, preferReferenceAllele = true }) => {
+    const cleanRsid = normalizeWhitespace(rsId || "").toLowerCase().startsWith("rs")
+      ? normalizeWhitespace(rsId || "").toLowerCase()
+      : `rs${normalizeWhitespace(rsId || "")}`;
+    const cleanPopulation = normalizeWhitespace(populationName || "");
+    if (!cleanRsid || !cleanPopulation) {
+      return { content: [{ type: "text", text: "Provide both `rsId` and `populationName`." }] };
+    }
+
+    const url = `${DBSNP_WEB_BASE}/${encodeURIComponent(cleanRsid)}`;
+    const response = await fetchWithRetry(url, { retries: 1, timeoutMs: 20000, maxBackoffMs: 2500 });
+    const html = await response.text();
+    const populationRows = extractDbSnpPopulationFrequencyRows(html);
+    const targetPopulation = cleanPopulation.toLowerCase();
+    const row = populationRows.find((entry) => entry.population.toLowerCase() === targetPopulation)
+      || populationRows.find((entry) => entry.population.toLowerCase().includes(targetPopulation))
+      || null;
+
+    if (!row) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `dbSNP did not expose a population-frequency row matching ${cleanPopulation} for ${cleanRsid}.`,
+          keyFields: [
+            `rsID: ${cleanRsid}`,
+            `Population: ${cleanPopulation}`,
+            populationRows.length > 0 ? `Available populations (sample): ${populationRows.slice(0, 8).map((entry) => entry.population).join(", ")}` : "",
+          ].filter(Boolean),
+          sources: [url],
+          limitations: ["This parser reads the public dbSNP web frequency table and may miss populations if the page layout changes."],
+        }) }],
+      };
+    }
+
+    const selectedAllele = preferReferenceAllele ? row.refAllele : row.altAllele;
+    const selectedFrequency = preferReferenceAllele ? row.refAlleleFrequency : row.altAlleleFrequency;
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary:
+            `dbSNP ${cleanRsid} ${preferReferenceAllele ? "reference" : "alternate"}-allele frequency for ${row.population} is ` +
+            `${Number.isFinite(selectedFrequency) ? selectedFrequency : "unavailable"}.`,
+          keyFields: [
+            `rsID: ${cleanRsid}`,
+            `Population: ${row.population}`,
+            row.refAllele ? `Reference allele frequency: ${row.refAllele}=${Number.isFinite(row.refAlleleFrequency) ? row.refAlleleFrequency : "unavailable"}` : "",
+            row.altAllele ? `Alternate allele frequency: ${row.altAllele}=${Number.isFinite(row.altAlleleFrequency) ? row.altAlleleFrequency : "unavailable"}` : "",
+            preferReferenceAllele && row.refAllele ? `Selected allele: ${row.refAllele}` : (!preferReferenceAllele && row.altAllele ? `Selected allele: ${row.altAllele}` : ""),
+          ].filter(Boolean),
+          sources: [url],
+          limitations: [
+            "Population-frequency values are parsed from the public NCBI SNP page rather than the refsnp JSON service because subpopulation rows such as African ALFA frequencies are surfaced there.",
+          ],
+        }),
+      }],
+      structuredContent: {
+        schema: "get_dbsnp_population_frequency.v1",
+        result_status: "ok",
+        rsid: cleanRsid,
+        population: row.population,
+        ref_allele: row.refAllele || null,
+        ref_allele_frequency: Number.isFinite(row.refAlleleFrequency) ? row.refAlleleFrequency : null,
+        alt_allele: row.altAllele || null,
+        alt_allele_frequency: Number.isFinite(row.altAlleleFrequency) ? row.altAlleleFrequency : null,
+        selected_allele: selectedAllele || null,
+        selected_frequency: Number.isFinite(selectedFrequency) ? selectedFrequency : null,
+      },
     };
   }
 );
@@ -16778,6 +18588,173 @@ server.registerTool(
       return payload;
     } catch (error) {
       return { content: [{ type: "text", text: `Error in get_depmap_expression_subset_mean: ${error.message}` }] };
+    }
+  }
+);
+
+server.registerTool(
+  "get_depmap_sample_top_expression_gene",
+  {
+    description:
+      "Find the highest-expressed gene for one named DepMap sample / stripped cell-line name in a public expression release. " +
+      "Uses OmicsProfiles plus the public expression matrix rather than BigQuery.",
+    inputSchema: {
+      sampleQuery: z.string().describe("Sample or stripped cell-line name, for example '1156QE8 Sample' or '1156QE8'."),
+      release: z.string().optional().default("25Q3").describe("DepMap public release tag or label (for example '25Q3' or 'DepMap Public 25Q3')."),
+      expressionDataset: z.enum(["protein_coding_stranded", "protein_coding", "all_genes_stranded", "all_genes"]).optional().default("protein_coding_stranded")
+        .describe("Which DepMap public expression matrix to query. Defaults to the stranded protein-coding log2(TPM+1) matrix."),
+      defaultProfileOnly: z.boolean().optional().default(true)
+        .describe("Whether to restrict to rows marked IsDefaultEntryForModel in the public profile and expression files."),
+    },
+  },
+  async ({
+    sampleQuery,
+    release = "25Q3",
+    expressionDataset = "protein_coding_stranded",
+    defaultProfileOnly = true,
+  }) => {
+    const rawSampleQuery = normalizeWhitespace(sampleQuery || "");
+    const sampleToken = normalizeDepMapSampleLookupToken(rawSampleQuery);
+    const normalizedRelease = normalizeDepMapReleaseQuery(release || "") || "25Q3";
+    const selectedDataset = DEPMAP_EXPRESSION_DATASET_FILES[expressionDataset] ? expressionDataset : "protein_coding_stranded";
+
+    if (!sampleToken) {
+      return {
+        content: [{
+          type: "text",
+          text: "Provide a DepMap sample / stripped cell-line name such as `1156QE8 Sample`.",
+        }],
+      };
+    }
+
+    try {
+      const [catalogRows, omicsProfiles] = await Promise.all([
+        fetchDepMapDownloadCatalog(),
+        fetchDepMapOmicsProfiles(normalizedRelease),
+      ]);
+
+      const matchedProfile = (Array.isArray(omicsProfiles.rows) ? omicsProfiles.rows : []).find((row) => {
+        const token = normalizeDepMapSampleLookupToken(row?.StrippedCellLineName || row?.DepMapCode || "");
+        if (!token || token !== sampleToken) return false;
+        if (normalizeWhitespace(row?.DataType || "").toLowerCase() !== "rna") return false;
+        if (!defaultProfileOnly) return true;
+        return ["1", "1.0", "true", "yes"].includes(String(row?.IsDefaultEntryForModel || "").trim().toLowerCase());
+      });
+
+      if (!matchedProfile) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No RNA expression profile matched DepMap sample "${rawSampleQuery}" in release ${omicsProfiles.release}.`,
+              keyFields: [
+                `Requested sample: ${rawSampleQuery}`,
+                `Normalized token: ${sampleToken}`,
+                `Release: ${omicsProfiles.release}`,
+                `Default model profiles only: ${defaultProfileOnly ? "yes" : "no"}`,
+              ],
+              sources: [omicsProfiles.sourceUrl].filter(Boolean),
+              limitations: ["Sample resolution uses OmicsProfiles.csv and currently expects a stripped cell-line/sample name rather than a sequencing accession."],
+            }),
+          }],
+        };
+      }
+
+      const modelId = normalizeWhitespace(matchedProfile?.ModelID || "");
+      const cacheKey = buildDepMapSampleTopExpressionCacheKey({
+        sampleToken,
+        release: normalizedRelease,
+        expressionDataset: selectedDataset,
+        defaultProfileOnly,
+      });
+      const cached = getFreshCacheValue(depMapSampleTopExpressionCache.get(cacheKey), 6 * 60 * 60 * 1000);
+      if (cached) {
+        return cached;
+      }
+
+      const expressionFilename = DEPMAP_EXPRESSION_DATASET_FILES[selectedDataset];
+      const expressionCatalogRow = findDepMapCatalogRow(catalogRows, expressionFilename, normalizedRelease);
+      if (!expressionCatalogRow?.url) {
+        throw new Error(`No DepMap expression file "${expressionFilename}" was found for release "${normalizedRelease}".`);
+      }
+
+      const response = await fetchWithRetry(expressionCatalogRow.url, {
+        retries: 1,
+        timeoutMs: 120000,
+        maxBackoffMs: 6000,
+        headers: {
+          Accept: "text/csv",
+          "User-Agent": "Mozilla/5.0 research-mcp",
+        },
+      });
+      const topGene = await computeDepMapTopExpressionGeneFromResponse(response, {
+        modelId,
+        defaultProfileOnly,
+      });
+
+      if (!topGene.matched || !topGene.topGeneSymbol || !Number.isFinite(topGene.topValue)) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `DepMap ${normalizeWhitespace(expressionCatalogRow.release || normalizedRelease)}: no finite expression values were recovered for sample ${rawSampleQuery}.`,
+              keyFields: [
+                `Requested sample: ${rawSampleQuery}`,
+                `Resolved model ID: ${modelId || "unavailable"}`,
+                `Expression file: ${expressionFilename}`,
+              ],
+              sources: [omicsProfiles.sourceUrl, expressionCatalogRow.url].filter(Boolean),
+              limitations: ["The selected public expression matrix did not yield a matched default RNA profile row with finite gene-expression values."],
+            }),
+          }],
+        };
+      }
+
+      const payload = {
+        structuredContent: {
+          sampleQuery: rawSampleQuery,
+          strippedCellLineName: normalizeWhitespace(matchedProfile?.StrippedCellLineName || "") || null,
+          modelId,
+          depmapCode: normalizeWhitespace(matchedProfile?.DepMapCode || "") || null,
+          profileId: normalizeWhitespace(matchedProfile?.ProfileID || "") || null,
+          sequencingId: normalizeWhitespace(matchedProfile?.SequencingID || "") || null,
+          release: normalizeWhitespace(expressionCatalogRow.release || omicsProfiles.release || normalizedRelease),
+          expressionDataset: selectedDataset,
+          defaultProfileOnly,
+          topGene: topGene.topGeneSymbol,
+          matchedGeneColumn: topGene.topGeneLabel,
+          topLog2TpmPlus1: topGene.topValue,
+        },
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary:
+              `DepMap ${normalizeWhitespace(expressionCatalogRow.release || omicsProfiles.release || normalizedRelease)}: ` +
+              `${normalizeWhitespace(matchedProfile?.StrippedCellLineName || rawSampleQuery)} top expression gene is ${topGene.topGeneSymbol} (${topGene.topValue.toFixed(5)} log2(TPM+1)).`,
+            keyFields: [
+              `Requested sample: ${rawSampleQuery}`,
+              `Resolved stripped cell-line name: ${normalizeWhitespace(matchedProfile?.StrippedCellLineName || rawSampleQuery)}`,
+              `Model ID: ${modelId}`,
+              normalizeWhitespace(matchedProfile?.DepMapCode || "") ? `DepMap code: ${normalizeWhitespace(matchedProfile.DepMapCode)}` : "",
+              normalizeWhitespace(matchedProfile?.ProfileID || "") ? `RNA profile ID: ${normalizeWhitespace(matchedProfile.ProfileID)}` : "",
+              normalizeWhitespace(matchedProfile?.SequencingID || "") ? `Sequencing ID: ${normalizeWhitespace(matchedProfile.SequencingID)}` : "",
+              `Expression file: ${expressionFilename}`,
+              `Top gene: ${topGene.topGeneSymbol}`,
+              `Matched expression column: ${topGene.topGeneLabel || "n/a"}`,
+              `Top log2(TPM+1): ${topGene.topValue.toFixed(5)}`,
+              `Default model profiles only: ${defaultProfileOnly ? "yes" : "no"}`,
+            ].filter(Boolean),
+            sources: [omicsProfiles.sourceUrl, expressionCatalogRow.url].filter(Boolean),
+            limitations: [
+              "Sample resolution uses OmicsProfiles.csv; the top gene is computed from the selected public expression matrix for the matched default RNA profile row.",
+            ],
+          }),
+        }],
+      };
+      depMapSampleTopExpressionCache.set(cacheKey, storeCacheValue(null, payload));
+      return payload;
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error in get_depmap_sample_top_expression_gene: ${error.message}` }] };
     }
   }
 );
