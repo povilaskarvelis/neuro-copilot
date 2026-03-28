@@ -561,6 +561,47 @@ def choose_best_match(
     return best
 
 
+def build_not_found_result(
+    *,
+    target_query: str,
+    target: dict[str, Any],
+    disease_query: str,
+    disease: dict[str, Any],
+    release_tag: str,
+    variant_query: str,
+    message: str,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "found": False,
+        "message": normalize_whitespace(message),
+        "release": release_tag,
+        "target_query": target_query,
+        "target_id": target["target_id"],
+        "target_symbol": target["target_symbol"],
+        "target_name": target["target_name"],
+        "target_resolution_source": target["resolution_source"],
+        "disease_query": disease_query,
+        "disease_id": disease["disease_id"],
+        "disease_name": disease["disease_name"],
+        "disease_resolution_source": disease["resolution_source"],
+        "candidate_diseases": disease["candidate_matches"],
+        "variant_query": variant_query,
+        "candidate_matches": [],
+        "score": None,
+        "score_rounded_3dp": None,
+        "study_id": "",
+        "trait_from_source": "",
+        "study_locus_id": "",
+        "variant_id": "",
+        "rs_ids": [],
+        "study_source_url": "",
+        "credible_set_source_url": "",
+        "l2g_source_url": "",
+        "shap_base_value": None,
+    }
+
+
 def run(payload: dict[str, Any]) -> dict[str, Any]:
     target_query = normalize_whitespace(payload.get("target"))
     disease_query = normalize_whitespace(payload.get("disease"))
@@ -643,29 +684,41 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
             return best_live
         except LookupError:
             pass
-    studies = load_candidate_studies(
-        disease_query,
-        disease["disease_id"],
-        disease["disease_name"],
-        release_tag,
-        max_candidates=max_study_candidates,
-    )
-    l2g_rows = load_target_l2g_rows(target["target_id"], release_tag)
-    study_locus_ids = {row["study_locus_id"] for row in l2g_rows}
-    credible_sets = load_candidate_credible_sets(study_locus_ids, release_tag)
-    best = choose_best_match(
-        disease_query=disease_query,
-        target=target,
-        studies=studies,
-        credible_sets=credible_sets,
-        l2g_rows=l2g_rows,
-        variant_query=variant_query,
-        release_tag=release_tag,
-        max_matches=max_matches,
-    )
+    try:
+        studies = load_candidate_studies(
+            disease_query,
+            disease["disease_id"],
+            disease["disease_name"],
+            release_tag,
+            max_candidates=max_study_candidates,
+        )
+        l2g_rows = load_target_l2g_rows(target["target_id"], release_tag)
+        study_locus_ids = {row["study_locus_id"] for row in l2g_rows}
+        credible_sets = load_candidate_credible_sets(study_locus_ids, release_tag)
+        best = choose_best_match(
+            disease_query=disease_query,
+            target=target,
+            studies=studies,
+            credible_sets=credible_sets,
+            l2g_rows=l2g_rows,
+            variant_query=variant_query,
+            release_tag=release_tag,
+            max_matches=max_matches,
+        )
+    except LookupError as exc:
+        return build_not_found_result(
+            target_query=target_query,
+            target=target,
+            disease_query=disease_query,
+            disease=disease,
+            release_tag=release_tag,
+            variant_query=variant_query,
+            message=str(exc),
+        )
     best.update(
         {
             "ok": True,
+            "found": True,
             "disease_id": disease["disease_id"],
             "disease_name": disease["disease_name"],
             "disease_resolution_source": disease["resolution_source"],

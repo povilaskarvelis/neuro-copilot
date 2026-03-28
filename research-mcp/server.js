@@ -6005,12 +6005,69 @@ server.registerTool(
       { timeoutMs: 180000 }
     );
 
-    if (!result?.ok) {
+    if (result?.ok && result?.found === false) {
+      const releaseTag = normalizeWhitespace(result.release || release || "");
+      const targetId = normalizeWhitespace(result.target_id || "");
+      const targetSymbol = normalizeWhitespace(result.target_symbol || target || "");
+      const targetName = normalizeWhitespace(result.target_name || "");
+      const diseaseId = normalizeWhitespace(result.disease_id || "");
+      const diseaseName = normalizeWhitespace(result.disease_name || disease || "");
+      const candidateDiseases = Array.isArray(result.candidate_diseases) ? result.candidate_diseases : [];
+      const keyFields = [
+        `Release: ${releaseTag || "latest archived release"}`,
+        `Target: ${targetSymbol}${targetId ? ` (${targetId})` : ""}${targetName ? ` — ${targetName}` : ""}`,
+        `Disease: ${diseaseName}${diseaseId ? ` (${diseaseId})` : ""}`,
+      ];
+      if (candidateDiseases.length > 1) {
+        const preview = candidateDiseases
+          .slice(0, 3)
+          .map((entry) => normalizeWhitespace(entry?.disease_name || ""))
+          .filter(Boolean)
+          .join("; ");
+        if (preview) {
+          keyFields.push(`Top disease matches considered: ${preview}`);
+        }
+      }
       return {
         content: [
           {
             type: "text",
-            text: `Error in get_open_targets_association: ${compactErrorMessage(result?.error || "unknown error", 320)}`,
+            text: renderStructuredResponse({
+              summary: `No Open Targets association_overall_direct score was found for ${targetSymbol || targetId} and ${diseaseName} in release ${releaseTag || "latest archived release"}.`,
+              keyFields,
+              sources: [
+                normalizeWhitespace(result.disease_resolution_source || ""),
+                normalizeWhitespace(result.target_resolution_source || ""),
+              ].filter(Boolean),
+              limitations: [
+                normalizeWhitespace(result.message || "No exact target-disease association row was present in this archived release."),
+                "This uses the official archived parquet release files rather than the current live API or BigQuery mirror.",
+              ],
+            }),
+          },
+        ],
+        structuredContent: {
+          schema: "get_open_targets_association.v1",
+          result_status: "not_found_or_empty",
+          found: false,
+          release: releaseTag || null,
+          target_id: targetId || null,
+          disease_id: diseaseId || null,
+        },
+      };
+    }
+
+    if (!result?.ok) {
+      const rawError = normalizeWhitespace(result?.error || "");
+      const helperError =
+        rawError === "True"
+          ? "Open Targets helper returned a non-diagnostic truthy error value."
+          : compactErrorMessage(rawError || "unknown error", 320);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error in get_open_targets_association: ${helperError}`,
           },
         ],
       };
@@ -6124,12 +6181,74 @@ server.registerTool(
       { timeoutMs: 240000 }
     );
 
-    if (!result?.ok) {
+    if (result?.ok && result?.found === false) {
+      const releaseTag = normalizeWhitespace(result.release || release || "");
+      const targetId = normalizeWhitespace(result.target_id || "");
+      const targetSymbol = normalizeWhitespace(result.target_symbol || target || "");
+      const targetName = normalizeWhitespace(result.target_name || "");
+      const diseaseId = normalizeWhitespace(result.disease_id || "");
+      const diseaseName = normalizeWhitespace(result.disease_name || disease || "");
+      const variantQuery = normalizeWhitespace(result.variant_query || variant || "");
+      const candidateDiseases = Array.isArray(result.candidate_diseases) ? result.candidate_diseases : [];
+      const keyFields = [
+        `Release: ${releaseTag || "latest archived release"}`,
+        `Target: ${targetSymbol}${targetId ? ` (${targetId})` : ""}${targetName ? ` — ${targetName}` : ""}`,
+        `Disease: ${diseaseName}${diseaseId ? ` (${diseaseId})` : ""}`,
+      ];
+      if (variantQuery) {
+        keyFields.push(`Variant constraint: ${variantQuery}`);
+      }
+      if (candidateDiseases.length > 1) {
+        const preview = candidateDiseases
+          .slice(0, 3)
+          .map((entry) => normalizeWhitespace(entry?.disease_name || ""))
+          .filter(Boolean)
+          .join("; ");
+        if (preview) {
+          keyFields.push(`Top disease matches considered: ${preview}`);
+        }
+      }
       return {
         content: [
           {
             type: "text",
-            text: `Error in get_open_targets_l2g: ${compactErrorMessage(result?.error || "unknown error", 320)}`,
+            text: renderStructuredResponse({
+              summary: `No Open Targets L2G score was found for ${targetSymbol || targetId} and ${diseaseName} in release ${releaseTag || "latest archived release"}.`,
+              keyFields,
+              sources: [
+                normalizeWhitespace(result.disease_resolution_source || ""),
+                normalizeWhitespace(result.target_resolution_source || ""),
+              ].filter(Boolean),
+              limitations: [
+                normalizeWhitespace(result.message || "No matching study-locus L2G row was present for this target-disease pair in the archived release."),
+                "This uses the official archived Open Targets release files rather than the current live API or BigQuery mirror.",
+              ],
+            }),
+          },
+        ],
+        structuredContent: {
+          schema: "get_open_targets_l2g.v1",
+          result_status: "not_found_or_empty",
+          found: false,
+          release: releaseTag || null,
+          target_id: targetId || null,
+          disease_id: diseaseId || null,
+          variant_query: variantQuery || null,
+        },
+      };
+    }
+
+    if (!result?.ok) {
+      const rawError = normalizeWhitespace(result?.error || "");
+      const helperError =
+        rawError === "True"
+          ? "Open Targets helper returned a non-diagnostic truthy error value."
+          : compactErrorMessage(rawError || "unknown error", 320);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error in get_open_targets_l2g: ${helperError}`,
           },
         ],
       };

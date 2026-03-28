@@ -279,6 +279,28 @@ def resolve_disease(query: str, release_tag: str, max_candidates: int = 5) -> di
     return best
 
 
+def _read_association_part(part_path: Path) -> tuple[pd.DataFrame, str, str]:
+    column_sets = [
+        ("associationScore", "evidenceCount"),
+        ("score", "evidenceCount"),
+        ("associationScore", "evidence_count"),
+        ("score", "evidence_count"),
+    ]
+    last_error: Exception | None = None
+    for score_column, evidence_column in column_sets:
+        try:
+            frame = pd.read_parquet(
+                part_path,
+                columns=["diseaseId", "targetId", score_column, evidence_column],
+            )
+            return frame, score_column, evidence_column
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unable to read Open Targets association parquet part.")
+
+
 def lookup_association(target_id: str, disease_id: str, release_tag: str) -> dict[str, Any]:
     base = release_output_base(release_tag)
     dataset_url = f"{base}/association_overall_direct"
@@ -292,10 +314,7 @@ def lookup_association(target_id: str, disease_id: str, release_tag: str) -> dic
             part_url,
             f"{release_tag}/association_overall_direct/{part_name}",
         )
-        frame = pd.read_parquet(
-            part_path,
-            columns=["diseaseId", "targetId", "score", "evidenceCount"],
-        )
+        frame, score_column, evidence_column = _read_association_part(part_path)
         matches = frame[
             (frame["targetId"] == target_id)
             & (frame["diseaseId"] == disease_id)
@@ -304,8 +323,8 @@ def lookup_association(target_id: str, disease_id: str, release_tag: str) -> dic
             continue
         record = matches.iloc[0].to_dict()
         return {
-            "score": float(record["score"]),
-            "evidence_count": int(record["evidenceCount"]),
+            "score": float(record[score_column]),
+            "evidence_count": int(record[evidence_column]),
             "association_source_url": part_url,
         }
 
@@ -327,9 +346,31 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     release_tag = normalize_release_tag(release_query or "latest")
     target = resolve_target(target_query)
     disease = resolve_disease(disease_query, release_tag, max_candidates=max_candidates)
-    association = lookup_association(target["target_id"], disease["disease_id"], release_tag)
+    try:
+        association = lookup_association(target["target_id"], disease["disease_id"], release_tag)
+    except LookupError as exc:
+        return {
+            "ok": True,
+            "found": False,
+            "message": normalize_whitespace(str(exc)),
+            "release": release_tag,
+            "target_query": target_query,
+            "target_id": target["target_id"],
+            "target_symbol": target["target_symbol"],
+            "target_name": target["target_name"],
+            "target_resolution_source": target["resolution_source"],
+            "disease_query": disease_query,
+            "disease_id": disease["disease_id"],
+            "disease_name": disease["disease_name"],
+            "disease_resolution_source": disease["resolution_source"],
+            "candidate_diseases": disease["candidate_matches"],
+            "score": None,
+            "evidence_count": None,
+            "association_source_url": "",
+        }
     return {
         "ok": True,
+        "found": True,
         "release": release_tag,
         "target_query": target_query,
         "target_id": target["target_id"],
