@@ -1,5 +1,5 @@
 """
-ADK-native orchestration graph for the Co-Scientist agent.
+ADK-native orchestration graph for the Neuro Copilot agent.
 
 Architecture:
   LlmAgent (router) — classifies user intent, transfers to specialist agents
@@ -111,28 +111,28 @@ BQ_PRIORITY_TOOLS = [
 
 STATE_WORKFLOW_TASK = "workflow_task_state"
 STATE_WORKFLOW_TASK_LEGACY_APP = "app:workflow_task_state"
-STATE_PRIOR_RESEARCH = "co_scientist_prior_research"
-STATE_FINALIZE_REQUESTED = "temp:co_scientist_finalize_requested"
-STATE_AUTO_SYNTH_REQUESTED = "temp:co_scientist_auto_synth_requested"
-STATE_TURN_ABORT_REASON = "temp:co_scientist_turn_abort_reason"
-STATE_PLANNER_BUFFER = "temp:co_scientist_planner_stream_buffer"
-STATE_EXECUTOR_BUFFER = "temp:co_scientist_executor_stream_buffer"
-STATE_SYNTH_BUFFER = "temp:co_scientist_synth_stream_buffer"
-STATE_PLANNER_RENDERED = "temp:co_scientist_planner_rendered"
-STATE_EXECUTOR_RENDERED = "temp:co_scientist_executor_rendered"
-STATE_EXECUTOR_ACTIVE_STEP_ID = "temp:co_scientist_executor_active_step_id"
-STATE_REACT_PARSE_RETRIES = "temp:co_scientist_react_parse_retries"
-STATE_EXECUTOR_LAST_ERROR = "temp:co_scientist_executor_last_error"
-STATE_EXECUTOR_PREV_STEP_STATUS = "temp:co_scientist_executor_prev_step_status"
-STATE_EXECUTOR_REASONING_TRACE = "temp:co_scientist_executor_reasoning_trace"
-STATE_EXECUTOR_TOOL_LOG = "temp:co_scientist_executor_tool_log"
-STATE_PLAN_PENDING_APPROVAL = "co_scientist_plan_pending_approval"
-STATE_MODEL_ERROR_PASSTHROUGH = "temp:co_scientist_model_error_passthrough"
-STATE_BENCHMARK_LOOP_COUNT = "temp:co_scientist_benchmark_loop_count"
-STATE_BENCHMARK_COMPLETE = "temp:co_scientist_benchmark_complete"
-STATE_BENCHMARK_LAST_DRAFT = "temp:co_scientist_benchmark_last_draft"
-STATE_BENCHMARK_FINAL_ANSWER = "temp:co_scientist_benchmark_final_answer"
-STATE_BENCHMARK_RETRY_FEEDBACK = "temp:co_scientist_benchmark_retry_feedback"
+STATE_PRIOR_RESEARCH = "neuro_copilot_prior_research"
+STATE_FINALIZE_REQUESTED = "temp:neuro_copilot_finalize_requested"
+STATE_AUTO_SYNTH_REQUESTED = "temp:neuro_copilot_auto_synth_requested"
+STATE_TURN_ABORT_REASON = "temp:neuro_copilot_turn_abort_reason"
+STATE_PLANNER_BUFFER = "temp:neuro_copilot_planner_stream_buffer"
+STATE_EXECUTOR_BUFFER = "temp:neuro_copilot_executor_stream_buffer"
+STATE_SYNTH_BUFFER = "temp:neuro_copilot_synth_stream_buffer"
+STATE_PLANNER_RENDERED = "temp:neuro_copilot_planner_rendered"
+STATE_EXECUTOR_RENDERED = "temp:neuro_copilot_executor_rendered"
+STATE_EXECUTOR_ACTIVE_STEP_ID = "temp:neuro_copilot_executor_active_step_id"
+STATE_REACT_PARSE_RETRIES = "temp:neuro_copilot_react_parse_retries"
+STATE_EXECUTOR_LAST_ERROR = "temp:neuro_copilot_executor_last_error"
+STATE_EXECUTOR_PREV_STEP_STATUS = "temp:neuro_copilot_executor_prev_step_status"
+STATE_EXECUTOR_REASONING_TRACE = "temp:neuro_copilot_executor_reasoning_trace"
+STATE_EXECUTOR_TOOL_LOG = "temp:neuro_copilot_executor_tool_log"
+STATE_PLAN_PENDING_APPROVAL = "neuro_copilot_plan_pending_approval"
+STATE_MODEL_ERROR_PASSTHROUGH = "temp:neuro_copilot_model_error_passthrough"
+STATE_BENCHMARK_LOOP_COUNT = "temp:neuro_copilot_benchmark_loop_count"
+STATE_BENCHMARK_COMPLETE = "temp:neuro_copilot_benchmark_complete"
+STATE_BENCHMARK_LAST_DRAFT = "temp:neuro_copilot_benchmark_last_draft"
+STATE_BENCHMARK_FINAL_ANSWER = "temp:neuro_copilot_benchmark_final_answer"
+STATE_BENCHMARK_RETRY_FEEDBACK = "temp:neuro_copilot_benchmark_retry_feedback"
 
 BENCHMARK_LOOP_MAX_ITERATIONS = 6
 
@@ -642,7 +642,7 @@ Rules:
 """
 
 
-ROUTER_INSTRUCTION = """You are the intent router for the AI Co-Scientist, a biomedical research assistant.
+ROUTER_INSTRUCTION = """You are the intent router for the Neuro Copilot, a biomedical research assistant.
 Your ONLY job is to read the user's message and the session context below, then IMMEDIATELY transfer
 to the correct specialist agent. Never answer questions yourself — always transfer.
 
@@ -691,7 +691,7 @@ You MUST always transfer. Never respond with text yourself.
 """
 
 
-GENERAL_QA_INSTRUCTION = """You are a knowledgeable biomedical expert within the AI Co-Scientist platform.
+GENERAL_QA_INSTRUCTION = """You are a knowledgeable biomedical expert within the Neuro Copilot platform.
 Answer the user's question directly and accurately from your training knowledge.
 
 Guidelines:
@@ -707,7 +707,7 @@ Guidelines:
 """
 
 
-BENCHMARK_QA_INSTRUCTION = """You are the benchmark execution profile for the AI Co-Scientist.
+BENCHMARK_QA_INSTRUCTION = """You are the benchmark execution profile for the Neuro Copilot.
 Answer a SINGLE benchmark question by using the available biomedical tools directly.
 
 Your goal is to maximize factual correctness on source-grounded database questions.
@@ -760,7 +760,7 @@ Rules:
 """
 
 
-BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE = """You are the benchmark execution profile for the AI Co-Scientist.
+BENCHMARK_LOOP_EXECUTOR_INSTRUCTION_TEMPLATE = """You are the benchmark execution profile for the Neuro Copilot.
 Answer a SINGLE benchmark question by using the available biomedical tools directly.
 
 Work in iterative Reason-Act-Observe cycles:
@@ -825,7 +825,7 @@ __ROUTING_POLICY__
 """
 
 
-CLARIFIER_INSTRUCTION = """You are a helpful query assistant for the AI Co-Scientist, a biomedical research platform.
+CLARIFIER_INSTRUCTION = """You are a helpful query assistant for the Neuro Copilot, a biomedical research platform.
 The user's query is unclear, ambiguous, or incomplete. Help them formulate a clear request.
 
 Your approach:
@@ -851,7 +851,7 @@ Examples:
 """
 
 
-REPORT_ASSISTANT_INSTRUCTION = """You are the report assistant for the AI Co-Scientist.
+REPORT_ASSISTANT_INSTRUCTION = """You are the report assistant for the Neuro Copilot.
 A research report has been produced, and the user has a follow-up request about it.
 
 You can:
@@ -6786,7 +6786,7 @@ def _validate_url(url: str) -> bool:
         req = urllib.request.Request(
             url,
             method="HEAD",
-            headers={"User-Agent": "ai-co-scientist/1.0 (link-validator)"},
+            headers={"User-Agent": "neuro-copilot/1.0 (link-validator)"},
         )
         with urllib.request.urlopen(req, timeout=_URL_VALIDATE_TIMEOUT) as resp:
             ok = 200 <= resp.status < 400
@@ -6798,7 +6798,7 @@ def _validate_url(url: str) -> bool:
 
 def _http_get_json(url: str) -> dict | None:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "ai-co-scientist/1.0 (citation-builder)"})
+        req = urllib.request.Request(url, headers={"User-Agent": "neuro-copilot/1.0 (citation-builder)"})
         with urllib.request.urlopen(req, timeout=_CITATION_FETCH_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:  # noqa: BLE001
@@ -8087,7 +8087,7 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
     objective = str(task_state.get("objective", "")).strip()
     claim_summary = dict(synthesis.get("claim_synthesis_summary", {}) or {})
 
-    lines = ["# AI Co-Scientist Report", ""]
+    lines = ["# Neuro Copilot Report", ""]
 
     if objective:
         lines += [f"> **Research Question:** {objective}", "", "---", ""]
@@ -8756,7 +8756,7 @@ RATE_LIMIT_AUTO_RETRY = os.environ.get(
     "ADK_RATE_LIMIT_AUTO_RETRY", "true"
 ).strip().lower() not in {"0", "false", "no", "off"}
 
-STATE_RATE_LIMIT_RETRY_COUNT = "temp:co_scientist_rate_limit_retry_count"
+STATE_RATE_LIMIT_RETRY_COUNT = "temp:neuro_copilot_rate_limit_retry_count"
 
 
 def _using_vertex_ai_backend() -> bool:
@@ -10997,8 +10997,8 @@ def create_workflow_agent(
     # ── Intent router (root agent) ────────────────────────────────────────
 
     router = LlmAgent(
-        name="co_scientist_router",
-        description="AI Co-Scientist: biomedical research assistant with intent routing.",
+        name="neuro_copilot_router",
+        description="Neuro Copilot: biomedical research assistant with intent routing.",
         model=router_model,
         instruction=ROUTER_INSTRUCTION,
         sub_agents=[general_qa, clarifier, report_assistant, research_workflow],

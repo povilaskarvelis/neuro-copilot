@@ -27,7 +27,7 @@ OPEN_TARGETS_ARCHIVE_ROOT = "https://ftp.ebi.ac.uk/pub/databases/opentargets/pla
 CACHE_ROOT = Path(
     os.getenv(
         "OPEN_TARGETS_RELEASE_CACHE_DIR",
-        str(Path.home() / ".cache" / "ai-co-scientist" / "open_targets"),
+        str(Path.home() / ".cache" / "neuro-copilot" / "open_targets"),
     )
 ).expanduser()
 

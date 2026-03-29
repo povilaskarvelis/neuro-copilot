@@ -1,5 +1,5 @@
 """
-AI Co-Scientist Agent Module
+Neuro Copilot Agent Module
 
 This module exports the root_agent for ADK evaluation framework.
 """
@@ -16,7 +16,7 @@ from .workflow import create_workflow_agent
 root_agent, _native_mcp_toolset = create_workflow_agent(require_plan_approval=True)
 
 app = App(
-    name="co_scientist",
+    name="neuro_copilot",
     root_agent=root_agent,
 )
 

@@ -5,13 +5,19 @@ import pytest
 
 from google.adk.sessions import InMemorySessionService
 
-for _env_name in ("AI_CO_SCIENTIST_POSTGRES_DSN", "POSTGRES_DSN", "DATABASE_URL"):
+for _env_name in (
+    "NEURO_COPILOT_POSTGRES_DSN",
+    "AI_CO_SCIENTIST_POSTGRES_DSN",
+    "POSTGRES_DSN",
+    "DATABASE_URL",
+):
     os.environ.pop(_env_name, None)
 
-import co_scientist.workflow as workflow
+import neuro_copilot.workflow as workflow
 import ui_server
-from co_scientist.workflow import (
+from neuro_copilot.workflow import (
     STATE_EXECUTOR_ACTIVE_STEP_ID,
+    STATE_EXECUTOR_BUFFER,
     STATE_EXECUTOR_LAST_ERROR,
     STATE_PLAN_PENDING_APPROVAL,
     STATE_PRIOR_RESEARCH,
@@ -29,7 +35,12 @@ class DummyRunner:
 
 @pytest.fixture
 def runtime(tmp_path, monkeypatch):
-    for env_name in ("AI_CO_SCIENTIST_POSTGRES_DSN", "POSTGRES_DSN", "DATABASE_URL"):
+    for env_name in (
+        "NEURO_COPILOT_POSTGRES_DSN",
+        "AI_CO_SCIENTIST_POSTGRES_DSN",
+        "POSTGRES_DSN",
+        "DATABASE_URL",
+    ):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(
         ui_server,
@@ -257,7 +268,7 @@ async def test_get_or_create_session_rehydrates_persisted_state(runtime):
             STATE_WORKFLOW_TASK: {"objective": "Restore me", "steps": []},
             STATE_PRIOR_RESEARCH: [{"objective": "Previous iteration"}],
             STATE_PLAN_PENDING_APPROVAL: True,
-            "temp:co_scientist_executor_buffer": "discard",
+            STATE_EXECUTOR_BUFFER: "discard",
         },
     )
 
@@ -272,7 +283,7 @@ async def test_get_or_create_session_rehydrates_persisted_state(runtime):
     assert session.state[STATE_WORKFLOW_TASK]["objective"] == "Restore me"
     assert session.state[STATE_PRIOR_RESEARCH] == [{"objective": "Previous iteration"}]
     assert session.state[STATE_PLAN_PENDING_APPROVAL] is True
-    assert "temp:co_scientist_executor_buffer" not in session.state
+    assert STATE_EXECUTOR_BUFFER not in session.state
 
 
 @pytest.mark.asyncio

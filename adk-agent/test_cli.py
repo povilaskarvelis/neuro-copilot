@@ -12,7 +12,7 @@ load_dotenv()
 
 os.environ.setdefault("ADK_NATIVE_PREFER_BIGQUERY", "1")
 
-from co_scientist.workflow import create_workflow_agent
+from neuro_copilot.workflow import create_workflow_agent
 from google.adk import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, Part

@@ -29,7 +29,7 @@ UNIPROT_API = "https://rest.uniprot.org"
 CACHE_ROOT = Path(
     os.getenv(
         "ALPHAFOLD_DOMAIN_CACHE_DIR",
-        str(Path.home() / ".cache" / "ai-co-scientist" / "alphafold"),
+        str(Path.home() / ".cache" / "neuro-copilot" / "alphafold"),
     )
 ).expanduser()
 ZERO_BLOCK = b"\0" * 512

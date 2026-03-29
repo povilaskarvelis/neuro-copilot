@@ -1,4 +1,4 @@
-import co_scientist.tool_registry as tool_registry
+import neuro_copilot.tool_registry as tool_registry
 
 
 def test_tool_to_domains_contains_expected_cross_domain_tool():

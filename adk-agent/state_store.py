@@ -193,7 +193,7 @@ def _require_psycopg() -> tuple[Any, Any, Any]:
     except ImportError as exc:  # noqa: BLE001
         raise RuntimeError(
             "Postgres persistence requires `psycopg` to be installed. "
-            "Add `psycopg[binary]` to the environment before setting AI_CO_SCIENTIST_POSTGRES_DSN."
+            "Add `psycopg[binary]` to the environment before setting NEURO_COPILOT_POSTGRES_DSN."
         ) from exc
     return psycopg, dict_row, Jsonb
 
@@ -579,7 +579,8 @@ class PostgresTaskStore:
 
 def create_state_store(state_store_path: Path) -> SupportsWorkflowStateStore:
     postgres_dsn = str(
-        os.getenv("AI_CO_SCIENTIST_POSTGRES_DSN")
+        os.getenv("NEURO_COPILOT_POSTGRES_DSN")
+        or os.getenv("AI_CO_SCIENTIST_POSTGRES_DSN")
         or os.getenv("POSTGRES_DSN")
         or os.getenv("DATABASE_URL")
         or ""

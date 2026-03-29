@@ -424,7 +424,7 @@ def _find_chrome_binary() -> str | None:
 
 
 def _build_html_document(markdown_text: str, *, title: str) -> str:
-    safe_title = escape(title or "AI Co-Scientist Report")
+    safe_title = escape(title or "Neuro Copilot Report")
     normalized_markdown = _prepare_markdown_for_pdf(markdown_text)
     if MARKDOWN_AVAILABLE:
         body_html = markdown_lib.markdown(
@@ -466,7 +466,7 @@ def _write_markdown_pdf_chrome(markdown: str, output_path: Path, *, title: str) 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     html = _build_html_document(markdown, title=title)
 
-    with tempfile.TemporaryDirectory(prefix="co_scientist_pdf_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="neuro_copilot_pdf_") as tmpdir:
         html_path = Path(tmpdir) / "report.html"
         html_path.write_text(html, encoding="utf-8")
         file_uri = html_path.resolve().as_uri()
@@ -976,7 +976,7 @@ def _markdown_story(markdown: str) -> list:
     return story
 
 
-def _write_markdown_pdf_legacy(markdown: str, output_path: Path, *, title: str = "AI Co-Scientist Report") -> str | None:
+def _write_markdown_pdf_legacy(markdown: str, output_path: Path, *, title: str = "Neuro Copilot Report") -> str | None:
     """
     Export markdown text to PDF using the legacy ReportLab renderer.
 
@@ -1010,7 +1010,7 @@ def _write_markdown_pdf_legacy(markdown: str, output_path: Path, *, title: str =
     return None
 
 
-def write_markdown_pdf(markdown: str, output_path: Path, *, title: str = "AI Co-Scientist Report") -> str | None:
+def write_markdown_pdf(markdown: str, output_path: Path, *, title: str = "Neuro Copilot Report") -> str | None:
     """
     Export markdown text to PDF.
 

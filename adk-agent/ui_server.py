@@ -1,5 +1,5 @@
 """
-Web UI for AI Co-Scientist (adapted to ADK-native workflow).
+Web UI for Neuro Copilot (adapted to ADK-native workflow).
 
 Run:
     python ui_server.py
@@ -33,8 +33,21 @@ from pydantic import BaseModel, Field
 from agent import validate_runtime_configuration
 from state_store import SupportsWorkflowStateStore, create_state_store
 from report_pdf import write_markdown_pdf
-from co_scientist.tool_registry import TOOL_SOURCE_NAMES
-from co_scientist.workflow import (
+from neuro_copilot.tool_registry import TOOL_SOURCE_NAMES
+
+
+def _ui_host() -> str:
+    return (
+        os.environ.get("NEURO_COPILOT_UI_HOST")
+        or os.environ.get("CO_SCI_UI_HOST")
+        or "127.0.0.1"
+    )
+
+
+def _ui_port() -> int:
+    raw = os.environ.get("NEURO_COPILOT_UI_PORT") or os.environ.get("CO_SCI_UI_PORT") or "8080"
+    return int(raw)
+from neuro_copilot.workflow import (
     STATE_EXECUTOR_ACTIVE_STEP_ID,
     STATE_EXECUTOR_LAST_ERROR,
     STATE_PRIOR_RESEARCH,
@@ -637,7 +650,7 @@ class UiRuntime:
         if not self.session_service:
             raise RuntimeError("Session service is not initialized.")
         workflow_agent, mcp_tools = create_workflow_agent(require_plan_approval=True)
-        app_name = f"co_scientist_ui_{conversation_id}"
+        app_name = f"neuro_copilot_ui_{conversation_id}"
         runner = Runner(
             agent=workflow_agent,
             app_name=app_name,
@@ -1028,7 +1041,7 @@ class UiRuntime:
             "clarifier",
             "report_assistant",
             "research_workflow",
-            "co_scientist_router",
+            "neuro_copilot_router",
         )
         for preferred_author in _preferred_authors:
             candidate = final_by_author.get(preferred_author, "").strip()
@@ -1937,7 +1950,7 @@ UI_DIR = ROOT_DIR / "ui"
 STATE_PATH = ROOT_DIR / "state" / "workflow_tasks.json"
 
 runtime = UiRuntime(STATE_PATH)
-app = FastAPI(title="AI Co-Scientist UI", version="0.2.0")
+app = FastAPI(title="Neuro Copilot UI", version="0.2.0")
 app.mount("/static", StaticFiles(directory=str(UI_DIR)), name="static")
 
 
@@ -1984,7 +1997,7 @@ def _render_ui_page(filename: str) -> HTMLResponse:
 async def _startup() -> None:
     await runtime.startup()
     if runtime.ready:
-        _port = int(os.environ.get("CO_SCI_UI_PORT", "8080"))
+        _port = _ui_port()
         print(f"[ui] Server ready at http://127.0.0.1:{_port}")
     else:
         print(f"[ui] Startup warning: {runtime.ready_error}")
@@ -2197,6 +2210,4 @@ async def export_report_pdf(task_id: str, request: Request) -> FileResponse:
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.environ.get("CO_SCI_UI_HOST", "127.0.0.1")
-    port = int(os.environ.get("CO_SCI_UI_PORT", "8080"))
-    uvicorn.run("ui_server:app", host=host, port=port, reload=False)
+    uvicorn.run("ui_server:app", host=_ui_host(), port=_ui_port(), reload=False)

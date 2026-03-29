@@ -9,16 +9,16 @@ from google.adk.tools import McpToolset
 from google.adk.tools.skill_toolset import SkillToolset
 from google.genai import types
 
-import co_scientist.tool_registry as tool_registry
-import co_scientist.workflow as workflow
-from co_scientist.workflow import create_workflow_agent
+import neuro_copilot.tool_registry as tool_registry
+import neuro_copilot.workflow as workflow
+from neuro_copilot.workflow import create_workflow_agent
 
 
 def test_native_workflow_graph_shape():
     root_agent, mcp_tools = create_workflow_agent(tool_filter=[])
     assert mcp_tools is None
     assert isinstance(root_agent, LlmAgent)
-    assert root_agent.name == "co_scientist_router"
+    assert root_agent.name == "neuro_copilot_router"
 
     top_level_names = [sub_agent.name for sub_agent in root_agent.sub_agents]
     assert "research_workflow" in top_level_names
@@ -2524,7 +2524,7 @@ def test_postprocess_synth_markdown_renders_structured_sections_from_claims():
         },
     )
 
-    raw_markdown = """# AI Co-Scientist Report
+    raw_markdown = """# Neuro Copilot Report
 
 ## Summary
 
@@ -2549,7 +2549,7 @@ The model kept useful step-level prose here.
 
     final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
 
-    assert "# AI Co-Scientist Report" in final_markdown
+    assert "# Neuro Copilot Report" in final_markdown
     assert "## TLDR" in final_markdown
     assert "## Key Findings" not in final_markdown
     assert "Custom evidence narrative from the model" in final_markdown
@@ -2643,7 +2643,7 @@ def test_informative_model_summary_is_preserved_in_report_summary():
         },
     )
 
-    raw_markdown = """# AI Co-Scientist Report
+    raw_markdown = """# Neuro Copilot Report
 
 ## Summary
 
@@ -2707,7 +2707,7 @@ def test_postprocess_uses_actual_bigquery_backing_source_instead_of_transport_la
         },
     )
 
-    raw_markdown = """# AI Co-Scientist Report
+    raw_markdown = """# Neuro Copilot Report
 
 ## Summary
 
@@ -2789,7 +2789,7 @@ def test_generic_no_claim_summary_falls_back_to_step_highlights():
         },
     )
 
-    raw_markdown = """# AI Co-Scientist Report
+    raw_markdown = """# Neuro Copilot Report
 
 ## Summary
 
@@ -2827,7 +2827,7 @@ def test_postprocess_renders_model_key_findings_when_no_structured_claims():
         plan,
         objective_text="Assess BRAF V600E actionability",
     )
-    raw_markdown = """# AI Co-Scientist Report
+    raw_markdown = """# Neuro Copilot Report
 
 ## Answer
 
@@ -2873,7 +2873,7 @@ def test_postprocess_renders_answer_section_for_no_claim_task():
         plan,
         objective_text="Evaluate LRRK2 target conviction",
     )
-    raw_markdown = """# AI Co-Scientist Report
+    raw_markdown = """# Neuro Copilot Report
 
 ## Answer
 
@@ -2973,7 +2973,7 @@ def test_postprocess_expands_reference_only_key_finding_bullets(monkeypatch):
         lambda ref_number, eid: f"[Citation {ref_number}](#ref-{ref_number})",
     )
 
-    raw_markdown = """# AI Co-Scientist Report
+    raw_markdown = """# Neuro Copilot Report
 
 ## Summary
 
@@ -3510,7 +3510,7 @@ def test_router_before_model_callback_forces_research_workflow_for_scoped_safety
 
 
 def test_router_before_model_callback_forces_research_workflow_for_all_landing_page_example_queries():
-    ui_html = Path("adk-agent/ui/index.html").read_text(encoding="utf-8")
+    ui_html = (Path(__file__).resolve().parent / "ui" / "index.html").read_text(encoding="utf-8")
     queries = [
         html.unescape(match)
         for match in re.findall(r'data-query="([^"]+)"', ui_html)

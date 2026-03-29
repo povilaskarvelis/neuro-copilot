@@ -1,8 +1,10 @@
-# AI Co-Scientist
+# Neuro Copilot
 
-AI Co-Scientist is a human-guided biomedical research assistant built on Google ADK that unifies 53 biomedical data sources behind a single conversational interface. It turns a plain-language research question into an investigation plan, queries the right databases and public datasets, and delivers a cited report for target discovery and pre-clinical decision support.
+Neuro Copilot is a human-guided biomedical research assistant built on Google ADK that unifies 53 biomedical data sources behind a single conversational interface. It turns a plain-language research question into an investigation plan, queries the right databases and public datasets, and delivers a cited report for target discovery and pre-clinical decision support.
 
-![AI Co-Scientist interface](interface.png)
+Lineage: this project continues from [AI Co-Scientist](https://github.com/povilaskarvelis/ai-co-scientist), rebranded and maintained here as Neuro Copilot.
+
+![Neuro Copilot interface](interface.png)
 
 ### Databases
 
@@ -65,7 +67,7 @@ flowchart TB
 ```mermaid
 flowchart TB
     subgraph Root["Root Agent"]
-        ROUTER["co_scientist_router<br/>(LlmAgent)"]
+        ROUTER["neuro_copilot_router<br/>(LlmAgent)"]
     end
 
     subgraph Specialists["Specialist Agents"]
@@ -96,7 +98,7 @@ flowchart TB
 
 **Router behavior:** The router uses a fast model (`ADK_ROUTER_MODEL`) to classify intent. It transfers to `general_qa` for straightforward knowledge questions, `clarifier` for ambiguous queries, `report_assistant` when the user is asking about an existing report, and `research_workflow` for full evidence-gathering investigations. In-workflow commands (approve, continue, finalize, etc.) bypass the router LLM and go directly to `research_workflow`.
 
-The primary runtime is the custom web UI in `adk-agent/ui/`, served by `adk-agent/ui_server.py`. That server manages conversations, state persistence, run orchestration, and PDF export on top of the Google ADK `Runner`. The source of truth for agent behavior is `adk-agent/co_scientist/workflow.py`.
+The primary runtime is the custom web UI in `adk-agent/ui/`, served by `adk-agent/ui_server.py`. That server manages conversations, state persistence, run orchestration, and PDF export on top of the Google ADK `Runner`. The source of truth for agent behavior is `adk-agent/neuro_copilot/workflow.py`.
 
 ## Dynamic Workflow
 
@@ -312,9 +314,9 @@ Opens the custom web interface at `http://localhost:8080` with conversation mana
 
 **Runtime notes:**
 
-- The UI server binds to `127.0.0.1:8080` by default. Override with `CO_SCI_UI_HOST` and `CO_SCI_UI_PORT`.
+- The UI server binds to `127.0.0.1:8080` by default. Override with `NEURO_COPILOT_UI_HOST` and `NEURO_COPILOT_UI_PORT` (legacy: `CO_SCI_UI_HOST` / `CO_SCI_UI_PORT`).
 - Local task and conversation state is stored in `adk-agent/state/workflow_tasks.json` by default.
-- To use Postgres-backed persistence instead of local JSON, set `AI_CO_SCIENTIST_POSTGRES_DSN` (or `POSTGRES_DSN` / `DATABASE_URL`).
+- To use Postgres-backed persistence instead of local JSON, set `NEURO_COPILOT_POSTGRES_DSN` (legacy: `AI_CO_SCIENTIST_POSTGRES_DSN`, or `POSTGRES_DSN` / `DATABASE_URL`).
 - Generated Markdown/PDF reports are written to `adk-agent/reports/`.
 - Planner skills are enabled by default. Set `ADK_PLANNER_SKILLS_ENABLED=0` to disable repo-local ADK planner skills.
 - Executor lookup skills are enabled by default. Set `ADK_EXECUTION_SKILLS_ENABLED=0` to disable repo-local executor skills.
@@ -324,7 +326,7 @@ Opens the custom web interface at `http://localhost:8080` with conversation mana
 
 ```bash
 cd adk-agent
-adk run co_scientist    # interactive terminal
+adk run neuro_copilot    # interactive terminal
 adk web .               # ADK built-in web UI
 ```
 
@@ -354,7 +356,7 @@ python agent.py --benchmark --query "What is the Open Targets Association Score 
 ```bash
 PROJECT_ID="your-project-id" \
 REGION="us-central1" \
-SERVICE_NAME="ai-co-scientist" \
+SERVICE_NAME="neuro-copilot" \
 bash scripts/deploy_cloud_run.sh
 ```
 
@@ -379,12 +381,12 @@ The deploy script builds a container image via Cloud Build, then deploys the pri
 ## Project Structure
 
 ```
-├── adk-agent/              # AI Co-Scientist Agent (Python)
+├── adk-agent/              # Neuro Copilot Agent (Python)
 │   ├── agent.py            # ADK-native CLI wrapper (interactive/single query)
 │   ├── ui_server.py        # Custom web UI server (FastAPI, primary entrypoint)
 │   ├── report_pdf.py       # PDF report generation
 │   ├── server.py           # Minimal FastAPI HTTP wrapper (legacy)
-│   ├── co_scientist/
+│   ├── neuro_copilot/
 │   │   ├── __init__.py     # Exports root_agent for `adk run` / `adk web`
 │   │   ├── workflow.py     # Workflow graph, HITL, history/rollback, callbacks
 │   │   ├── skill_loader.py # Repo-local wrapper for loading ADK workflow skills
@@ -451,7 +453,7 @@ The full tool catalog above is the authoritative source. The lists below highlig
 
 ```bash
 cd adk-agent
-python -m py_compile agent.py server.py ui_server.py report_pdf.py state_store.py co_scientist/workflow.py
+python -m py_compile agent.py server.py ui_server.py report_pdf.py state_store.py neuro_copilot/workflow.py
 python -m pytest test_tool_registry.py test_report_pdf.py test_ui_server_state.py test_workflow.py
 ```
 

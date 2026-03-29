@@ -15,7 +15,7 @@ from agent import (
 
 
 app = FastAPI(
-    title="AI Co-Scientist API",
+    title="Neuro Copilot API",
     version="0.1.0",
 )
 

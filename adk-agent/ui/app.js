@@ -2209,7 +2209,7 @@ function debugSummaryHtml(debugPayload) {
     : {};
   const steps = Array.isArray(workflow.steps) ? workflow.steps : [];
   const completedSteps = steps.filter((step) => String(step?.status || "").trim() === "completed").length;
-  const priorResearch = Array.isArray(rawState.co_scientist_prior_research) ? rawState.co_scientist_prior_research : [];
+  const priorResearch = Array.isArray(rawState.neuro_copilot_prior_research) ? rawState.neuro_copilot_prior_research : [];
   const watchlist = Array.isArray(executionSummary.specialization_watchlist)
     ? executionSummary.specialization_watchlist
     : [];
@@ -2226,7 +2226,7 @@ function debugSummaryHtml(debugPayload) {
       value: String(executionSummary.total_steps || steps.length || 0),
     },
     { label: "Prior research", value: String(priorResearch.length) },
-    { label: "Approval pending", value: rawState.co_scientist_plan_pending_approval ? "yes" : "no" },
+    { label: "Approval pending", value: rawState.neuro_copilot_plan_pending_approval ? "yes" : "no" },
     {
       label: "Persisted",
       value: payload.persisted_updated_at ? formatDate(payload.persisted_updated_at) : "n/a",

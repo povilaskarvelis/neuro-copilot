@@ -1,7 +1,7 @@
 import pytest
 from google.adk.tools.skill_toolset import SkillToolset
 
-from co_scientist.skill_loader import (
+from neuro_copilot.skill_loader import (
     EXECUTION_SKILL_DIR_NAMES,
     PLANNER_SKILL_DIR_NAMES,
     REPORT_ASSISTANT_SKILL_DIR_NAMES,

@@ -10,9 +10,9 @@ set -euo pipefail
 
 PROJECT_ID="gen-lang-client-0943167408"
 REGION="${REGION:-us-central1}"
-SERVICE_NAME="${SERVICE_NAME:-ai-co-scientist}"
-REPO_NAME="${REPO_NAME:-co-scientist-images}"
-IMAGE_NAME="${IMAGE_NAME:-ai-co-scientist}"
+SERVICE_NAME="${SERVICE_NAME:-neuro-copilot}"
+REPO_NAME="${REPO_NAME:-neuro-copilot-images}"
+IMAGE_NAME="${IMAGE_NAME:-neuro-copilot}"
 USE_VERTEX_AI="${USE_VERTEX_AI:-}"
 GOOGLE_API_KEY="${GOOGLE_API_KEY:-}"
 BIOGRID_ACCESS_KEY="${BIOGRID_ACCESS_KEY:-}"
@@ -90,7 +90,7 @@ if ! gcloud artifacts repositories describe "${REPO_NAME}" \
   gcloud artifacts repositories create "${REPO_NAME}" \
     --repository-format=docker \
     --location "${REGION}" \
-    --description="Container images for AI Co-Scientist" \
+    --description="Container images for Neuro Copilot" \
     --project "${PROJECT_ID}"
 fi
 
@@ -107,9 +107,9 @@ gcloud builds submit \
 
 # ── Store secrets in Secret Manager ───────────────────────────────────────────
 
-GOOGLE_SECRET_NAME="ai-co-scientist-api-key"
-BIOGRID_SECRET_NAME="ai-co-scientist-biogrid-access-key"
-BIOGRID_ORCS_SECRET_NAME="ai-co-scientist-biogrid-orcs-access-key"
+GOOGLE_SECRET_NAME="neuro-copilot-api-key"
+BIOGRID_SECRET_NAME="neuro-copilot-biogrid-access-key"
+BIOGRID_ORCS_SECRET_NAME="neuro-copilot-biogrid-orcs-access-key"
 PROJECT_NUMBER=""
 COMPUTE_SA=""
 

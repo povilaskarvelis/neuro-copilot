@@ -1,11 +1,11 @@
 """
-LABBench2 external runner for the benchmark-optimized AI Co-Scientist endpoint.
+LABBench2 external runner for the benchmark-optimized Neuro Copilot endpoint.
 
 Usage from a LABBench2 checkout:
 
-    export AI_CO_SCIENTIST_BENCHMARK_URL=http://127.0.0.1:8000/benchmark_query
+    export NEURO_COPILOT_BENCHMARK_URL=http://127.0.0.1:8000/benchmark_query
     uv run python -m evals.run_evals \
-      --agent external:/absolute/path/to/ai-co-scientist/adk-agent/labbench2_runner.py:LabBench2BenchmarkRunner \
+      --agent external:/absolute/path/to/neuro-copilot/adk-agent/labbench2_runner.py:LabBench2BenchmarkRunner \
       --tag dbqa2 \
       --mode inject
 """
@@ -31,10 +31,14 @@ class LabBench2BenchmarkRunner:
 
     def __init__(self) -> None:
         self.endpoint_url = str(
-            os.environ.get("AI_CO_SCIENTIST_BENCHMARK_URL", DEFAULT_BENCHMARK_URL)
+            os.environ.get("NEURO_COPILOT_BENCHMARK_URL")
+            or os.environ.get("AI_CO_SCIENTIST_BENCHMARK_URL")
+            or DEFAULT_BENCHMARK_URL
         ).strip()
         timeout_raw = str(
-            os.environ.get("AI_CO_SCIENTIST_BENCHMARK_TIMEOUT", DEFAULT_TIMEOUT_SECONDS)
+            os.environ.get("NEURO_COPILOT_BENCHMARK_TIMEOUT")
+            or os.environ.get("AI_CO_SCIENTIST_BENCHMARK_TIMEOUT")
+            or DEFAULT_TIMEOUT_SECONDS
         ).strip()
         self.timeout = float(timeout_raw or DEFAULT_TIMEOUT_SECONDS)
 

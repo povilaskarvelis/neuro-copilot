@@ -1,8 +1,8 @@
 """
-AI Co-Scientist ADK-native runner.
+Neuro Copilot ADK-native runner.
 
 Usage:
-    adk run co_scientist
+    adk run neuro_copilot
     adk web .
     python agent.py
     python agent.py --query "Evaluate LRRK2 in Parkinson disease"
@@ -25,7 +25,7 @@ from google.adk import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, FunctionResponse, Part
 
-from co_scientist.workflow import create_workflow_agent
+from neuro_copilot.workflow import create_workflow_agent
 
 
 load_dotenv()
@@ -343,7 +343,7 @@ async def _run_native_workflow_turn(
             "clarifier",
             "report_assistant",
             "research_workflow",
-            "co_scientist_router",
+            "neuro_copilot_router",
         ):
             candidate = final_by_author.get(preferred_author, "").strip()
             if candidate:
@@ -363,7 +363,7 @@ async def _run_native_workflow_turn(
 async def run_native_interactive_async() -> None:
     """Run the ADK-native workflow agent in an interactive terminal session."""
     print("=" * 60)
-    print("AI Co-Scientist (ADK-native workflow mode)")
+    print("Neuro Copilot (ADK-native workflow mode)")
     print("=" * 60)
 
     is_valid, error_message = validate_runtime_configuration()
@@ -383,11 +383,11 @@ async def run_native_interactive_async() -> None:
     session_service = InMemorySessionService()
     runner = Runner(
         agent=workflow_agent,
-        app_name="co_scientist_native",
+        app_name="neuro_copilot_native",
         session_service=session_service,
     )
     session = await session_service.create_session(
-        app_name="co_scientist_native",
+        app_name="neuro_copilot_native",
         user_id="researcher",
     )
 
@@ -450,9 +450,9 @@ async def run_single_query_native_with_confirmation_async(
 
     session_service = InMemorySessionService()
     app_name = (
-        "co_scientist_native_benchmark_query"
+        "neuro_copilot_native_benchmark_query"
         if benchmark_mode
-        else "co_scientist_native_single_query"
+        else "neuro_copilot_native_single_query"
     )
     workflow_agent, mcp_tools = create_workflow_agent(
         require_plan_approval=not benchmark_mode,
@@ -521,7 +521,7 @@ def run_single_query(query: str) -> str:
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AI Co-Scientist")
+    parser = argparse.ArgumentParser(description="Neuro Copilot")
     parser.add_argument(
         "--query",
         type=str,
